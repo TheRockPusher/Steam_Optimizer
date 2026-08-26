@@ -12,7 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth_routes import Clock, create_auth_router
 from app.settings import Settings, get_settings
-from app.steam_gateway import SteamGateway, SteamGatewayProtocol
+from app.steam_gateway import (
+    AsyncSleep,
+    MonotonicClock,
+    SteamGateway,
+    SteamGatewayProtocol,
+)
 from app.steam_openid import SteamOpenIDClient, SteamOpenIDVerifier
 
 
@@ -22,6 +27,8 @@ def create_app(
     steam_gateway: SteamGatewayProtocol | None = None,
     openid_verifier: SteamOpenIDVerifier | None = None,
     clock: Clock | None = None,
+    monotonic_clock: MonotonicClock | None = None,
+    sleep: AsyncSleep | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     shared_client: httpx2.AsyncClient | None = None
@@ -34,7 +41,13 @@ def create_app(
     if steam_gateway is None:
         if shared_client is None:
             raise RuntimeError
-        gateway = SteamGateway(settings, http_client=shared_client)
+        gateway = SteamGateway(
+            settings,
+            http_client=shared_client,
+            utc_clock=clock,
+            monotonic_clock=monotonic_clock,
+            sleep=sleep,
+        )
     else:
         gateway = steam_gateway
 

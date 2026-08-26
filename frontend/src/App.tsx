@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import steamSignInWide from "./assets/steam/sits_01.png";
+import steamSignInCompact from "./assets/steam/sits_02.png";
 import "./App.css";
 
 type VisibilityStatus = "public" | "private" | "unavailable";
@@ -6,6 +8,11 @@ type VisibilityStatus = "public" | "private" | "unavailable";
 type VisibilityCheck = {
   status: VisibilityStatus;
   message: string;
+};
+
+type InventoryCheck = VisibilityCheck & {
+  retry_after_seconds: number | null;
+  rate_limited: boolean;
 };
 
 type SteamUser = {
@@ -23,7 +30,7 @@ type SignedInSession = {
   user: SteamUser;
   checks: {
     profile: VisibilityCheck;
-    inventory: VisibilityCheck;
+    inventory: InventoryCheck;
   };
 };
 
@@ -35,13 +42,14 @@ type ViewState =
   | { kind: "signed-in"; session: SignedInSession }
   | { kind: "api-unavailable" };
 
-type SurfaceName = "profile" | "inventory";
-
+const MILLISECONDS_PER_SECOND = 1000;
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
 const SESSION_URL = `${API_BASE_URL}/api/auth/session`;
 const LOGOUT_URL = `${API_BASE_URL}/api/auth/logout`;
 const STEAM_LOGIN_URL = `${API_BASE_URL}/api/auth/steam/start`;
 const STEAM_PRIVACY_URL = "https://steamcommunity.com/my/edit/settings";
+const PRIVACY_POLICY_URL =
+  "https://github.com/TheRockPusher/Steam_Optimizer#privacy-and-steam-data-policy";
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
 
 const STATUS_LABELS: Record<VisibilityStatus, string> = {
@@ -61,6 +69,23 @@ function isVisibilityCheck(value: unknown): value is VisibilityCheck {
       check.status === "private" ||
       check.status === "unavailable") &&
     typeof check.message === "string"
+  );
+}
+
+function isInventoryCheck(value: unknown): value is InventoryCheck {
+  if (!isVisibilityCheck(value)) {
+    return false;
+  }
+
+  const retryAfterSeconds = (value as Partial<InventoryCheck>).retry_after_seconds;
+  return (
+    typeof retryAfterSeconds !== "undefined" &&
+    (retryAfterSeconds === null ||
+      (typeof retryAfterSeconds === "number" &&
+        Number.isSafeInteger(retryAfterSeconds) &&
+        retryAfterSeconds >= 0 &&
+        Number.isSafeInteger(retryAfterSeconds * MILLISECONDS_PER_SECOND))) &&
+    typeof (value as Partial<InventoryCheck>).rate_limited === "boolean"
   );
 }
 
@@ -104,7 +129,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
     (typeof user.display_name === "string" || user.display_name === null) &&
     (typeof user.avatar_url === "string" || user.avatar_url === null) &&
     isVisibilityCheck(checks.profile) &&
-    isVisibilityCheck(checks.inventory)
+    isInventoryCheck(checks.inventory)
   );
 }
 
@@ -131,6 +156,17 @@ function toViewState(session: SessionResponse): ViewState {
   return session.authenticated
     ? { kind: "signed-in", session }
     : { kind: "signed-out" };
+}
+
+function secondsUntilDeadline(deadlineMs: number | null, nowMs: number): number {
+  if (deadlineMs === null) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    Math.ceil((deadlineMs - nowMs) / MILLISECONDS_PER_SECOND)
+  );
 }
 
 function Brand() {
@@ -188,12 +224,25 @@ function SignedOutView() {
           your public Steam identity—your password never comes here.
         </p>
         <a
-          className="primary-action"
+          className="steam-sign-in-link"
           href={STEAM_LOGIN_URL}
           aria-describedby="connect-description"
         >
-          Continue with Steam
-          <span aria-hidden="true">→</span>
+          <picture className="steam-sign-in-picture">
+            <source
+              media="(max-width: 40rem)"
+              srcSet={steamSignInCompact}
+              width="109"
+              height="66"
+            />
+            <img
+              className="steam-sign-in-image"
+              src={steamSignInWide}
+              width="180"
+              height="35"
+              alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+            />
+          </picture>
         </a>
       </div>
 
@@ -273,18 +322,21 @@ function SteamIdentity({ user }: { user: SteamUser }) {
   );
 }
 
-function AccessCard({
-  surface,
-  check
-}: {
-  surface: SurfaceName;
-  check: VisibilityCheck;
-}) {
+type AccessCardProps =
+  | { surface: "profile"; check: VisibilityCheck }
+  | { surface: "inventory"; check: InventoryCheck };
+
+function AccessCard({ surface, check }: AccessCardProps) {
   const title = surface === "profile" ? "Steam profile" : "Steam inventory";
   const privateGuidance =
     surface === "profile"
       ? "Your Steam profile is not public."
       : "Your Steam inventory is not public.";
+  const isRateLimited =
+    surface === "inventory" &&
+    check.status === "unavailable" &&
+    check.rate_limited;
+  const statusLabel = isRateLimited ? "Try later" : STATUS_LABELS[check.status];
 
   return (
     <article
@@ -298,7 +350,7 @@ function AccessCard({
         </div>
         <p className={`access-badge access-badge-${check.status}`}>
           <span className="status-dot" aria-hidden="true" />
-          {STATUS_LABELS[check.status]}
+          {statusLabel}
         </p>
       </div>
 
@@ -315,11 +367,17 @@ function AccessCard({
         </p>
       )}
 
-      {check.status === "unavailable" && (
-        <p className="result-guidance">
-          This is not a privacy result. Recheck when the service is available.
-        </p>
-      )}
+      {check.status === "unavailable" &&
+        (isRateLimited ? (
+          <p className="result-guidance">
+            Steam is temporarily limiting automated checks. This is not a
+            privacy result and does not mean your inventory is private.
+          </p>
+        ) : (
+          <p className="result-guidance">
+            This is not a privacy result. Recheck when the service is available.
+          </p>
+        ))}
     </article>
   );
 }
@@ -328,6 +386,7 @@ function SignedInView({
   session,
   isRechecking,
   isSigningOut,
+  retryAfterSeconds,
   actionMessage,
   onRecheck,
   onLogout
@@ -335,11 +394,13 @@ function SignedInView({
   session: SignedInSession;
   isRechecking: boolean;
   isSigningOut: boolean;
+  retryAfterSeconds: number;
   actionMessage: string | null;
   onRecheck: () => void;
   onLogout: () => void;
 }) {
-  const isBusy = isRechecking || isSigningOut;
+  const isRecheckDisabled =
+    isRechecking || isSigningOut || retryAfterSeconds > 0;
 
   return (
     <section className="account-view" aria-labelledby="account-title">
@@ -350,7 +411,10 @@ function SignedInView({
             className="secondary-action"
             type="button"
             onClick={onRecheck}
-            disabled={isBusy}
+            disabled={isRecheckDisabled}
+            aria-describedby={
+              retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
+            }
           >
             {isRechecking ? "Checking…" : "Recheck Steam access"}
           </button>
@@ -358,7 +422,7 @@ function SignedInView({
             className="text-action"
             type="button"
             onClick={onLogout}
-            disabled={isBusy}
+            disabled={isSigningOut || isRechecking}
           >
             {isSigningOut ? "Signing out…" : "Sign out on this device"}
           </button>
@@ -368,6 +432,13 @@ function SignedInView({
       {(isRechecking || actionMessage) && (
         <p className={`action-status${actionMessage ? " action-status-error" : ""}`}>
           {isRechecking ? "Rechecking profile and inventory access…" : actionMessage}
+        </p>
+      )}
+
+      {retryAfterSeconds > 0 && (
+        <p id="recheck-cooldown" className="action-status cooldown-status">
+          Repeated immediate recheck requests are disabled. Try again in{" "}
+          {retryAfterSeconds}s.
         </p>
       )}
 
@@ -394,8 +465,32 @@ export function App() {
   const [viewState, setViewState] = useState<ViewState>({ kind: "loading" });
   const [isRechecking, setIsRechecking] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [retryDeadlineMs, setRetryDeadlineMs] = useState<number | null>(null);
+  const [countdownNowMs, setCountdownNowMs] = useState(() => performance.now());
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [statusAnnouncement, setStatusAnnouncement] = useState("Checking session…");
+  const retryDeadlineRef = useRef<number | null>(null);
+  const recheckInFlightRef = useRef(false);
+  const retryAfterSeconds = secondsUntilDeadline(
+    retryDeadlineMs,
+    countdownNowMs
+  );
+
+  const applySession = useCallback((session: SessionResponse) => {
+    const nowMs = performance.now();
+    const deadlineMs =
+      session.authenticated &&
+        session.checks.inventory.retry_after_seconds !== null
+        ? nowMs +
+        session.checks.inventory.retry_after_seconds *
+        MILLISECONDS_PER_SECOND
+        : null;
+
+    retryDeadlineRef.current = deadlineMs;
+    setRetryDeadlineMs(deadlineMs);
+    setCountdownNowMs(nowMs);
+    setViewState(toViewState(session));
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -403,7 +498,7 @@ export function App() {
     void requestSession(controller.signal)
       .then((session) => {
         if (!controller.signal.aborted) {
-          setViewState(toViewState(session));
+          applySession(session);
           setStatusAnnouncement("");
         }
       })
@@ -415,7 +510,31 @@ export function App() {
       });
 
     return () => controller.abort();
-  }, []);
+  }, [applySession]);
+
+  useEffect(() => {
+    if (retryDeadlineMs === null) {
+      return;
+    }
+
+    const remainingMs = retryDeadlineMs - performance.now();
+    if (remainingMs <= 0) {
+      retryDeadlineRef.current = null;
+      return;
+    }
+
+    const remainingSeconds = Math.ceil(
+      remainingMs / MILLISECONDS_PER_SECOND
+    );
+    const nextTickMs =
+      remainingMs -
+      (remainingSeconds - 1) * MILLISECONDS_PER_SECOND;
+    const timeoutId = window.setTimeout(() => {
+      setCountdownNowMs(performance.now());
+    }, nextTickMs);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [countdownNowMs, retryDeadlineMs]);
 
   async function handleRetry() {
     setViewState({ kind: "loading" });
@@ -423,7 +542,7 @@ export function App() {
     setStatusAnnouncement("Checking session…");
 
     try {
-      setViewState(toViewState(await requestSession()));
+      applySession(await requestSession());
       setStatusAnnouncement("");
     } catch {
       setViewState({ kind: "api-unavailable" });
@@ -432,13 +551,22 @@ export function App() {
   }
 
   async function handleRecheck() {
+    if (
+      recheckInFlightRef.current ||
+      isSigningOut ||
+      secondsUntilDeadline(retryDeadlineRef.current, performance.now()) > 0
+    ) {
+      return;
+    }
+
+    recheckInFlightRef.current = true;
     setIsRechecking(true);
     setActionMessage(null);
     setStatusAnnouncement("Rechecking profile and inventory access…");
 
     try {
       const session = await requestSession();
-      setViewState(toViewState(session));
+      applySession(session);
       setStatusAnnouncement(
         session.authenticated
           ? `Recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Steam inventory: ${STATUS_LABELS[session.checks.inventory.status]}.`
@@ -450,6 +578,7 @@ export function App() {
       setActionMessage(message);
       setStatusAnnouncement(message);
     } finally {
+      recheckInFlightRef.current = false;
       setIsRechecking(false);
     }
   }
@@ -469,7 +598,7 @@ export function App() {
         throw new Error("The logout service returned an unexpected response.");
       }
 
-      setViewState({ kind: "signed-out" });
+      applySession({ authenticated: false });
       setStatusAnnouncement("Signed out successfully.");
     } catch {
       const message =
@@ -523,6 +652,7 @@ export function App() {
             session={viewState.session}
             isRechecking={isRechecking}
             isSigningOut={isSigningOut}
+            retryAfterSeconds={retryAfterSeconds}
             actionMessage={actionMessage}
             onRecheck={() => void handleRecheck()}
             onLogout={() => void handleLogout()}
@@ -535,6 +665,10 @@ export function App() {
       <footer className="site-footer">
         <p>Steam Optimizer</p>
         <p>Public data in. Manual decisions out.</p>
+        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
+          Privacy &amp; Steam data terms
+          <span className="visually-hidden"> (opens in a new tab)</span>
+        </a>
       </footer>
     </div>
   );

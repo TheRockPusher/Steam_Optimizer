@@ -22,6 +22,50 @@ but it does not grant access to a private inventory. Inventory access therefore 
 the user's Steam Community inventory to be public. The application never receives Steam passwords
 or Steam Guard codes.
 
+## Data handling, compliance, and upstream limits
+
+The profile-visibility check uses Valve's documented [Steam Web API](https://steamcommunity.com/dev)
+when its optional key is configured. The inventory check calls Steam Community's
+`/inventory/{steamid}/753/6` route, which is not listed in that Web API reference. The key remains
+server-only and does not fix that separate Community route. The 100,000-call daily term in
+[Valve's API terms](https://steamcommunity.com/dev/apiterms) is stated for the Web API; this
+project does not present it as a quota for the Community route.
+
+The project is designed around relevant boundaries in those terms: it retrieves Steam data only for
+a user-requested check, never receives or stores Steam passwords or Steam Guard codes, presents data
+as-is, and does not automate transactions or degrade Steam. It does not imply Valve or Steam
+endorsement. The [official button artwork](https://steamcommunity.com/dev) requested on Steam's
+developer page is local and does not imply affiliation. The signed HTTP-only session cookie contains
+the SteamID64 on the user's device for up to 24 hours by default, is sent to the Railway-hosted
+backend on session requests, and is cleared by logout or expiry. The public
+[privacy policy and Steam Data disclaimer](../README.md#privacy-and-steam-data-policy) disclose
+storage, deletion, warranty, and liability terms.
+
+The process-local state in Railway's configured US region treats only the SteamID64 and definitive
+public inventory-visibility result as reusable for five minutes. During an enforced cooldown it
+also retains the last public, private, unavailable, or rate-limited result for up to 900 seconds.
+No inventory payload persists. Expired entries are removed by later inventory traffic or process
+restart; until then they can remain in process memory but are never reused after their deadlines.
+State is bounded to 1,024 SteamIDs. HTTP 429 responses and bodies are never cached; session responses
+use `Cache-Control: no-store`.
+
+The Community route has no published `Retry-After` guarantee. Following [RFC 6585
+§4](https://www.rfc-editor.org/rfc/rfc6585#section-4), the app never stores 429 responses and
+honors valid nonnegative-second or HTTP-date
+[`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3) values. A per-SteamID
+30-second cooldown prevents duplicate checks; each check makes at most three upstream attempts,
+with 1- and 2-second fallback delays and at most five seconds of retry-sleep time in addition to
+upstream request time. Hints beyond that inline bound are not slept, and the user cooldown is
+capped at 900 seconds. Only 429, 5xx, and network transients are retried; private or other 4xx
+responses, malformed 200 responses, and decoding failures are not. Concurrent checks for one
+SteamID coalesce.
+The terminal message is "Steam is temporarily limiting inventory checks. Try again in N seconds."
+It is shown as temporary limiting, not private; only rechecks are disabled while it counts down, and
+logout remains available.
+
+A static outbound IP may isolate network reputation but cannot guarantee no 429 response; it is not
+a cure for rate limiting.
+
 ## Technical direction
 
 - **Backend:** Python, FastAPI, and Pydantic, managed with uv; Ruff, Pyrefly, and pytest provide

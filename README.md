@@ -8,7 +8,7 @@ released under the [GNU AGPL v3.0](LICENSE).
 [![React 19.2](https://img.shields.io/badge/React-19.2-informational)](https://react.dev/)
 [![FastAPI 0.115](https://img.shields.io/badge/FastAPI-0.115-informational)](https://fastapi.tiangolo.com/)
 
-First released in 2026; current release: 0.1.0 (2026-08-26).
+First released in 2026; current release: 0.1.1 (2026-08-27).
 [TheRockPusher](https://github.com/TheRockPusher) maintains it to make Steam inventory and
 badge decisions transparent without automating account actions.
 
@@ -178,10 +178,64 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 - Commercial role or open-core model: none is documented; the repository is GNU AGPL v3.0.
 - Non-free components: Steam is a proprietary external service; no non-free component is bundled
   in this repository.
-- Required centralized services and terms: authentication and visibility checks depend on
-  [Steam Community](https://steamcommunity.com/), the
-  [Steam Web API](https://steamcommunity.com/dev), and Valve's
-  [API terms](https://steamcommunity.com/dev/apiterms).
-- Off-device data transmission and privacy policy: the browser is redirected to Steam for login,
-  and the backend sends the verified SteamID64 to Steam for visibility checks. No project-specific
-  privacy policy is currently published.
+- Centralized services and terms: authentication and inventory visibility checks depend on
+  [Steam Community](https://steamcommunity.com/). Profile visibility uses Valve's documented
+  [Steam Web API](https://steamcommunity.com/dev) when a key is configured. The
+  `/inventory/{steamid}/753/6` Community route is not listed in that Web API reference; the key
+  does not fix that separate route. The 100,000-call daily term in [Valve's API
+  terms](https://steamcommunity.com/dev/apiterms) describes the Web API, not a documented quota
+  for the Community route.
+- Deployment caveat: a static outbound IP may isolate this service's network reputation, but it
+  cannot guarantee that Steam will avoid 429 responses and is not a cure for rate limiting.
+
+### Privacy and Steam Data Policy
+
+This section is Steam Optimizer's published privacy policy. It applies to the deployed service and
+was last updated on 2026-08-27.
+
+- Data handling and privacy policy: the browser redirects to Steam for login, and the backend sends
+  the verified SteamID64 to Steam only for the user's requested checks. Steam data is presented
+  as-is; the app does not automate transactions or degrade Steam. No Steam password or Steam Guard
+  code is received or stored. The signed, HTTP-only session cookie contains the SteamID64 on the
+  user's device for up to 24 hours by default; it is sent to the Railway-hosted backend on session
+  requests and cleared by logout or expiry.
+- Process-local inventory state: Railway's configured US region treats the SteamID64 and definitive
+  public inventory-visibility result as reusable for five minutes. During an enforced cooldown it
+  also retains the last public, private, unavailable, or rate-limited visibility result for up to
+  900 seconds. No inventory payload persists. Expired entries are removed by later inventory
+  traffic or process restart; until then they can remain in process memory but are never reused
+  after their deadlines. State is bounded to 1,024 SteamIDs. A 429 response or body is never cached;
+  session responses use `Cache-Control: no-store`.
+- Community-route rate limits: this route is undocumented and Steam publishes no `Retry-After`
+  guarantee for it. A per-SteamID 30-second cooldown prevents duplicate checks; each check makes
+  at most three upstream attempts, with 1- and 2-second fallback delays and at most five seconds
+  of retry-sleep time in addition to upstream request time. Valid nonnegative-second or HTTP-date
+  [`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3) values take precedence;
+  hints that exceed the inline bound are not slept, and the user cooldown
+  is capped at 900 seconds. The policy retries only 429, 5xx, and network transients, not private
+  or other 4xx responses or malformed 200 responses. This follows [RFC 6585
+  §4](https://www.rfc-editor.org/rfc/rfc6585#section-4), which says 429 responses must not be
+  stored and may include `Retry-After`. The terminal message is "Steam is temporarily limiting
+  inventory checks. Try again in N seconds." It is shown as temporary limiting, not private; the UI
+  disables only rechecks until it expires, while logout remains available.
+- Sign-in branding: the local button uses the [Steam-requested sign-in
+  artwork](https://steamcommunity.com/dev); it does not imply Valve or Steam endorsement or
+  affiliation.
+
+Users can clear the local session through **Sign out on this device** or by deleting the browser
+cookie. Questions or deletion requests can be filed through the repository's
+[GitHub issues](https://github.com/TheRockPusher/Steam_Optimizer/issues).
+
+### Steam Data Disclaimer
+
+The Steam Web API, Steam Data, and Valve Brand and Links are provided **as is**, **with all faults**,
+and **as available**. To the maximum extent permitted by law, Valve and its suppliers disclaim
+express, implied, and statutory warranties, including merchantability, fitness for a particular
+purpose, title, non-infringement, and uninterrupted or error-free availability. To the maximum
+extent permitted by law, Valve and its suppliers are not liable for any damages—including indirect,
+consequential, special, incidental, or punitive damages—arising from these terms or use of the Steam
+Web API, Steam Data, or Valve Brand and Links, even if advised that damages were possible. These
+exclusions apply regardless of breach of contract, warranty, negligence, or another cause of action.
+If you disagree with these conditions, your sole and exclusive remedy is to discontinue use. See
+Valve's [Steam Web API Terms of Use](https://steamcommunity.com/dev/apiterms) for the controlling
+terms and limitations under applicable law.

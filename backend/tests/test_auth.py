@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -24,10 +26,12 @@ from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
     INVENTORY_ENDPOINT,
+    INVENTORY_LOCK_STRIPES,
     PROFILE_ENDPOINT,
     InventoryCheck,
     ProfileCheck,
     SteamGateway,
+    parse_retry_after,
 )
 from app.steam_openid import (
     OpenIDVerifierUnavailableError,
@@ -54,6 +58,9 @@ class UnavailableVerifier:
 
 
 class FakeGateway:
+    def __init__(self, *, inventory_retry_after_seconds: int | None = None) -> None:
+        self.inventory_retry_after_seconds = inventory_retry_after_seconds
+
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         del steam_id
         return ProfileCheck(
@@ -65,7 +72,11 @@ class FakeGateway:
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         del steam_id
-        return InventoryCheck(status="private", message="inventory private")
+        return InventoryCheck(
+            status="private",
+            message="inventory private",
+            retry_after_seconds=self.inventory_retry_after_seconds,
+        )
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -242,7 +253,7 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
     verifier = FakeVerifier()
     app = create_app(
         settings,
-        steam_gateway=FakeGateway(),
+        steam_gateway=FakeGateway(inventory_retry_after_seconds=17),
         openid_verifier=verifier,
         clock=lambda: NOW,
     )
@@ -270,21 +281,39 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
         },
         "checks": {
             "profile": {"status": "public", "message": "profile ok"},
-            "inventory": {"status": "private", "message": "inventory private"},
+            "inventory": {
+                "status": "private",
+                "message": "inventory private",
+                "retry_after_seconds": 17,
+                "rate_limited": False,
+            },
         },
     }
+    assert session.headers["cache-control"] == "no-store"
     assert logout.status_code == 204
     assert after_logout.json() == {"authenticated": False}
+    assert after_logout.headers["cache-control"] == "no-store"
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: object) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: object,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.payload = payload
+        self.headers = dict(headers or {})
         self.text = ""
 
     def json(self) -> object:
         return self.payload
+
+
+async def no_sleep(seconds: float) -> None:
+    del seconds
 
 
 class FakePostClient:
@@ -361,10 +390,355 @@ class TrackingHTTPClient:
                 200,
                 {"response": {"players": [{"communityvisibilitystate": 3}]}},
             )
+
         return FakeResponse(200, {"success": 1})
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class ManualInventoryClock:
+    def __init__(self) -> None:
+        self.monotonic = 0.0
+        self.wall = NOW
+        self.sleeps: list[float] = []
+
+    def monotonic_now(self) -> float:
+        return self.monotonic
+
+    def utc_now(self) -> datetime:
+        return self.wall
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.monotonic += seconds
+        self.wall += timedelta(seconds=seconds)
+
+
+class SequenceHTTPClient:
+    def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    async def get(
+        self, url: str, *, params: Mapping[str, str] | None = None
+    ) -> FakeResponse:
+        del url, params
+        self.calls += 1
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    async def post(self, url: str, *, data: Mapping[str, str]) -> FakeResponse:
+        del url, data
+        raise AssertionError
+
+
+def make_inventory_gateway(
+    client: SequenceHTTPClient, clock: ManualInventoryClock
+) -> SteamGateway:
+    return SteamGateway(
+        make_settings(steam_web_api_key="key"),
+        http_client=client,
+        monotonic_clock=clock.monotonic_now,
+        utc_clock=clock.utc_now,
+        sleep=clock.sleep,
+    )
+
+
+def test_inventory_short_retry_after_is_honored_before_success() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [
+            FakeResponse(429, {}, headers={"Retry-After": "2"}),
+            FakeResponse(200, {"success": 1}),
+        ]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.status == "public"
+    assert result.retry_after_seconds == 30
+    assert result.rate_limited is False
+    assert client.calls == 2
+    assert clock.sleeps == [2]
+
+
+def test_inventory_long_retry_after_returns_without_sleep_and_caps_cooldown() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [FakeResponse(429, {}, headers={"Retry-After": "1200"})]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.status == "unavailable"
+    assert result.retry_after_seconds == 900
+    assert result.rate_limited is True
+    assert result.message == (
+        "Steam is temporarily limiting inventory checks. Try again in 900 seconds."
+    )
+    assert client.calls == 1
+    assert clock.sleeps == []
+
+
+def test_inventory_missing_retry_after_uses_bounded_exponential_backoff() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [FakeResponse(429, {}), FakeResponse(429, {}), FakeResponse(429, {})]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.status == "unavailable"
+    assert result.retry_after_seconds == 30
+    assert result.rate_limited is True
+    assert result.message.endswith("Try again in 30 seconds.")
+    assert client.calls == 3
+    assert clock.sleeps == [1, 2]
+    assert sum(clock.sleeps) <= 5
+
+
+def test_inventory_http_date_retry_after_uses_injected_wall_clock() -> None:
+    clock = ManualInventoryClock()
+    retry_at = "Wed, 26 Aug 2026 12:00:02 GMT"
+    client = SequenceHTTPClient(
+        [
+            FakeResponse(429, {}, headers={"Retry-After": retry_at}),
+            FakeResponse(200, {"success": 1}),
+        ]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.status == "public"
+    assert client.calls == 2
+    assert clock.sleeps == [2]
+
+
+def test_retry_after_accepts_obsolete_dates_and_overlarge_seconds() -> None:
+    assert (
+        parse_retry_after(
+            "Wed Aug 26 12:00:02 2026",
+            now=NOW,
+        )
+        == 2
+    )
+    rfc850_delay = parse_retry_after(
+        "Wednesday, 26-Aug-75 12:00:02 GMT",
+        now=NOW,
+    )
+    assert rfc850_delay is not None
+    assert rfc850_delay > 48 * 365 * 24 * 60 * 60
+    assert math.isinf(parse_retry_after("9" * 5000, now=NOW) or 0)
+
+
+def test_inventory_decoding_error_is_not_retried() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [
+            httpx2.DecodingError("malformed compressed body"),
+            FakeResponse(200, {"success": 1}),
+        ]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.status == "unavailable"
+    assert result.retry_after_seconds == 30
+    assert result.rate_limited is False
+    assert client.calls == 1
+    assert clock.sleeps == []
+
+
+def test_inventory_public_cache_cooldown_and_expiry() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [FakeResponse(200, {"success": 1}), FakeResponse(200, {"success": 1})]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    first = asyncio.run(gateway.check_inventory("76561198000000000"))
+    clock.monotonic = 10
+    during_cooldown = asyncio.run(gateway.check_inventory("76561198000000000"))
+    clock.monotonic = 31
+    cached = asyncio.run(gateway.check_inventory("76561198000000000"))
+    clock.monotonic = 301
+    expired = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert first.retry_after_seconds == 30
+    assert first.rate_limited is False
+    assert during_cooldown.status == "public"
+    assert during_cooldown.retry_after_seconds == 20
+    assert cached.status == "public"
+    assert cached.retry_after_seconds is None
+    assert expired.status == "public"
+    assert client.calls == 2
+
+
+def test_inventory_concurrent_same_steam_id_deduplicates_upstream_call() -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient([FakeResponse(200, {"success": 1})])
+    gateway = make_inventory_gateway(client, clock)
+
+    async def run() -> tuple[InventoryCheck, InventoryCheck]:
+        return await asyncio.gather(
+            gateway.check_inventory("76561198000000000"),
+            gateway.check_inventory("76561198000000000"),
+        )
+
+    first, second = asyncio.run(run())
+
+    assert first.status == second.status == "public"
+    assert client.calls == 1
+
+
+def test_inventory_capacity_preserves_active_cooldowns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.steam_gateway.INVENTORY_MAX_STEAM_IDS", 2)
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [
+            FakeResponse(200, {"success": 1}),
+            FakeResponse(200, {"success": 1}),
+        ]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    first = asyncio.run(gateway.check_inventory("76561198000000001"))
+    second = asyncio.run(gateway.check_inventory("76561198000000002"))
+    at_capacity = asyncio.run(gateway.check_inventory("76561198000000003"))
+    first_again = asyncio.run(gateway.check_inventory("76561198000000001"))
+
+    assert first.status == second.status == first_again.status == "public"
+    assert at_capacity.status == "unavailable"
+    assert at_capacity.retry_after_seconds == 30
+    assert "temporarily busy" in at_capacity.message
+    assert client.calls == 2
+
+
+def test_inventory_capacity_rejection_enforces_admission_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.steam_gateway.INVENTORY_MAX_STEAM_IDS", 1)
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient(
+        [
+            FakeResponse(403, {}),
+            FakeResponse(200, {"success": 1}),
+        ]
+    )
+    gateway = make_inventory_gateway(client, clock)
+
+    first = asyncio.run(gateway.check_inventory("76561198000000001"))
+    clock.monotonic = 25
+    rejected = asyncio.run(gateway.check_inventory("76561198000000002"))
+    clock.monotonic = 31
+    still_rejected = asyncio.run(gateway.check_inventory("76561198000000002"))
+    clock.monotonic = 55
+    admitted = asyncio.run(gateway.check_inventory("76561198000000002"))
+
+    assert first.status == "private"
+    assert rejected.retry_after_seconds == 30
+    assert still_rejected.retry_after_seconds == 24
+    assert admitted.status == "public"
+    assert client.calls == 2
+
+
+def test_inventory_capacity_reserves_pending_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.steam_gateway.INVENTORY_MAX_STEAM_IDS", 1)
+
+    async def run() -> tuple[InventoryCheck, InventoryCheck, int]:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        clock = ManualInventoryClock()
+
+        class BlockingHTTPClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def get(
+                self,
+                url: str,
+                *,
+                params: Mapping[str, str] | None = None,
+            ) -> FakeResponse:
+                del url, params
+                self.calls += 1
+                started.set()
+                await release.wait()
+                return FakeResponse(200, {"success": 1})
+
+            async def post(
+                self,
+                url: str,
+                *,
+                data: Mapping[str, str],
+            ) -> FakeResponse:
+                del url, data
+                raise AssertionError
+
+        client = BlockingHTTPClient()
+        gateway = SteamGateway(
+            make_settings(steam_web_api_key="key"),
+            http_client=client,
+            monotonic_clock=clock.monotonic_now,
+            utc_clock=clock.utc_now,
+            sleep=clock.sleep,
+        )
+        first_id = "76561198000000001"
+        second_id = next(
+            str(candidate)
+            for candidate in range(76561198000000002, 76561198000000100)
+            if hash(str(candidate)) % INVENTORY_LOCK_STRIPES
+            != hash(first_id) % INVENTORY_LOCK_STRIPES
+        )
+        first_task = asyncio.create_task(gateway.check_inventory(first_id))
+        await started.wait()
+        clock.monotonic = 31
+        second = await gateway.check_inventory(second_id)
+        release.set()
+        first = await first_task
+        return first, second, client.calls
+
+    first, second, calls = asyncio.run(run())
+
+    assert first.status == "public"
+    assert second.status == "unavailable"
+    assert "temporarily busy" in second.message
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_status"),
+    [
+        (FakeResponse(403, {}), "private"),
+        (FakeResponse(404, {}), "unavailable"),
+        (FakeResponse(200, {"success": "1"}), "unavailable"),
+    ],
+)
+def test_inventory_non_retry_cases_do_not_retry(
+    response: FakeResponse, expected_status: str
+) -> None:
+    clock = ManualInventoryClock()
+    client = SequenceHTTPClient([response, FakeResponse(200, {"success": 1})])
+    gateway = make_inventory_gateway(client, clock)
+
+    result = asyncio.run(gateway.check_inventory("76561198000000000"))
+
+    assert result.retry_after_seconds == 30
+    assert result.rate_limited is False
+    assert result.status == expected_status
+    assert client.calls == 1
 
 
 def test_default_steam_boundaries_share_and_close_lifespan_client(
@@ -498,14 +872,8 @@ def test_inventory_rate_limit_and_server_failure_stay_unavailable() -> None:
     for status_code in (429, 500, 503):
         gateway = SteamGateway(
             make_settings(steam_web_api_key="key"),
-            http_client=FakeHttpClient(
-                {
-                    inventory_url: FakeResponse(
-                        status_code,
-                        {"Error": "This profile is private."},
-                    )
-                }
-            ),
+            http_client=FakeHttpClient({inventory_url: FakeResponse(status_code, {})}),
+            sleep=no_sleep,
         )
         result = asyncio.run(gateway.check_inventory("76561198000000000"))
         assert result.status == "unavailable"

@@ -44,9 +44,14 @@ class SessionCheck(BaseModel):
     message: str
 
 
+class SessionInventoryCheck(SessionCheck):
+    retry_after_seconds: int | None = None
+    rate_limited: bool = False
+
+
 class SessionChecks(BaseModel):
     profile: SessionCheck
-    inventory: SessionCheck
+    inventory: SessionInventoryCheck
 
 
 class AuthenticatedSessionResponse(BaseModel):
@@ -155,9 +160,11 @@ def _session_response(
                 status=profile.status,
                 message=profile.message,
             ),
-            inventory=SessionCheck(
+            inventory=SessionInventoryCheck(
                 status=inventory.status,
                 message=inventory.message,
+                retry_after_seconds=inventory.retry_after_seconds,
+                rate_limited=inventory.rate_limited,
             ),
         ),
     )
@@ -325,7 +332,8 @@ def create_auth_router(
             return response
 
     @router.get("/api/auth/session", response_model=SessionResponse)
-    async def auth_session(request: Request) -> SessionResponse:
+    async def auth_session(request: Request, response: Response) -> SessionResponse:
+        response.headers["Cache-Control"] = "no-store"
         token = request.cookies.get(settings.session_cookie_name)
         if not token:
             return UnauthenticatedSessionResponse()

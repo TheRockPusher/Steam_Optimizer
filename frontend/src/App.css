@@ -229,7 +229,6 @@ h3 {
   margin-top: var(--space-3);
 }
 
-.primary-action,
 .secondary-action,
 .text-action {
   display: inline-flex;
@@ -246,20 +245,22 @@ h3 {
     transform var(--transition-slow);
 }
 
-.primary-action {
-  gap: var(--space-3);
+.steam-sign-in-link {
+  display: inline-block;
+  max-width: 100%;
   margin-top: var(--space-6);
-  padding: var(--space-3) var(--space-5);
-  border: var(--border-width) solid var(--color-accent);
-  color: var(--color-on-accent);
-  background: var(--color-accent);
-  text-decoration: none;
+  border-radius: var(--radius-sm);
+  line-height: 0;
 }
 
-.primary-action:hover {
-  border-color: var(--color-accent-strong);
-  background: var(--color-accent-strong);
-  transform: translateY(calc(var(--space-1) * -0.5));
+.steam-sign-in-picture,
+.steam-sign-in-image {
+  display: block;
+}
+
+.steam-sign-in-image {
+  max-width: 100%;
+  height: auto;
 }
 
 .secondary-action {
@@ -287,7 +288,13 @@ h3 {
   color: var(--color-ink);
 }
 
-.secondary-action:disabled,
+.secondary-action:disabled {
+  border-color: var(--color-line-soft);
+  color: var(--color-ink-faint);
+  background: var(--color-unavailable-soft);
+  cursor: not-allowed;
+}
+
 .text-action:disabled {
   cursor: wait;
   opacity: 0.55;
@@ -413,6 +420,12 @@ h3 {
 .action-status-error {
   color: var(--color-error);
   background: var(--color-error-soft);
+}
+
+.cooldown-status {
+  color: var(--color-unavailable);
+  background: var(--color-unavailable-soft);
+  font-variant-numeric: tabular-nums;
 }
 
 .access-intro {
@@ -554,6 +567,7 @@ h3 {
 .site-footer {
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: var(--space-4);
   padding: var(--space-5) var(--page-gutter) var(--space-7);
   color: var(--color-ink-faint);

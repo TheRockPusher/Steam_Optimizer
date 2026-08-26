@@ -10,6 +10,11 @@ class HTTPResponse(Protocol):
     status_code: int
 
     @property
+    def headers(self) -> Mapping[str, str]:
+        """Return response headers with case-insensitive keys."""
+        ...
+
+    @property
     def text(self) -> str:
         """Return the decoded response body."""
         ...
