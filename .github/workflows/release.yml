@@ -1,4 +1,4 @@
-name: Release notes
+name: Release
 
 on:
   push:
@@ -6,12 +6,213 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-production
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate tag, main ancestry, and backend version
+        env:
+          TAG: ${{ github.ref_name }}
+          TAG_COMMIT: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF_PROTECTED" != "true" ]]; then
+            echo "Release tag must be protected by an active GitHub ruleset." >&2
+            exit 1
+          fi
+
+
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must match vMAJOR.MINOR.PATCH: $TAG" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+            echo "Release tag commit is not on origin/main." >&2
+            exit 1
+          fi
+
+          tag_version="${TAG#v}"
+          project_version="$(
+            python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("backend/pyproject.toml").open("rb") as pyproject:
+              print(tomllib.load(pyproject)["project"]["version"])
+          PY
+          )"
+          if [[ "$tag_version" != "$project_version" ]]; then
+            echo "Release tag version and backend project.version differ." >&2
+            exit 1
+          fi
+
+  ci:
+    name: Run CI checks
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  deploy-backend:
+    name: Deploy backend to production
+    needs: [validate, ci]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli@5.44.1
+      - name: Deploy backend source
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+        run: railway up ./backend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service backend
+
+  smoke-backend:
+    name: Smoke check backend
+    needs: deploy-backend
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check backend health
+        run: curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors "${{ vars.BACKEND_URL }}/api/health"
+
+  deploy-frontend:
+    name: Deploy frontend to production
+    needs: smoke-backend
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli@5.44.1
+      - name: Deploy frontend source
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+        run: railway up ./frontend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service frontend
+
+  smoke-frontend:
+    name: Smoke check frontend
+    needs: deploy-frontend
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check frontend root
+        run: curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors "${{ vars.FRONTEND_URL }}/"
+      - name: Check proxied authentication endpoints
+        env:
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import parse_qs, urlsplit
+          from urllib.request import HTTPRedirectHandler, build_opener, urlopen
+
+          frontend_url = os.environ["FRONTEND_URL"].rstrip("/")
+
+          with urlopen(f"{frontend_url}/api/auth/session", timeout=20) as response:
+              session = json.load(response)
+          if session != {"authenticated": False}:
+              raise SystemExit(f"Unexpected session response: {session!r}")
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(
+                  self,
+                  request,
+                  file_pointer,
+                  code,
+                  message,
+                  headers,
+                  new_url,
+              ):
+                  return None
+
+          try:
+              build_opener(NoRedirect).open(
+                  f"{frontend_url}/api/auth/steam/start",
+                  timeout=20,
+              )
+          except HTTPError as error:
+              if error.code != 302:
+                  raise
+              redirect_response = error
+          else:
+              raise SystemExit("Steam start endpoint did not redirect.")
+
+          location = redirect_response.headers["Location"]
+          redirect_url = urlsplit(location)
+          if (
+              redirect_url.scheme != "https"
+              or redirect_url.netloc != "steamcommunity.com"
+              or redirect_url.path != "/openid/login"
+          ):
+              raise SystemExit(f"Unexpected Steam redirect: {location}")
+
+          parameters = parse_qs(redirect_url.query)
+          return_to = parameters.get("openid.return_to", [""])[0]
+          expected_callback = f"{frontend_url}/api/auth/steam/callback?state="
+          if not return_to.startswith(expected_callback):
+              raise SystemExit(f"Unexpected OpenID return_to: {return_to}")
+
+          state_cookie = redirect_response.headers.get("Set-Cookie", "")
+          required_attributes = ("HttpOnly", "Secure", "SameSite=lax")
+          if not all(attribute in state_cookie for attribute in required_attributes):
+              raise SystemExit("Steam login-state cookie is missing secure attributes.")
+          PY
+
   release:
     name: Publish release notes
+    needs: [validate, ci, deploy-backend, smoke-backend, deploy-frontend, smoke-frontend]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

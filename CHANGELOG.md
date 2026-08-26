@@ -5,3 +5,5 @@ All notable changes to Steam Optimizer are documented here. Release notes are ge
 ## Unreleased
 
 - Establish the initial backend, frontend, repository tooling, and documentation scaffold.
+- Add Steam OpenID login, signed local sessions, public profile and inventory
+  visibility checks, and the first-stage connection interface.
