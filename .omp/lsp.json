@@ -1,0 +1,28 @@
+{
+  "servers": {
+    "typescript-language-server": {
+      "command": "corepack",
+      "args": [
+        "pnpm@10.15.0",
+        "--dir",
+        "frontend",
+        "exec",
+        "typescript-language-server",
+        "--stdio"
+      ],
+      "rootMarkers": ["frontend/tsconfig.json"]
+    },
+    "pyrefly": {
+      "command": "uv",
+      "args": ["run", "--project", "backend", "pyrefly", "lsp"],
+      "fileTypes": [".py", ".pyi"],
+      "languageId": "python",
+      "rootMarkers": ["backend/pyproject.toml"]
+    },
+    "ruff": {
+      "command": "uv",
+      "args": ["run", "--project", "backend", "ruff", "server"],
+      "rootMarkers": ["backend/pyproject.toml"]
+    }
+  }
+}
