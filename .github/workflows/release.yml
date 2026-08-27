@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without a leading v (for example, 0.1.2)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,8 +19,104 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare release reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
+      release_commit: ${{ steps.release.outputs.release_commit }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve and prepare release reference
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          TAG_COMMIT: ${{ github.sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$REF_NAME" != "main" ]]; then
+              echo "Manual production releases must run from main." >&2
+              exit 1
+            fi
+            if [[ ! "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Manual release version must match MAJOR.MINOR.PATCH: $INPUT_VERSION" >&2
+              exit 1
+            fi
+            release_version="$INPUT_VERSION"
+            release_tag="v$release_version"
+          else
+            release_tag="$REF_NAME"
+            if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Release tag must match vMAJOR.MINOR.PATCH: $release_tag" >&2
+              exit 1
+            fi
+            release_version="${release_tag#v}"
+            if [[ "$REF_PROTECTED" != "true" ]]; then
+              echo "Release tag must be protected by an active GitHub ruleset." >&2
+              exit 1
+            fi
+          fi
+
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+            echo "Release commit is not on origin/main." >&2
+            exit 1
+          fi
+
+          project_version="$(
+            python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("backend/pyproject.toml").open("rb") as pyproject:
+              print(tomllib.load(pyproject)["project"]["version"])
+          PY
+          )"
+          if [[ "$release_version" != "$project_version" ]]; then
+            echo "Release version and backend project.version differ." >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            existing_commit="$(git ls-remote --refs origin "refs/tags/$release_tag" | cut -f1)"
+            if [[ -n "$existing_commit" ]]; then
+              if [[ "$existing_commit" != "$TAG_COMMIT" ]]; then
+                echo "Release tag already points to another commit: $release_tag" >&2
+                exit 1
+              fi
+            else
+              if ! gh api --method POST "repos/$REPOSITORY/git/refs" \
+                -f "ref=refs/tags/$release_tag" \
+                -f "sha=$TAG_COMMIT"; then
+                echo "Could not create the protected release tag. Grant the GitHub Actions actor bypass access to the release-tag ruleset, or use the protected-tag UI flow." >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          {
+            echo "release_tag=$release_tag"
+            echo "release_version=$release_version"
+            echo "release_commit=$TAG_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate release tag
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -26,19 +128,19 @@ jobs:
           fetch-depth: 0
       - name: Validate tag, main ancestry, and backend version
         env:
-          TAG: ${{ github.ref_name }}
-          TAG_COMMIT: ${{ github.sha }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          TAG_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+          TAG_VERSION: ${{ needs.prepare.outputs.release_version }}
+          EVENT_NAME: ${{ github.event_name }}
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
-          if [[ "$REF_PROTECTED" != "true" ]]; then
-            echo "Release tag must be protected by an active GitHub ruleset." >&2
-            exit 1
-          fi
-
-
           if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Release tag must match vMAJOR.MINOR.PATCH: $TAG" >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "push" && "$REF_PROTECTED" != "true" ]]; then
+            echo "Release tag must be protected by an active GitHub ruleset." >&2
             exit 1
           fi
 
@@ -48,7 +150,6 @@ jobs:
             exit 1
           fi
 
-          tag_version="${TAG#v}"
           project_version="$(
             python - <<'PY'
           import tomllib
@@ -58,7 +159,7 @@ jobs:
               print(tomllib.load(pyproject)["project"]["version"])
           PY
           )"
-          if [[ "$tag_version" != "$project_version" ]]; then
+          if [[ "$TAG_VERSION" != "$project_version" ]]; then
             echo "Release tag version and backend project.version differ." >&2
             exit 1
           fi
@@ -208,7 +309,16 @@ jobs:
 
   release:
     name: Publish release notes
-    needs: [validate, ci, deploy-backend, smoke-backend, deploy-frontend, smoke-frontend]
+    needs:
+      [
+        prepare,
+        validate,
+        ci,
+        deploy-backend,
+        smoke-backend,
+        deploy-frontend,
+        smoke-frontend,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -218,6 +328,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_commit }}
       - name: Generate release notes with git-cliff
         uses: orhun/git-cliff-action@v4
         with:
@@ -229,3 +340,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: RELEASE_NOTES.md
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ needs.prepare.outputs.release_commit }}

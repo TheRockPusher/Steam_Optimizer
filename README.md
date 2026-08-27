@@ -123,11 +123,26 @@ Each service has its own Dockerfile. Infrastructure is managed separately with t
 
 ### Production release deployment
 
-Production is the only deployed environment; there is no staging environment yet. A protected
-`vMAJOR.MINOR.PATCH` tag is the only deployment trigger. The release workflow validates strict tag
-syntax, verifies that the tag commit is on `origin/main`, and verifies that the tag matches the
-backend `project.version`. Normal continuous integration still runs on pull requests and `main`;
-the release invokes that reusable CI before deploying.
+Production is the only deployed environment; there is no staging environment yet. The release
+workflow accepts either a protected `vMAJOR.MINOR.PATCH` tag push or an explicit GitHub UI
+dispatch. It validates strict tag syntax, verifies that the release commit is on `origin/main`,
+and verifies that the tag matches the backend `project.version`. Normal continuous integration
+still runs on pull requests and `main`; the release invokes that reusable CI before deploying.
+
+### Run a release from the GitHub UI
+
+After the version commit has been merged to `main`, open **Actions → Release → Run workflow**.
+Keep the branch set to `main`, enter the backend `project.version` without the leading `v` (for
+example, `0.1.2`), and run the workflow. The workflow validates the version and commit, creates
+`v0.1.2` inside that same run, then executes the existing continuous-integration, deployment,
+smoke-check, and release-note jobs directly. A tag created with `GITHUB_TOKEN` does not start a
+second workflow.
+
+The active release-tag ruleset must permit the GitHub Actions actor to create protected `v*` tags.
+If it does not, the manual run stops before deployment; grant that actor bypass access or use
+**Releases → Draft a new release**, create the same tag on `main`, and publish it to trigger the
+tag-based path. The input version must already match `backend/pyproject.toml`; the workflow does
+not edit source files or bump versions.
 
 Configure these values before the first production release:
 

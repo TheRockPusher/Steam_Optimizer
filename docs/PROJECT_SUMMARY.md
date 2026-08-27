@@ -76,11 +76,19 @@ EU-West, exact region `europe-west4-drams3a`; all future Railway processes must 
 
 ## Production deployment
 
-Production is the only deployed environment; no staging environment exists yet. A protected
-`vMAJOR.MINOR.PATCH` tag is the only deployment trigger. The release workflow validates strict tag
-syntax, verifies that the tag commit is on `origin/main`, and verifies that the tag matches the
-backend `project.version`. Normal continuous integration still runs on pull requests and `main`;
-the release invokes that reusable CI before deploying.
+Production is the only deployed environment; no staging environment exists yet. The release
+workflow accepts either a protected `vMAJOR.MINOR.PATCH` tag push or an explicit GitHub UI
+dispatch. It validates strict tag syntax, verifies that the release commit is on `origin/main`,
+and verifies that the tag matches the backend `project.version`. Normal continuous integration
+still runs on pull requests and `main`; the release invokes that reusable CI before deploying.
+
+To start a release from the GitHub UI, merge the version update to `main`, open **Actions →
+Release → Run workflow**, keep `main` selected, and enter the matching backend
+`project.version` without a leading `v`. The dispatched run validates the input, creates the
+version tag itself, and executes CI, deployment, smoke checks, and release-note publication in the
+same run; it does not rely on a second tag event. The active release-tag ruleset must permit the
+GitHub Actions actor to create protected `v*` tags. Otherwise, use **Releases → Draft a new
+release** and create the protected tag on `main` to use the tag-triggered path.
 
 The workflow uses Railway CLI 5.44.1 to upload `./backend` and then `./frontend` with
 `--path-as-root`, explicitly selecting the project, `production` environment, and service. It
