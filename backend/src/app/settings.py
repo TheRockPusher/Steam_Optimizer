@@ -34,6 +34,8 @@ _WILDCARD_ORIGIN_ERROR = "Credentialed CORS origins cannot include '*'."
 _EXPIRY_ERROR = "Expiry settings must be positive."
 _TIMEOUT_ERROR = "Steam request timeout must be positive."
 _BULK_TIMEOUT_ERROR = "Steam bulk request timeout must be positive."
+_GEM_CACHE_PATH_ERROR = "Gem price cache path must not be empty."
+_GEM_MISS_LIMIT_ERROR = "Gem lookup miss limit must not be negative."
 _MISSING_SIGNING_MESSAGE = "SIGNING_SECRET must be configured outside development."
 _WEAK_SIGNING_MESSAGE = (
     "SIGNING_SECRET must be a non-placeholder value of at least 32 characters "
@@ -73,6 +75,10 @@ class Settings(BaseSettings):
     nonce_future_skew_seconds: int = 60
     steam_request_timeout_seconds: float = 10.0
     steam_bulk_timeout_seconds: float = 120.0
+    gem_price_cache_path: str = "gem_price_cache.sqlite3"
+    gem_lookup_timeout_seconds: float = 10.0
+    gem_lookup_budget_seconds: float = 16.0
+    gem_lookup_max_misses_per_scan: int = 2
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -118,6 +124,27 @@ class Settings(BaseSettings):
     def positive_bulk_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError(_BULK_TIMEOUT_ERROR)
+        return value
+
+    @field_validator("gem_price_cache_path")
+    @classmethod
+    def nonempty_gem_cache_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError(_GEM_CACHE_PATH_ERROR)
+        return value
+
+    @field_validator("gem_lookup_timeout_seconds", "gem_lookup_budget_seconds")
+    @classmethod
+    def positive_gem_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError(_TIMEOUT_ERROR)
+        return value
+
+    @field_validator("gem_lookup_max_misses_per_scan")
+    @classmethod
+    def nonnegative_gem_miss_limit(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(_GEM_MISS_LIMIT_ERROR)
         return value
 
     @model_validator(mode="before")

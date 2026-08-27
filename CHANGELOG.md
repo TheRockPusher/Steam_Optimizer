@@ -15,8 +15,12 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   data-source caveats, and explicit partial price coverage. SteamApis omits currency metadata from its
   bulk feed; its order-book values are preserved and displayed as provider-denominated decimals without
   a currency symbol. Optimization must not treat these values as monetary until an authoritative
-  currency contract or explicit configuration exists. No current inventory or price cache or database
-  is used.
+  currency contract or explicit configuration exists. Market order-book snapshots are not persisted.
+  Gem yields use the persistent cache described below.
+- Add rate-limited, read-only gem-yield lookups once per game and normal/foil card rarity,
+  persist validated results in a Railway-backed SQLite cache, and derive per-card gem cash
+  estimates from the lowest-sell `753-Sack of Gems` price. Group trading cards by game and
+  expose sortable gem and provider-denominated cash-value columns.
 - Keep the optional Steam Web API profile key server-only.
 - Configure all Railway services and future Railway processes in EU-West
   (`europe-west4-drams3a`).

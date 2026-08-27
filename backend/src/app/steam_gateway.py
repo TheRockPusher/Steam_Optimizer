@@ -12,7 +12,17 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 import httpx2
 import ijson
 from ijson.common import IncompleteJSONError, JSONError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.gem_pricing import (
+    SACK_OF_GEMS_MARKET_HASH_NAME,
+    CardRarity,
+    GemPricingService,
+    GemScanResult,
+    canonical_decimal,
+    gem_cash_value,
+    parse_card_metadata,
+)
 
 if TYPE_CHECKING:
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
@@ -28,9 +38,14 @@ STEAM_ICON_BASE_URL = "https://community.cloudflare.steamstatic.com/economy/imag
 STEAM_OPTIMIZER_USER_AGENT = (
     "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
+_CANONICAL_SACK_PRICE_ERROR = "Sack price must be a canonical decimal."
+_CANONICAL_GEM_CASH_VALUE_ERROR = "Gem cash value must be a canonical decimal."
+_INVALID_ITEM_GEM_METADATA_ERROR = "Inventory item gem metadata is inconsistent."
 
 CheckStatus = Literal["public", "private", "unavailable"]
 PriceStatus = Literal["complete", "partial", "unavailable"]
+GemStatus = Literal["complete", "partial", "unavailable"]
+InventoryItemType = Literal["trading_card", "other"]
 
 _ASCII_DIGITS = re.compile(r"^[0-9]+$")
 _PRIVATE_INVENTORY_MESSAGE = (
@@ -100,6 +115,25 @@ class InventoryPrice(BaseModel):
     observed_at: str | None = None
 
 
+class GemCashContext(BaseModel):
+    currency: Literal[None] = None
+    basis: Literal["lowest_sell"] = "lowest_sell"
+    market_hash_name: Literal["753-Sack of Gems"] = SACK_OF_GEMS_MARKET_HASH_NAME
+    sack_gems: Literal[1000] = 1000
+    sack_price: str = Field(
+        pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
+        max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
+    )
+    observed_at: str | None = None
+
+    @field_validator("sack_price")
+    @classmethod
+    def require_canonical_sack_price(cls, value: str) -> str:
+        if canonical_decimal(value) != value:
+            raise ValueError(_CANONICAL_SACK_PRICE_ERROR)
+        return value
+
+
 class InventoryItem(BaseModel):
     class_id: str = Field(pattern=r"^[0-9]+$")
     instance_id: str = Field(pattern=r"^[0-9]+$")
@@ -109,7 +143,57 @@ class InventoryItem(BaseModel):
     icon_url: str | None = None
     marketable: bool
     tradable: bool
+    item_type: InventoryItemType = "other"
+    game_app_id: str | None = Field(default=None, pattern=r"^[0-9]+$")
+    game_name: str | None = None
+    card_rarity: CardRarity | None = None
+    gem_yield: int | None = Field(default=None, ge=0)
+    gem_cash_value: str | None = Field(
+        default=None,
+        max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
+        pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
+    )
     price: InventoryPrice | None = None
+
+    @field_validator("gem_cash_value")
+    @classmethod
+    def require_canonical_gem_cash_value(cls, value: str | None) -> str | None:
+        if value is not None and canonical_decimal(value) != value:
+            raise ValueError(_CANONICAL_GEM_CASH_VALUE_ERROR)
+        return value
+
+    @model_validator(mode="after")
+    def validate_gem_metadata(self) -> InventoryItem:
+        if self.item_type == "other":
+            if any(
+                value is not None
+                for value in (
+                    self.game_app_id,
+                    self.game_name,
+                    self.card_rarity,
+                    self.gem_yield,
+                    self.gem_cash_value,
+                )
+            ):
+                raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
+            return self
+        if self.game_app_id is None:
+            if any(
+                value is not None
+                for value in (
+                    self.game_name,
+                    self.card_rarity,
+                    self.gem_yield,
+                    self.gem_cash_value,
+                )
+            ):
+                raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
+            return self
+        if self.card_rarity is None or (
+            self.gem_cash_value is not None and self.gem_yield is None
+        ):
+            raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
+        return self
 
 
 class InventoryCheck(CheckResult):
@@ -126,6 +210,18 @@ class InventoryCheck(CheckResult):
     price_status: PriceStatus = "unavailable"
     price_message: str = "Steam item prices are unavailable."
     items: list[InventoryItem] = Field(default_factory=list)
+
+    gem_status: GemStatus = "unavailable"
+    gem_message: str = "Gem prices are unavailable."
+    gem_priceable_item_count: int = Field(default=0, ge=0)
+    gem_priced_item_count: int = Field(default=0, ge=0)
+    gem_rate_limited: bool = False
+    gem_retry_after_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_RETRY_AFTER_SECONDS,
+    )
+    gem_cash_context: GemCashContext | None = None
 
 
 class SteamGatewayProtocol(Protocol):
@@ -226,6 +322,10 @@ class _Description:
     icon_url: str | None
     marketable: bool
     tradable: bool
+    item_type: InventoryItemType
+    game_app_id: str | None
+    game_name: str | None
+    card_rarity: CardRarity | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +405,7 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
         tradable = _flag(raw_description.get("tradable"))
         if marketable is None or tradable is None:
             return None
+        metadata = parse_card_metadata(raw_description.get("tags"))
         descriptions.append(
             _Description(
                 class_id=class_id,
@@ -314,6 +415,10 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
                 icon_url=_icon_url(raw_description.get("icon_url")),
                 marketable=marketable,
                 tradable=tradable,
+                item_type=metadata.item_type,
+                game_app_id=metadata.game_app_id,
+                game_name=metadata.game_name,
+                card_rarity=metadata.card_rarity,
             )
         )
 
@@ -452,6 +557,80 @@ def _price_status_for_items(
         priceable_count,
         priced_count,
     )
+
+
+def _gem_status_for_items(
+    items: list[InventoryItem],
+    scan: GemScanResult,
+) -> tuple[GemStatus, str, int, int]:
+    priceable_count = sum(item.item_type == "trading_card" for item in items)
+    priced_count = sum(
+        item.item_type == "trading_card" and item.gem_yield is not None
+        for item in items
+    )
+    if priceable_count == 0:
+        return (
+            "complete",
+            "No trading cards require gem prices.",
+            priceable_count,
+            priced_count,
+        )
+    if priced_count == priceable_count:
+        message = "Gem prices are current for all trading cards."
+        if scan.used_stale_cache:
+            message = "Gem prices are complete using a cached fallback."
+        if scan.rate_limited:
+            message += " Steam Community access is temporarily rate limited."
+        return "complete", message, priceable_count, priced_count
+    if priced_count:
+        if scan.pending_count:
+            message = (
+                "Gem prices are partially available; remaining values are pending."
+            )
+        else:
+            message = "Gem prices are unavailable for some trading cards."
+    elif scan.pending_count:
+        message = "Gem prices are pending for some trading cards."
+    else:
+        message = "Gem prices are unavailable."
+    if scan.rate_limited:
+        message += " Steam Community access is temporarily rate limited."
+    return (
+        "partial" if priced_count else "unavailable",
+        message,
+        priceable_count,
+        priced_count,
+    )
+
+
+def _gem_cash_context(price: InventoryPrice | None) -> GemCashContext | None:
+    if price is None or price.lowest_sell is None:
+        return None
+    sack_price = canonical_decimal(price.lowest_sell)
+    if sack_price is None:
+        return None
+    return GemCashContext(sack_price=sack_price, observed_at=price.observed_at)
+
+
+def _gem_group_representatives(
+    items: list[InventoryItem],
+) -> dict[tuple[str, CardRarity], str | None]:
+    groups: dict[tuple[str, CardRarity], str | None] = {}
+    for item in items:
+        if (
+            item.item_type != "trading_card"
+            or item.game_app_id is None
+            or item.card_rarity is None
+        ):
+            continue
+        key = (item.game_app_id, item.card_rarity)
+        market_hash_name = item.market_hash_name
+        existing = groups.get(key)
+        if existing is None or (
+            market_hash_name is not None and market_hash_name < existing
+        ):
+            groups[key] = market_hash_name
+    return groups
 
 
 def _unavailable_inventory(
@@ -769,6 +948,7 @@ class SteamApisClient:
         http_client: AsyncHTTPClient,
         bulk_http_client: AsyncHTTPClient | None = None,
         bulk_timeout_seconds: float | None = None,
+        gem_pricing: GemPricingService | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -779,6 +959,9 @@ class SteamApisClient:
             else settings.steam_bulk_timeout_seconds
         )
         self._inventory_inflight: dict[str, asyncio.Task[InventoryCheck]] = {}
+        self.gem_pricing = gem_pricing or GemPricingService(
+            settings, http_client=http_client
+        )
 
     @property
     def _api_key(self) -> str | None:
@@ -807,7 +990,7 @@ class SteamApisClient:
     def _discard_inventory_task(
         self,
         steam_id: str,
-        task: asyncio.Task[InventoryCheck],
+        task: asyncio.Future[InventoryCheck],
     ) -> None:
         if task.done() and self._inventory_inflight.get(steam_id) is task:
             self._inventory_inflight.pop(steam_id, None)
@@ -949,6 +1132,10 @@ class SteamApisClient:
                 icon_url=description.icon_url,
                 marketable=description.marketable,
                 tradable=description.tradable,
+                item_type=description.item_type,
+                game_app_id=description.game_app_id,
+                game_name=description.game_name,
+                card_rarity=description.card_rarity,
             )
             for description in descriptions.values()
             if (description.class_id, description.instance_id) in quantities
@@ -956,13 +1143,17 @@ class SteamApisClient:
         items.sort(
             key=lambda item: (item.name.casefold(), item.class_id, item.instance_id)
         )
-        priceable_names = frozenset(
+        priceable_names = {
             item.market_hash_name
             for item in items
             if item.marketable and item.market_hash_name
-        )
+        }
+        if any(item.item_type == "trading_card" for item in items):
+            # The sack is a reference price, not an inventory row and therefore
+            # does not affect ordinary SteamApis coverage counts.
+            priceable_names.add(SACK_OF_GEMS_MARKET_HASH_NAME)
         try:
-            price_lookup = await self.fetch_prices(priceable_names)
+            price_lookup = await self.fetch_prices(frozenset(priceable_names))
         except _PRICE_STREAM_JSON_ERRORS:
             price_lookup = _unavailable_price_lookup()
         except (
@@ -988,6 +1179,53 @@ class SteamApisClient:
             priceable_item_count,
             priced_item_count,
         ) = _price_status_for_items(items)
+
+        gem_groups = _gem_group_representatives(items)
+        gem_scan = GemScanResult(values={})
+        if gem_groups:
+            try:
+                gem_scan = await self.gem_pricing.resolve(gem_groups)
+            except (
+                AttributeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                # Gem failures must never turn an otherwise public inventory
+                # into an unavailable response.
+                gem_scan = GemScanResult(values={})
+
+        sack_price = price_lookup.prices.get(SACK_OF_GEMS_MARKET_HASH_NAME)
+        for index, item in enumerate(items):
+            if item.item_type != "trading_card":
+                continue
+            key = (
+                (item.game_app_id, item.card_rarity)
+                if item.game_app_id is not None and item.card_rarity is not None
+                else None
+            )
+            resolution = gem_scan.values.get(key) if key is not None else None
+            if resolution is None:
+                continue
+            items[index] = item.model_copy(
+                update={
+                    "gem_yield": resolution.gem_yield,
+                    "gem_cash_value": gem_cash_value(
+                        resolution.gem_yield,
+                        sack_price.lowest_sell if sack_price is not None else None,
+                    ),
+                }
+            )
+
+        (
+            gem_status,
+            gem_message,
+            gem_priceable_item_count,
+            gem_priced_item_count,
+        ) = _gem_status_for_items(items, gem_scan)
         return InventoryCheck(
             status="public",
             message="Steam inventory is public.",
@@ -997,6 +1235,15 @@ class SteamApisClient:
             priced_item_count=priced_item_count,
             price_status=price_status,
             price_message=price_message,
+            gem_status=gem_status,
+            gem_message=gem_message,
+            gem_priceable_item_count=gem_priceable_item_count,
+            gem_priced_item_count=gem_priced_item_count,
+            gem_rate_limited=gem_scan.rate_limited,
+            gem_retry_after_seconds=gem_scan.retry_after_seconds,
+            gem_cash_context=_gem_cash_context(sack_price)
+            if any(item.item_type == "trading_card" for item in items)
+            else None,
             items=items,
         )
 

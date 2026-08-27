@@ -22,6 +22,13 @@ const privateInventory = {
   priced_item_count: 0,
   price_status: "unavailable",
   price_message: "Prices are unavailable while the inventory is private.",
+  gem_status: "unavailable",
+  gem_message: "Gem values are unavailable while the inventory is private.",
+  gem_priceable_item_count: 0,
+  gem_priced_item_count: 0,
+  gem_rate_limited: false,
+  gem_retry_after_seconds: null,
+  gem_cash_context: null,
   items: []
 };
 
@@ -51,7 +58,31 @@ function inventoryItem(index: number) {
     icon_url: null,
     marketable: false,
     tradable: false,
-    price: null
+    price: null,
+    item_type: "other",
+    game_app_id: null,
+    game_name: null,
+    card_rarity: null,
+    gem_yield: null,
+    gem_cash_value: null
+  };
+}
+
+function tradingCardItem(
+  index: number,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    ...inventoryItem(index),
+    name: `Card ${String(index).padStart(4, "0")}`,
+    market_hash_name: `Card ${String(index).padStart(4, "0")}`,
+    item_type: "trading_card",
+    game_app_id: "440",
+    game_name: "Team Fortress 2",
+    card_rarity: "normal",
+    gem_yield: 10,
+    gem_cash_value: null,
+    ...overrides
   };
 }
 const validInventoryPrice = {
@@ -76,6 +107,13 @@ function publicInventory(
     priced_item_count: 0,
     price_status: "complete",
     price_message: "No marketable item types require pricing.",
+    gem_status: "complete",
+    gem_message: "No trading cards require gem prices.",
+    gem_priceable_item_count: 0,
+    gem_priced_item_count: 0,
+    gem_rate_limited: false,
+    gem_retry_after_seconds: null,
+    gem_cash_context: null,
     items,
     ...overrides
   };
@@ -322,7 +360,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(
       within(nonmarketableRow as HTMLElement).getAllByText("Not applicable")
-    ).toHaveLength(3);
+    ).toHaveLength(5);
   });
 
   it("sorts every inventory field in both directions and keeps unavailable values last", async () => {
@@ -375,10 +413,9 @@ describe("App", () => {
       name: "Inventory items"
     });
     const renderedNames = () =>
-      within(inventoryTable)
-        .getAllByRole("row")
-        .slice(1)
-        .map((row) => within(row).getByRole("rowheader").textContent);
+      Array.from(inventoryTable.querySelectorAll("tr.inventory-item")).map(
+        (row) => within(row as HTMLElement).getByRole("rowheader").textContent
+      );
     const assertSort = (
       label: string,
       ascending: string[],
@@ -752,8 +789,7 @@ describe("App", () => {
     const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
     });
-    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(51);
-    expect(within(inventoryTable).getByText("Item 0001")).toBeInTheDocument();
+    expect(inventoryTable.querySelectorAll("tr.inventory-item")).toHaveLength(50);
     expect(within(inventoryTable).getByText("Item 0050")).toBeInTheDocument();
     expect(
       within(inventoryTable).queryByText("Item 0051")
@@ -783,14 +819,14 @@ describe("App", () => {
     expect(nextButton).toBeEnabled();
     fireEvent.click(nextButton);
     expect(within(inventoryTable).getByText("Item 0051")).toBeInTheDocument();
-    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(51);
+    expect(inventoryTable.querySelectorAll("tr.inventory-item")).toHaveLength(50);
     expect(within(inventoryTable).queryByText("Item 0001")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("combobox", { name: "Inventory page" }), {
       target: { value: "41" }
     });
     expect(within(inventoryTable).getByText("Item 2001")).toBeInTheDocument();
-    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(2);
+    expect(inventoryTable.querySelectorAll("tr.inventory-item")).toHaveLength(1);
     expect(
       screen.getByRole("status", { name: "Inventory pagination status" })
     ).toHaveTextContent("Showing 2,001–2,001 of 2,001. Page 41 of 41.");
@@ -961,7 +997,9 @@ describe("App", () => {
             status: "public",
             message: "Your Steam inventory is publicly accessible.",
             retry_after_seconds: null,
-            rate_limited: false
+            rate_limited: false,
+            gem_status: "complete",
+            gem_message: "No trading cards require gem prices."
           }
         }
       })
@@ -1235,6 +1273,220 @@ describe("App", () => {
       ).getByText("Private")
     ).toBeInTheDocument();
   });
+
+  it("groups trading cards by game, keeps fallback and Other groups, and sorts within groups", async () => {
+    const alphaCard = tradingCardItem(1, {
+      name: "Alpha card",
+      game_app_id: "10",
+      game_name: "Alpha game",
+      gem_yield: 20,
+      gem_cash_value: "0.01"
+    });
+    const zetaCard = tradingCardItem(2, {
+      name: "Zeta high card",
+      game_app_id: "20",
+      game_name: "Zeta game",
+      gem_yield: 30,
+      gem_cash_value: "0.015"
+    });
+    const zetaLowCard = tradingCardItem(3, {
+      name: "Zeta low card",
+      game_app_id: "20",
+      game_name: "Zeta game",
+      card_rarity: "foil",
+      gem_yield: 5,
+      gem_cash_value: "0.0025"
+    });
+    const fallbackCard = tradingCardItem(4, {
+      name: "Unknown card",
+      game_app_id: null,
+      game_name: null,
+      card_rarity: null,
+      gem_yield: null,
+      gem_cash_value: null
+    });
+    const otherItem = inventoryItem(5);
+    const inventory = publicInventory(
+      [zetaCard, otherItem, fallbackCard, alphaCard, zetaLowCard],
+      {
+        gem_status: "partial",
+        gem_message: "One unknown trading-card group has no metadata.",
+        gem_priceable_item_count: 4,
+        gem_priced_item_count: 3,
+        gem_cash_context: {
+          currency: null,
+          basis: "lowest_sell",
+          market_hash_name: "753-Sack of Gems",
+          sack_gems: 1000,
+          sack_price: "0.5",
+          observed_at: "2026-08-27T08:15:00Z"
+        }
+      }
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const table = (await screen.findByRole("table", {
+      name: "Inventory items"
+    })) as HTMLTableElement;
+    const groupLabels = () =>
+      Array.from(table.tBodies).map(
+        (body) => body.querySelector(".inventory-group-header th")?.textContent
+      );
+    expect(groupLabels()).toEqual([
+      "Alpha game",
+      "Zeta game",
+      "Trading cards (game unavailable)",
+      "Other inventory items"
+    ]);
+    expect(
+      screen.getByRole("region", { name: "Trading-card gem values" })
+    ).toHaveTextContent(
+      "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-card replacement-cost estimate."
+    );
+    expect(
+      within(screen.getByText("Unknown card").closest("tr") as HTMLElement)
+        .getAllByText("Unavailable")
+    ).toHaveLength(2);
+    expect(
+      within(screen.getByText("Item 0005").closest("tr") as HTMLElement)
+        .getAllByText("Not applicable")
+    ).toHaveLength(5);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Gem value, ascending" })
+    );
+    expect(groupLabels()).toEqual([
+      "Alpha game",
+      "Zeta game",
+      "Trading cards (game unavailable)",
+      "Other inventory items"
+    ]);
+    const zetaRowNames = () =>
+      Array.from(
+        table.tBodies[1].querySelectorAll("tr.inventory-item")
+      ).map((row) => row.querySelector(".inventory-item-name strong")?.textContent);
+    expect(zetaRowNames()).toEqual(["Zeta low card", "Zeta high card"]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Gem value, descending" })
+    );
+    expect(zetaRowNames()).toEqual(["Zeta high card", "Zeta low card"]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Gem cash value, ascending" })
+    );
+    expect(zetaRowNames()).toEqual(["Zeta low card", "Zeta high card"]);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Sort by Gem cash value, descending"
+      })
+    );
+    expect(zetaRowNames()).toEqual(["Zeta high card", "Zeta low card"]);
+  });
+
+  it("reports partial gem coverage, rate limiting, and per-card cash provenance", async () => {
+    const pricedCard = tradingCardItem(1, {
+      gem_yield: 0,
+      gem_cash_value: null
+    });
+    const pendingCard = tradingCardItem(2, {
+      card_rarity: "foil",
+      gem_yield: null,
+      gem_cash_value: null
+    });
+    const inventory = publicInventory([pricedCard, pendingCard], {
+      gem_status: "partial",
+      gem_message: "One trading-card group is still pending.",
+      gem_priceable_item_count: 2,
+      gem_priced_item_count: 1,
+      gem_rate_limited: true,
+      gem_retry_after_seconds: 30,
+      gem_cash_context: null
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const coverage = await screen.findByRole("region", {
+      name: "Trading-card gem values"
+    });
+    expect(within(coverage).getByText("Partial gem pricing")).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(
+        "Gem values are available for 1 of 2 trading-card item types."
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(coverage).getByText("One trading-card group is still pending.")
+    ).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(/rate-limiting gem lookups/i)
+    ).toHaveTextContent("try again in 30s");
+    expect(
+      within(coverage).getByText(/lowest-sell basis/i)
+    ).toHaveTextContent(/unknown currency/i);
+    const pricedRow = screen.getByText("Card 0001").closest("tr");
+    expect(pricedRow).not.toBeNull();
+    expect(within(pricedRow as HTMLElement).getByText("0")).toBeInTheDocument();
+    const pendingRow = screen.getByText("Card 0002").closest("tr");
+    expect(pendingRow).not.toBeNull();
+    expect(
+      within(pendingRow as HTMLElement).getAllByText("Unavailable")
+    ).toHaveLength(2);
+  });
+
+  it("rejects card metadata that violates the item-type invariants", async () => {
+    const malformedItem = {
+      ...inventoryItem(1),
+      item_type: "other",
+      game_app_id: "440"
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        publicInventorySession(publicInventory([malformedItem]))
+      )
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "What is in your inventory" })
+    ).not.toBeInTheDocument();
+  });
+  it("rejects partially populated trading-card metadata", async () => {
+    const malformedCard = tradingCardItem(1, {
+      card_rarity: null,
+      gem_yield: null,
+      gem_cash_value: null
+    });
+    const inventory = publicInventory([malformedCard], {
+      gem_status: "unavailable",
+      gem_message: "Gem prices are unavailable.",
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 0
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+  });
+
 
   it("clears the local session with a credentialed logout POST", async () => {
     const fetchMock = vi
