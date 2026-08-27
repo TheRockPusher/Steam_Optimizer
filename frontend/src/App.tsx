@@ -10,9 +10,37 @@ type VisibilityCheck = {
   message: string;
 };
 
+type PriceStatus = "complete" | "partial" | "unavailable";
+
+type InventoryPrice = {
+  currency: null;
+  highest_buy: string | null;
+  lowest_sell: string | null;
+  observed_at: string | null;
+};
+
+type InventoryItem = {
+  class_id: string;
+  instance_id: string;
+  name: string;
+  market_hash_name: string | null;
+  quantity: number;
+  icon_url: string | null;
+  marketable: boolean;
+  tradable: boolean;
+  price: InventoryPrice | null;
+};
+
 type InventoryCheck = VisibilityCheck & {
   retry_after_seconds: number | null;
   rate_limited: boolean;
+  total_asset_count: number;
+  unique_item_count: number;
+  priceable_item_count: number;
+  priced_item_count: number;
+  price_status: PriceStatus;
+  price_message: string;
+  items: InventoryItem[];
 };
 
 type SteamUser = {
@@ -51,11 +79,28 @@ const STEAM_PRIVACY_URL = "https://steamcommunity.com/my/edit/settings";
 const PRIVACY_POLICY_URL =
   "https://github.com/TheRockPusher/Steam_Optimizer#privacy-and-steam-data-policy";
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
+const NONNEGATIVE_DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
+const INVENTORY_PAGE_SIZE = 50;
+const INVENTORY_COUNT_FORMATTER = new Intl.NumberFormat("en-US");
+const PRICE_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  timeZone: "UTC",
+  timeZoneName: "short"
+});
 
 const STATUS_LABELS: Record<VisibilityStatus, string> = {
   public: "Public",
   private: "Private",
   unavailable: "Unavailable"
+};
+const PRICE_STATUS_LABELS: Record<PriceStatus, string> = {
+  complete: "Complete pricing",
+  partial: "Partial pricing",
+  unavailable: "Pricing unavailable"
 };
 
 function isVisibilityCheck(value: unknown): value is VisibilityCheck {
@@ -72,20 +117,139 @@ function isVisibilityCheck(value: unknown): value is VisibilityCheck {
   );
 }
 
+function isSafeInteger(value: unknown, minimum: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= minimum
+  );
+}
+
+function isDecimalString(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    !NON_ASCII_DECIMAL_PATTERN.test(value)
+  );
+}
+
+function isHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isInventoryPrice(value: unknown): value is InventoryPrice {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const price = value as Partial<InventoryPrice>;
+  return (
+    price.currency === null &&
+    (price.highest_buy === null ||
+      (typeof price.highest_buy === "string" &&
+        NONNEGATIVE_DECIMAL_PATTERN.test(price.highest_buy))) &&
+    (price.lowest_sell === null ||
+      (typeof price.lowest_sell === "string" &&
+        NONNEGATIVE_DECIMAL_PATTERN.test(price.lowest_sell))) &&
+    (typeof price.observed_at === "string" || price.observed_at === null)
+  );
+}
+
+function isInventoryItem(value: unknown): value is InventoryItem {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const item = value as Partial<InventoryItem>;
+  return (
+    isDecimalString(item.class_id) &&
+    isDecimalString(item.instance_id) &&
+    typeof item.name === "string" &&
+    (typeof item.market_hash_name === "string" ||
+      item.market_hash_name === null) &&
+    isSafeInteger(item.quantity, 1) &&
+    (item.icon_url === null || isHttpsUrl(item.icon_url)) &&
+    typeof item.marketable === "boolean" &&
+    typeof item.tradable === "boolean" &&
+    (item.price === null || isInventoryPrice(item.price))
+  );
+}
+
 function isInventoryCheck(value: unknown): value is InventoryCheck {
   if (!isVisibilityCheck(value)) {
     return false;
   }
 
-  const retryAfterSeconds = (value as Partial<InventoryCheck>).retry_after_seconds;
+  const check = value as Partial<InventoryCheck>;
+  const retryAfterSeconds = check.retry_after_seconds;
+  if (
+    typeof retryAfterSeconds === "undefined" ||
+    (retryAfterSeconds !== null &&
+      (!isSafeInteger(retryAfterSeconds, 0) ||
+        !Number.isSafeInteger(
+          retryAfterSeconds * MILLISECONDS_PER_SECOND
+        ))) ||
+    typeof check.rate_limited !== "boolean" ||
+    !isSafeInteger(check.total_asset_count, 0) ||
+    !isSafeInteger(check.unique_item_count, 0) ||
+    !isSafeInteger(check.priceable_item_count, 0) ||
+    !isSafeInteger(check.priced_item_count, 0) ||
+    (check.price_status !== "complete" &&
+      check.price_status !== "partial" &&
+      check.price_status !== "unavailable") ||
+    typeof check.price_message !== "string" ||
+    !Array.isArray(check.items)
+  ) {
+    return false;
+  }
+
+  const itemKeys = new Set<string>();
+  let totalAssetCount = 0;
+  let marketableItemCount = 0;
+  let pricedItemCount = 0;
+
+  for (const item of check.items) {
+    if (!isInventoryItem(item)) {
+      return false;
+    }
+
+    const itemKey = `${item.class_id}:${item.instance_id}`;
+    if (itemKeys.has(itemKey)) {
+      return false;
+    }
+    itemKeys.add(itemKey);
+
+    if (item.quantity > Number.MAX_SAFE_INTEGER - totalAssetCount) {
+      return false;
+    }
+    totalAssetCount += item.quantity;
+
+    if (item.marketable) {
+      marketableItemCount += 1;
+    }
+    if (item.price !== null) {
+      if (!item.marketable || item.market_hash_name === null) {
+        return false;
+      }
+      pricedItemCount += 1;
+    }
+  }
+
   return (
-    typeof retryAfterSeconds !== "undefined" &&
-    (retryAfterSeconds === null ||
-      (typeof retryAfterSeconds === "number" &&
-        Number.isSafeInteger(retryAfterSeconds) &&
-        retryAfterSeconds >= 0 &&
-        Number.isSafeInteger(retryAfterSeconds * MILLISECONDS_PER_SECOND))) &&
-    typeof (value as Partial<InventoryCheck>).rate_limited === "boolean"
+    check.items.length === check.unique_item_count &&
+    totalAssetCount === check.total_asset_count &&
+    check.priced_item_count <= check.priceable_item_count &&
+    check.priceable_item_count <= check.unique_item_count &&
+    marketableItemCount === check.priceable_item_count &&
+    pricedItemCount === check.priced_item_count
   );
 }
 
@@ -382,6 +546,274 @@ function AccessCard({ surface, check }: AccessCardProps) {
   );
 }
 
+function formatPriceTimestamp(observedAt: string): string {
+  const observedDate = new Date(observedAt);
+  return Number.isNaN(observedDate.getTime())
+    ? observedAt
+    : PRICE_TIMESTAMP_FORMATTER.format(observedDate);
+}
+
+function InventoryItemRow({ item }: { item: InventoryItem }) {
+  const unavailableLabel = item.marketable ? "Unavailable" : "Not applicable";
+  const highestBuy = item.price?.highest_buy;
+  const lowestSell = item.price?.lowest_sell;
+  const observedAt = item.price?.observed_at;
+  const marketHashName =
+    item.market_hash_name !== null && item.market_hash_name !== item.name
+      ? item.market_hash_name
+      : null;
+
+  return (
+    <li className="inventory-item">
+      <div className="inventory-item-name">
+        {item.icon_url !== null && (
+          <img
+            className="inventory-item-icon"
+            src={item.icon_url}
+            alt=""
+            loading="lazy"
+            decoding="async"
+          />
+        )}
+        <div>
+          <strong>{item.name}</strong>
+          {marketHashName !== null && (
+            <span className="market-hash-name">{marketHashName}</span>
+          )}
+        </div>
+      </div>
+      <div className="inventory-item-field">
+        <span className="inventory-field-label">Quantity</span>
+        <span className="inventory-quantity">
+          {INVENTORY_COUNT_FORMATTER.format(item.quantity)}
+        </span>
+      </div>
+      <div className="inventory-item-field">
+        <span className="inventory-field-label">Marketability</span>
+        <span
+          className={`marketability-label ${item.marketable
+              ? "marketability-label-public"
+              : "marketability-label-unavailable"
+            }`}
+        >
+          {item.marketable ? "Marketable" : "Nonmarketable"}
+        </span>
+      </div>
+      <div className="inventory-item-field inventory-price-value">
+        <span className="inventory-field-label">Highest buy</span>
+        <span>
+          {typeof highestBuy === "string" ? highestBuy : unavailableLabel}
+        </span>
+      </div>
+      <div className="inventory-item-field inventory-price-value">
+        <span className="inventory-field-label">Lowest sell</span>
+        <span>
+          {typeof lowestSell === "string" ? lowestSell : unavailableLabel}
+        </span>
+      </div>
+      <div className="inventory-item-field inventory-observed-at">
+        <span className="inventory-field-label">Price timestamp</span>
+        {typeof observedAt === "string" && observedAt.length > 0 ? (
+          <time dateTime={observedAt}>{formatPriceTimestamp(observedAt)}</time>
+        ) : (
+          <span>{unavailableLabel}</span>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function InventoryBrowser({ items }: { items: InventoryItem[] }) {
+  const [requestedPageIndex, setRequestedPageIndex] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(items.length / INVENTORY_PAGE_SIZE));
+  const pageIndex = Math.min(requestedPageIndex, pageCount - 1);
+
+  const firstItemIndex = pageIndex * INVENTORY_PAGE_SIZE;
+  const lastItemIndex = Math.min(
+    firstItemIndex + INVENTORY_PAGE_SIZE,
+    items.length
+  );
+  const visibleItems = items.slice(firstItemIndex, lastItemIndex);
+
+  return (
+    <section className="inventory-browser" aria-labelledby="inventory-items-title">
+      <div className="inventory-browser-heading">
+        <div>
+          <p className="section-label">Item ledger</p>
+          <h3 id="inventory-items-title">Inventory items</h3>
+        </div>
+        <p>
+          {INVENTORY_COUNT_FORMATTER.format(items.length)} distinct item{" "}
+          {items.length === 1 ? "type" : "types"}
+        </p>
+      </div>
+
+      <p
+        className="inventory-page-status"
+        role="status"
+        aria-label="Inventory pagination status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        Showing {INVENTORY_COUNT_FORMATTER.format(firstItemIndex + 1)}–
+        {INVENTORY_COUNT_FORMATTER.format(lastItemIndex)} of{" "}
+        {INVENTORY_COUNT_FORMATTER.format(items.length)}. Page {pageIndex + 1} of{" "}
+        {pageCount}.
+      </p>
+
+      {pageCount > 1 && (
+        <nav className="inventory-pagination" aria-label="Inventory pages">
+          <button
+            className="secondary-action"
+            type="button"
+            onClick={() => setRequestedPageIndex(pageIndex - 1)}
+            disabled={pageIndex === 0}
+            aria-label="Previous inventory page"
+          >
+            Previous
+          </button>
+          <label className="inventory-page-picker">
+            <span>Page</span>
+            <select
+              value={pageIndex + 1}
+              onChange={(event) =>
+                setRequestedPageIndex(Number(event.currentTarget.value) - 1)
+              }
+              aria-label="Inventory page"
+            >
+              {Array.from({ length: pageCount }, (_, index) => (
+                <option key={index} value={index + 1}>
+                  {index + 1}
+                </option>
+              ))}
+            </select>
+            <span>of {pageCount}</span>
+          </label>
+          <button
+            className="secondary-action"
+            type="button"
+            onClick={() => setRequestedPageIndex(pageIndex + 1)}
+            disabled={pageIndex === pageCount - 1}
+            aria-label="Next inventory page"
+          >
+            Next
+          </button>
+        </nav>
+      )}
+
+      <div className="inventory-list-header" aria-hidden="true">
+        <span>Item</span>
+        <span>Quantity</span>
+        <span>Marketability</span>
+        <span>Highest buy</span>
+        <span>Lowest sell</span>
+        <span>Price timestamp</span>
+      </div>
+      <ul className="inventory-list" aria-labelledby="inventory-items-title">
+        {visibleItems.map((item) => (
+          <InventoryItemRow
+            key={`${item.class_id}:${item.instance_id}`}
+            item={item}
+          />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function InventoryResults({ inventory }: { inventory: InventoryCheck }) {
+  const coverageMessage =
+    inventory.priceable_item_count === 0
+      ? "No marketable item types require a price lookup."
+      : `SteamApis price data is available for ${INVENTORY_COUNT_FORMATTER.format(
+        inventory.priced_item_count
+      )} of ${INVENTORY_COUNT_FORMATTER.format(
+        inventory.priceable_item_count
+      )} marketable item ${inventory.priceable_item_count === 1 ? "type" : "types"
+      }.`;
+
+  return (
+    <section className="inventory-results" aria-labelledby="inventory-results-title">
+      <div className="inventory-results-heading">
+        <div>
+          <p className="section-label">Public inventory</p>
+          <h2 id="inventory-results-title">What is in your inventory</h2>
+        </div>
+        <p>
+          Quantities combine matching Steam assets. Prices are read-only market
+          context, not sale offers.
+        </p>
+      </div>
+
+      <section className="price-coverage" aria-labelledby="price-coverage-title">
+        <div className="price-coverage-heading">
+          <div>
+            <p className="section-label">Price coverage</p>
+            <h3 id="price-coverage-title">Current market snapshot</h3>
+          </div>
+          <p
+            className={`pricing-status pricing-status-${inventory.price_status}`}
+          >
+            <span className="status-dot" aria-hidden="true" />
+            {PRICE_STATUS_LABELS[inventory.price_status]}
+          </p>
+        </div>
+        <p className="price-coverage-copy">{coverageMessage}</p>
+        <p className="price-message">
+          SteamApis does not specify the currency for this feed. Values are
+          shown exactly as received, without a currency symbol.
+        </p>
+        {inventory.price_message.trim().length > 0 && (
+          <p className="price-message">{inventory.price_message}</p>
+        )}
+        <dl className="inventory-summary">
+          <div>
+            <dt>Total assets</dt>
+            <dd>
+              {INVENTORY_COUNT_FORMATTER.format(inventory.total_asset_count)}
+            </dd>
+          </div>
+          <div>
+            <dt>Distinct item types</dt>
+            <dd>
+              {INVENTORY_COUNT_FORMATTER.format(inventory.unique_item_count)}
+            </dd>
+          </div>
+          <div>
+            <dt>Priceable types</dt>
+            <dd>
+              {INVENTORY_COUNT_FORMATTER.format(
+                inventory.priceable_item_count
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Types with prices</dt>
+            <dd>
+              {INVENTORY_COUNT_FORMATTER.format(inventory.priced_item_count)}
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      {inventory.items.length > 0 ? (
+        <InventoryBrowser
+          key={inventory.unique_item_count}
+          items={inventory.items}
+        />
+      ) : (
+        <div className="inventory-empty">
+          <h3>No inventory items to display</h3>
+          <p>
+            Steam returned a public inventory with no items. Recheck after your
+            inventory changes.
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function SignedInView({
   session,
   isRechecking,
@@ -457,6 +889,10 @@ function SignedInView({
         <AccessCard surface="profile" check={session.checks.profile} />
         <AccessCard surface="inventory" check={session.checks.inventory} />
       </div>
+
+      {session.checks.inventory.status === "public" && (
+        <InventoryResults inventory={session.checks.inventory} />
+      )}
     </section>
   );
 }

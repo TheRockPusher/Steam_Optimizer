@@ -44,14 +44,9 @@ class SessionCheck(BaseModel):
     message: str
 
 
-class SessionInventoryCheck(SessionCheck):
-    retry_after_seconds: int | None = None
-    rate_limited: bool = False
-
-
 class SessionChecks(BaseModel):
     profile: SessionCheck
-    inventory: SessionInventoryCheck
+    inventory: InventoryCheck
 
 
 class AuthenticatedSessionResponse(BaseModel):
@@ -141,6 +136,7 @@ def _unavailable_inventory() -> InventoryCheck:
     return InventoryCheck(
         status="unavailable",
         message="Steam inventory check is unavailable.",
+        price_message="Steam item prices are unavailable.",
     )
 
 
@@ -160,12 +156,7 @@ def _session_response(
                 status=profile.status,
                 message=profile.message,
             ),
-            inventory=SessionInventoryCheck(
-                status=inventory.status,
-                message=inventory.message,
-                retry_after_seconds=inventory.retry_after_seconds,
-                rate_limited=inventory.rate_limited,
-            ),
+            inventory=inventory,
         ),
     )
 

@@ -11,6 +11,20 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
+const privateInventory = {
+  status: "private",
+  message: "Steam reports that this inventory is private.",
+  retry_after_seconds: null,
+  rate_limited: false,
+  total_asset_count: 0,
+  unique_item_count: 0,
+  priceable_item_count: 0,
+  priced_item_count: 0,
+  price_status: "unavailable",
+  price_message: "Prices are unavailable while the inventory is private.",
+  items: []
+};
+
 const signedInSession = {
   authenticated: true,
   user: {
@@ -23,14 +37,59 @@ const signedInSession = {
       status: "public",
       message: "Your Steam profile is publicly visible."
     },
-    inventory: {
-      status: "private",
-      message: "Steam reports that this inventory is private.",
-      retry_after_seconds: null,
-      rate_limited: false
-    }
+    inventory: privateInventory
   }
 };
+
+function inventoryItem(index: number) {
+  return {
+    class_id: String(1000 + index),
+    instance_id: "0",
+    name: `Item ${String(index).padStart(4, "0")}`,
+    market_hash_name: null,
+    quantity: 1,
+    icon_url: null,
+    marketable: false,
+    tradable: false,
+    price: null
+  };
+}
+const validInventoryPrice = {
+  currency: null,
+  highest_buy: "0.10",
+  lowest_sell: "0.20",
+  observed_at: null
+};
+
+function publicInventory(
+  items: unknown[],
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    status: "public",
+    message: "Your Steam inventory is publicly accessible.",
+    retry_after_seconds: null,
+    rate_limited: false,
+    total_asset_count: items.length,
+    unique_item_count: items.length,
+    priceable_item_count: 0,
+    priced_item_count: 0,
+    price_status: "complete",
+    price_message: "No marketable item types require pricing.",
+    items,
+    ...overrides
+  };
+}
+
+function publicInventorySession(inventory: Record<string, unknown>) {
+  return {
+    ...signedInSession,
+    checks: {
+      ...signedInSession.checks,
+      inventory
+    }
+  };
+}
 
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -178,6 +237,516 @@ describe("App", () => {
     ).toHaveAttribute("href", "https://steamcommunity.com/my/edit/settings");
   });
 
+  it("accepts the complete inventory contract and renders exact provider price strings", async () => {
+    const pricedItem = {
+      ...inventoryItem(1),
+      name: "Prismatic Trading Card",
+      market_hash_name: "Prismatic Trading Card",
+      quantity: 3,
+      icon_url: "https://cdn.example.test/items/prismatic.png",
+      marketable: true,
+      tradable: true,
+      price: {
+        currency: null,
+        highest_buy: "0.12",
+        lowest_sell: "1.005",
+        observed_at: "2026-08-27T08:15:00Z"
+      }
+    };
+    const nonmarketableItem = {
+      ...inventoryItem(2),
+      name: "Community Contributor Badge",
+      quantity: 1
+    };
+    const inventory = publicInventory(
+      [pricedItem, nonmarketableItem],
+      {
+        total_asset_count: 4,
+        priceable_item_count: 1,
+        priced_item_count: 1,
+        price_status: "complete",
+        price_message: "Current prices were found for every marketable type."
+      }
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "What is in your inventory" })
+    ).toBeInTheDocument();
+    const coverage = screen.getByRole("region", {
+      name: "Current market snapshot"
+    });
+    expect(within(coverage).getByText("Complete pricing")).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(
+        "SteamApis price data is available for 1 of 1 marketable item type."
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(
+        "SteamApis does not specify the currency for this feed. Values are shown exactly as received, without a currency symbol."
+      )
+    ).toBeInTheDocument();
+    expect(coverage).not.toHaveTextContent("USD");
+    expect(within(coverage).getByText("Total assets").parentElement).toHaveTextContent(
+      "4"
+    );
+
+    const inventoryList = screen.getByRole("list", { name: "Inventory items" });
+    const pricedRow = within(inventoryList)
+      .getByText("Prismatic Trading Card")
+      .closest("li");
+    expect(pricedRow).not.toBeNull();
+    expect(within(pricedRow as HTMLElement).getByText("3")).toBeInTheDocument();
+    expect(
+      within(pricedRow as HTMLElement).getByText("Marketable")
+    ).toBeInTheDocument();
+    expect(within(pricedRow as HTMLElement).getByText("0.12")).toBeInTheDocument();
+    expect(within(pricedRow as HTMLElement).getByText("1.005")).toBeInTheDocument();
+    expect(pricedRow).not.toHaveTextContent("$");
+    expect(
+      within(pricedRow as HTMLElement).getByText(/Aug 27, 2026/)
+    ).toHaveAttribute("datetime", "2026-08-27T08:15:00Z");
+
+    const nonmarketableRow = within(inventoryList)
+      .getByText("Community Contributor Badge")
+      .closest("li");
+    expect(nonmarketableRow).not.toBeNull();
+    expect(
+      within(nonmarketableRow as HTMLElement).getByText("Nonmarketable")
+    ).toBeInTheDocument();
+    expect(
+      within(nonmarketableRow as HTMLElement).getAllByText("Not applicable")
+    ).toHaveLength(3);
+  });
+
+  it("rejects a malformed nested item", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        publicInventorySession(
+          publicInventory([{ ...inventoryItem(1), quantity: 0 }])
+        )
+      )
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "What is in your inventory" })
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      label: "a known currency",
+      price: { ...validInventoryPrice, currency: "USD" }
+    },
+    {
+      label: "a missing currency field",
+      price: {
+        highest_buy: "0.10",
+        lowest_sell: "0.20",
+        observed_at: null
+      }
+    },
+    {
+      label: "a missing highest buy field",
+      price: {
+        currency: null,
+        lowest_sell: "0.20",
+        observed_at: null
+      }
+    },
+    {
+      label: "a missing lowest sell field",
+      price: {
+        currency: null,
+        highest_buy: "0.10",
+        observed_at: null
+      }
+    },
+    {
+      label: "a numeric highest buy",
+      price: { ...validInventoryPrice, highest_buy: 0.1 }
+    },
+    {
+      label: "a negative lowest sell",
+      price: { ...validInventoryPrice, lowest_sell: "-0.01" }
+    },
+    {
+      label: "an exponent-form amount",
+      price: { ...validInventoryPrice, highest_buy: "1e3" }
+    },
+    {
+      label: "a noncanonical leading zero",
+      price: { ...validInventoryPrice, lowest_sell: "01.00" }
+    },
+    {
+      label: "legacy minor-unit fields",
+      price: {
+        currency: null,
+        highest_buy_minor: 10,
+        lowest_sell_minor: 20,
+        observed_at: null
+      }
+    }
+  ])("rejects a nested price with $label", async ({ price }) => {
+    const item = {
+      ...inventoryItem(1),
+      market_hash_name: "Item 0001",
+      marketable: true,
+      price
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        publicInventorySession(
+          publicInventory([item], {
+            priceable_item_count: 1,
+            priced_item_count: 1
+          })
+        )
+      )
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "What is in your inventory" })
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      label: "duplicate class and instance rows",
+      inventory: publicInventory([inventoryItem(1), inventoryItem(1)])
+    },
+    {
+      label: "unique item count that differs from the returned rows",
+      inventory: publicInventory([inventoryItem(1)], {
+        unique_item_count: 2
+      })
+    },
+    {
+      label: "total asset count that differs from summed quantities",
+      inventory: publicInventory(
+        [{ ...inventoryItem(1), quantity: 2 }],
+        { total_asset_count: 1 }
+      )
+    },
+    {
+      label: "quantity sum outside the safe integer range",
+      inventory: publicInventory(
+        [
+          { ...inventoryItem(1), quantity: Number.MAX_SAFE_INTEGER },
+          inventoryItem(2)
+        ],
+        { total_asset_count: Number.MAX_SAFE_INTEGER }
+      )
+    },
+    {
+      label: "priced count above the priceable count",
+      inventory: publicInventory(
+        [
+          {
+            ...inventoryItem(1),
+            market_hash_name: "Item 0001",
+            marketable: true,
+            price: validInventoryPrice
+          }
+        ],
+        { priced_item_count: 1 }
+      )
+    },
+    {
+      label: "priceable count above the unique item count",
+      inventory: publicInventory(
+        [{ ...inventoryItem(1), marketable: true }],
+        { priceable_item_count: 2 }
+      )
+    },
+    {
+      label: "priceable count that differs from marketable rows",
+      inventory: publicInventory(
+        [{ ...inventoryItem(1), marketable: true }],
+        { priceable_item_count: 0 }
+      )
+    },
+    {
+      label: "priced count that differs from rows with prices",
+      inventory: publicInventory(
+        [
+          {
+            ...inventoryItem(1),
+            market_hash_name: "Item 0001",
+            marketable: true,
+            price: validInventoryPrice
+          }
+        ],
+        { priceable_item_count: 1, priced_item_count: 0 }
+      )
+    },
+    {
+      label: "price attached to a nonmarketable row",
+      inventory: publicInventory(
+        [
+          {
+            ...inventoryItem(1),
+            market_hash_name: "Item 0001",
+            price: validInventoryPrice
+          },
+          {
+            ...inventoryItem(2),
+            market_hash_name: "Item 0002",
+            marketable: true
+          }
+        ],
+        { priceable_item_count: 1, priced_item_count: 1 }
+      )
+    },
+    {
+      label: "price attached without a market hash name",
+      inventory: publicInventory(
+        [
+          {
+            ...inventoryItem(1),
+            marketable: true,
+            price: validInventoryPrice
+          }
+        ],
+        { priceable_item_count: 1, priced_item_count: 1 }
+      )
+    }
+  ])("rejects $label", async ({ inventory }) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "What is in your inventory" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows partial price coverage and marks a marketable unpriced item unavailable", async () => {
+    const pricedItem = {
+      ...inventoryItem(1),
+      market_hash_name: "Item 0001",
+      marketable: true,
+      price: {
+        currency: null,
+        highest_buy: "1.00",
+        lowest_sell: "1.25",
+        observed_at: "2026-08-27T08:15:00Z"
+      }
+    };
+    const unpricedItem = {
+      ...inventoryItem(2),
+      name: "Marketable without a price",
+      market_hash_name: "Marketable without a price",
+      marketable: true
+    };
+    const inventory = publicInventory([pricedItem, unpricedItem], {
+      priceable_item_count: 2,
+      priced_item_count: 1,
+      price_status: "partial",
+      price_message: "One marketable type did not have a current order book."
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const coverage = await screen.findByRole("region", {
+      name: "Current market snapshot"
+    });
+    expect(within(coverage).getByText("Partial pricing")).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(
+        "SteamApis price data is available for 1 of 2 marketable item types."
+      )
+    ).toBeInTheDocument();
+    const unpricedRow = screen
+      .getByText("Marketable without a price")
+      .closest("li");
+    expect(unpricedRow).not.toBeNull();
+    expect(
+      within(unpricedRow as HTMLElement).getAllByText("Unavailable")
+    ).toHaveLength(3);
+  });
+
+  it("distinguishes an unavailable price feed from inventory privacy", async () => {
+    const unpricedItem = {
+      ...inventoryItem(1),
+      market_hash_name: "Item 0001",
+      marketable: true
+    };
+    const inventory = publicInventory([unpricedItem], {
+      priceable_item_count: 1,
+      price_status: "unavailable",
+      price_message:
+        "The inventory is public, but current Steam market prices are unavailable."
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const coverage = await screen.findByRole("region", {
+      name: "Current market snapshot"
+    });
+    expect(within(coverage).getByText("Pricing unavailable")).toBeInTheDocument();
+    expect(
+      within(coverage).getByText(
+        "The inventory is public, but current Steam market prices are unavailable."
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent("Public");
+    expect(
+      screen.queryByRole("link", { name: /open Steam privacy settings/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it("paginates a 2,001-item inventory without rendering more than one page", async () => {
+    const items = Array.from({ length: 2001 }, (_, index) =>
+      inventoryItem(index + 1)
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(publicInventory(items)))
+    );
+
+    render(<App />);
+
+    const inventoryList = await screen.findByRole("list", {
+      name: "Inventory items"
+    });
+    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(50);
+    expect(within(inventoryList).getByText("Item 0001")).toBeInTheDocument();
+    expect(within(inventoryList).getByText("Item 0050")).toBeInTheDocument();
+    expect(
+      within(inventoryList).queryByText("Item 0051")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Showing 1–50 of 2,001. Page 1 of 41.");
+
+    const previousButton = screen.getByRole("button", {
+      name: "Previous inventory page"
+    });
+    const nextButton = screen.getByRole("button", {
+      name: "Next inventory page"
+    });
+    expect(previousButton).toBeDisabled();
+    expect(nextButton).toBeEnabled();
+    fireEvent.click(nextButton);
+    expect(within(inventoryList).getByText("Item 0051")).toBeInTheDocument();
+    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(50);
+    expect(within(inventoryList).queryByText("Item 0001")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Inventory page" }), {
+      target: { value: "41" }
+    });
+    expect(within(inventoryList).getByText("Item 2001")).toBeInTheDocument();
+    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(1);
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Showing 2,001–2,001 of 2,001. Page 41 of 41.");
+    expect(nextButton).toBeDisabled();
+    expect(previousButton).toBeEnabled();
+  });
+
+  it("clamps the stored inventory page after a recheck shrinks the result", async () => {
+    const initialItems = Array.from({ length: 101 }, (_, index) =>
+      inventoryItem(index + 1)
+    );
+    const shrunkenItems = Array.from({ length: 10 }, (_, index) =>
+      inventoryItem(index + 201)
+    );
+    const grownItems = Array.from({ length: 100 }, (_, index) =>
+      inventoryItem(index + 301)
+    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventorySession(publicInventory(initialItems)))
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventorySession(publicInventory(shrunkenItems)))
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventorySession(publicInventory(grownItems)))
+      );
+
+    render(<App />);
+
+    const inventoryList = await screen.findByRole("list", {
+      name: "Inventory items"
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Inventory page" }), {
+      target: { value: "3" }
+    });
+    expect(within(inventoryList).getByText("Item 0101")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Recheck Steam access" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("status", { name: "Inventory pagination status" })
+      ).toHaveTextContent("Showing 1–10 of 10. Page 1 of 1.");
+    });
+    expect(
+      within(screen.getByRole("list", { name: "Inventory items" })).getByText(
+        "Item 0201"
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Inventory page" })
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Recheck Steam access" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("status", { name: "Inventory pagination status" })
+      ).toHaveTextContent("Showing 1–50 of 100. Page 1 of 2.");
+    });
+    const refreshedInventoryList = screen.getByRole("list", {
+      name: "Inventory items"
+    });
+    expect(within(refreshedInventoryList).getByText("Item 0301")).toBeInTheDocument();
+    expect(
+      within(refreshedInventoryList).queryByText("Item 0351")
+    ).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it.each(["", " ", "123\n", "76561198000000001abc", "１２３", "١٢٣", "+123"])(
     "rejects a non-ASCII decimal Steam ID (%j)",
     async (steamId) => {
@@ -266,6 +835,7 @@ describe("App", () => {
             message: "The Steam Web API is not configured."
           },
           inventory: {
+            ...signedInSession.checks.inventory,
             status: "public",
             message: "Your Steam inventory is publicly accessible.",
             retry_after_seconds: null,
@@ -297,6 +867,7 @@ describe("App", () => {
         checks: {
           ...sessionWithRetry(30).checks,
           inventory: {
+            ...signedInSession.checks.inventory,
             status: "unavailable",
             message: rateLimitMessage,
             retry_after_seconds: 30,
@@ -476,6 +1047,7 @@ describe("App", () => {
           message: "Profile access was checked again."
         },
         inventory: {
+          ...signedInSession.checks.inventory,
           status: "unavailable",
           message: "Inventory access was checked again.",
           retry_after_seconds: null,

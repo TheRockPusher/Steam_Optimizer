@@ -8,9 +8,11 @@ and help a user decide what to do next. It is not an account operator or marketp
 tool.
 
 The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an application-owned
-signed session, backend checks for public profile and AppID 753 Community inventory visibility,
-and a React interface that presents both results independently. Full inventory retrieval,
-normalization, and optimization remain deferred.
+signed session, backend profile checks, and server-only SteamApis v2 access through `STEAMAPI_KEY`.
+For a public inventory, it retrieves the complete AppID 753/context 6 inventory through provider
+pagination, joins current bulk AppID 753 prices to marketable items, and reports explicit price
+coverage (`complete`, `partial`, or `unavailable`). The React interface exposes all retrieved items
+and the separate price coverage result.
 
 ## Safety and identity boundary
 
@@ -18,53 +20,40 @@ All purchases, sales, trades, and other Steam actions remain manual. The applica
 automate transactions or require users to provide Steam credentials or secrets.
 
 The identity flow uses Steam OpenID 2.0. OpenID identifies and proves ownership of a SteamID64,
-but it does not grant access to a private inventory. Inventory access therefore still requires
-the user's Steam Community inventory to be public. The application never receives Steam passwords
-or Steam Guard codes.
+but it does not grant access to a private inventory. SteamApis inventory access therefore still
+requires the user's Steam Community inventory to be public. The application never receives Steam
+passwords or Steam Guard codes.
 
 ## Data handling, compliance, and upstream limits
 
-The profile-visibility check uses Valve's documented [Steam Web API](https://steamcommunity.com/dev)
-when its optional key is configured. The inventory check calls Steam Community's
-`/inventory/{steamid}/753/6` route, which is not listed in that Web API reference. The key remains
-server-only and does not fix that separate Community route. The 100,000-call daily term in
-[Valve's API terms](https://steamcommunity.com/dev/apiterms) is stated for the Web API; this
-project does not present it as a quota for the Community route.
+Profile visibility uses Valve's documented [Steam Web API](https://steamcommunity.com/dev) when its
+optional `STEAM_WEB_API_KEY` is configured. Inventory retrieval and current bulk AppID 753 prices
+use the third-party SteamApis v2 provider with the server-only `STEAMAPI_KEY`. The credential is
+sent only by the backend and never exposed to the browser. The inventory request is paginated by
+the provider; the backend follows its cursors and combines the pages into the complete public
+AppID 753/context 6 result.
 
-The project is designed around relevant boundaries in those terms: it retrieves Steam data only for
-a user-requested check, never receives or stores Steam passwords or Steam Guard codes, presents data
-as-is, and does not automate transactions or degrade Steam. It does not imply Valve or Steam
-endorsement. The [official button artwork](https://steamcommunity.com/dev) requested on Steam's
-developer page is local and does not imply affiliation. The signed HTTP-only session cookie contains
-the SteamID64 on the user's device for up to 24 hours by default, is sent to the Railway-hosted
-backend on session requests, and is cleared by logout or expiry. The public
+SteamApis is an independent provider and data source, not a Valve guarantee. Its availability,
+response fields, pagination behavior, data freshness, and bulk price coverage can differ from
+Steam Community at a given time. The bulk feed is filtered and joined to marketable inventory
+items, so some items may have no current price and the result can be `partial` or `unavailable`
+even when the inventory itself is public. SteamApis omits currency metadata from its bulk feed. Order-book
+values are preserved exactly as provider-denominated decimals and displayed without a currency symbol.
+Optimization must not treat them as monetary values until an authoritative currency contract or explicit
+configuration exists.
+
+The project retrieves Steam data only for a user-requested check, never receives or stores Steam
+passwords or Steam Guard codes, presents data as-is, and does not automate transactions or degrade
+Steam. It does not imply Valve or Steam endorsement. The [official button artwork](https://steamcommunity.com/dev)
+requested on Steam's developer page is local and does not imply affiliation. The signed HTTP-only
+session cookie contains the SteamID64 on the user's device for up to 24 hours by default, is sent
+to the Railway-hosted backend on session requests, and is cleared by logout or expiry. The public
 [privacy policy and Steam Data disclaimer](../README.md#privacy-and-steam-data-policy) disclose
 storage, deletion, warranty, and liability terms.
 
-The process-local state in Railway's configured US region treats only the SteamID64 and definitive
-public inventory-visibility result as reusable for five minutes. During an enforced cooldown it
-also retains the last public, private, unavailable, or rate-limited result for up to 900 seconds.
-No inventory payload persists. Expired entries are removed by later inventory traffic or process
-restart; until then they can remain in process memory but are never reused after their deadlines.
-State is bounded to 1,024 SteamIDs. HTTP 429 responses and bodies are never cached; session responses
-use `Cache-Control: no-store`.
-
-The Community route has no published `Retry-After` guarantee. Following [RFC 6585
-§4](https://www.rfc-editor.org/rfc/rfc6585#section-4), the app never stores 429 responses and
-honors valid nonnegative-second or HTTP-date
-[`Retry-After`](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3) values. A per-SteamID
-30-second cooldown prevents duplicate checks; each check makes at most three upstream attempts,
-with 1- and 2-second fallback delays and at most five seconds of retry-sleep time in addition to
-upstream request time. Hints beyond that inline bound are not slept, and the user cooldown is
-capped at 900 seconds. Only 429, 5xx, and network transients are retried; private or other 4xx
-responses, malformed 200 responses, and decoding failures are not. Concurrent checks for one
-SteamID coalesce.
-The terminal message is "Steam is temporarily limiting inventory checks. Try again in N seconds."
-It is shown as temporary limiting, not private; only rechecks are disabled while it counts down, and
-logout remains available.
-
-A static outbound IP may isolate network reputation but cannot guarantee no 429 response; it is not
-a cure for rate limiting.
+No inventory or price payload is currently cached or persisted in a database. Results are joined in
+process memory for the requested response only. Railway's backend and frontend services run in
+EU-West, exact region `europe-west4-drams3a`; all future Railway processes must use that region.
 
 ## Technical direction
 
@@ -73,12 +62,14 @@ a cure for rate limiting.
 - **Frontend:** React and TypeScript with Vite, managed with pnpm; ESLint and Vitest provide
   quality checks.
 - **Architecture:** Keep the backend API, Steam integration, inventory model, and optimizer as
-  separable modules. The future optimizer will be a deterministic, pure Python package, and
-  money values will use integer minor units. The frontend and backend remain independently
+  separable modules. The future optimizer will be a deterministic, pure Python package, but it
+  must not treat SteamApis order-book decimals as monetary values until an authoritative currency
+  contract or explicit configuration exists. The frontend and backend remain independently
   deployable services.
 - **Hosting:** Railway project `steam-optimizer`
   (`a6d0c0d3-2a41-486b-9f3b-1de0db5da949`) has a production environment with separate backend
-  and frontend services. The browser uses the frontend origin for both UI and `/api`; Caddy
+  and frontend services in EU-West (`europe-west4-drams3a`). All future Railway processes must use
+  the same region. The browser uses the frontend origin for both UI and `/api`; Caddy
   proxies API traffic to the backend service.
 - **License:** GNU Affero General Public License v3.0, preserving source availability for
   modified hosted versions.
@@ -112,7 +103,11 @@ Configure the following before a production release:
   `COOKIE_SAMESITE=lax`.
 - The Railway frontend service keeps `VITE_API_BASE_URL` empty and sets runtime `API_UPSTREAM` to
   the public backend origin. Caddy proxies `/api` so authentication uses same-origin cookies.
-  `STEAM_WEB_API_KEY` is optional and belongs only in the backend environment.
+- `STEAM_WEB_API_KEY` is optional and belongs only in the backend environment for profile checks.
+- `STEAMAPI_KEY` belongs only in the backend environment for SteamApis v2 inventory retrieval and
+  bulk prices; it is never exposed to the browser.
+- Both Railway services and all future Railway processes must run in EU-West, exact region
+  `europe-west4-drams3a`.
 
 After deployment, the backend smoke check requests `${{ vars.BACKEND_URL }}/api/health`. Frontend
 smoke checks verify the root document, proxied session endpoint, Steam login redirect, callback
@@ -128,7 +123,6 @@ remain compatible.
 
 The following are planned later, not missing pieces of the current stage:
 
-- Full Steam Community inventory retrieval and normalization
 - Deterministic badge optimization and recommendation planning
 - PostgreSQL persistence and Redis-backed services
 - Marketplace, purchase, sale, trade, or any other transaction automation

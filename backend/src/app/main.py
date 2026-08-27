@@ -12,12 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth_routes import Clock, create_auth_router
 from app.settings import Settings, get_settings
-from app.steam_gateway import (
-    AsyncSleep,
-    MonotonicClock,
-    SteamGateway,
-    SteamGatewayProtocol,
-)
+from app.steam_gateway import SteamGateway, SteamGatewayProtocol
 from app.steam_openid import SteamOpenIDClient, SteamOpenIDVerifier
 
 
@@ -27,35 +22,37 @@ def create_app(
     steam_gateway: SteamGatewayProtocol | None = None,
     openid_verifier: SteamOpenIDVerifier | None = None,
     clock: Clock | None = None,
-    monotonic_clock: MonotonicClock | None = None,
-    sleep: AsyncSleep | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
-    shared_client: httpx2.AsyncClient | None = None
+    normal_client: httpx2.AsyncClient | None = None
+    bulk_client: httpx2.AsyncClient | None = None
     if steam_gateway is None or openid_verifier is None:
-        shared_client = httpx2.AsyncClient(
-            timeout=settings.steam_request_timeout_seconds
+        normal_client = httpx2.AsyncClient(
+            timeout=settings.steam_request_timeout_seconds,
+        )
+    if steam_gateway is None:
+        bulk_client = httpx2.AsyncClient(
+            timeout=settings.steam_bulk_timeout_seconds,
         )
 
     gateway: SteamGatewayProtocol
     if steam_gateway is None:
-        if shared_client is None:
+        if normal_client is None:
             raise RuntimeError
         gateway = SteamGateway(
             settings,
-            http_client=shared_client,
-            utc_clock=clock,
-            monotonic_clock=monotonic_clock,
-            sleep=sleep,
+            http_client=normal_client,
+            bulk_http_client=bulk_client,
+            bulk_timeout_seconds=settings.steam_bulk_timeout_seconds,
         )
     else:
         gateway = steam_gateway
 
     verifier: SteamOpenIDVerifier
     if openid_verifier is None:
-        if shared_client is None:
+        if normal_client is None:
             raise RuntimeError
-        verifier = SteamOpenIDClient(http_client=shared_client)
+        verifier = SteamOpenIDClient(http_client=normal_client)
     else:
         verifier = openid_verifier
 
@@ -64,8 +61,12 @@ def create_app(
         try:
             yield
         finally:
-            if shared_client is not None:
-                await shared_client.aclose()
+            try:
+                if bulk_client is not None:
+                    await bulk_client.aclose()
+            finally:
+                if normal_client is not None:
+                    await normal_client.aclose()
 
     application = FastAPI(title=settings.app, lifespan=lifespan)
     application.add_middleware(
