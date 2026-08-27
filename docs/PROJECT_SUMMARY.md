@@ -84,11 +84,12 @@ still runs on pull requests and `main`; the release invokes that reusable CI bef
 
 To start a release from the GitHub UI, merge the version update to `main`, open **Actions →
 Release → Run workflow**, keep `main` selected, and enter the matching backend
-`project.version` without a leading `v`. The dispatched run validates the input, creates the
-version tag itself, and executes CI, deployment, smoke checks, and release-note publication in the
-same run; it does not rely on a second tag event. The active release-tag ruleset must permit the
-GitHub Actions actor to create protected `v*` tags. Otherwise, use **Releases → Draft a new
-release** and create the protected tag on `main` to use the tag-triggered path.
+`project.version` without a leading `v`. The dispatched run validates the input, executes CI,
+deployment, and smoke checks, then creates the version tag and publishes release notes in the same
+run; it does not rely on a second tag event. The active release-tag ruleset must permit the GitHub
+Actions actor to create protected `v*` tags. Otherwise, the manual run stops before the tag and
+GitHub release are published, after the deployment checks have completed; use **Releases → Draft a
+new release** and create the protected tag on `main` to use the tag-triggered path.
 
 The workflow uses Railway CLI 5.44.1 to upload `./backend` and then `./frontend` with
 `--path-as-root`, explicitly selecting the project, `production` environment, and service. It
