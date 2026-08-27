@@ -6,6 +6,7 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
 ## Unreleased
 
 - Establish the initial backend, frontend, repository tooling, and documentation scaffold.
+- Make Harbor Signal the default frontend colour system with dark navy surfaces, Steam-blue highlights, and accessible semantic states.
 - Add official Steam sign-in artwork and clarify that it does not imply Valve or Steam affiliation.
 - Move Steam sign-in to the top-right header and add accessible ascending and descending
   sorting controls for every inventory table column.

@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   font-family: "Avenir Next", "Trebuchet MS", "Gill Sans", sans-serif;
   color: var(--color-ink);
   background: var(--color-canvas);
@@ -7,27 +7,27 @@
   text-rendering: optimizeLegibility;
 
   --font-display: Georgia, "Times New Roman", serif;
-  --color-canvas: #eee9df;
-  --color-surface: #faf7f0;
-  --color-surface-strong: #f4efe5;
-  --color-ink: #17272a;
-  --color-ink-soft: #4d5d60;
-  --color-ink-faint: #5f6969;
-  --color-line: #cfc5b5;
-  --color-line-soft: #ded6c9;
-  --color-accent: #b55227;
-  --color-accent-strong: #863716;
-  --color-accent-soft: #f2ded0;
-  --color-public: #276348;
-  --color-public-soft: #dcebe1;
-  --color-private: #99502a;
-  --color-private-soft: #f2e1d2;
-  --color-unavailable: #615f69;
-  --color-unavailable-soft: #e6e3e4;
-  --color-error: #923f38;
-  --color-error-soft: #f2ddda;
-  --color-focus: #195c70;
-  --color-on-accent: #fff8f1;
+  --color-canvas: #08131e;
+  --color-surface: #101f2d;
+  --color-surface-strong: #172a3b;
+  --color-ink: #f4f8fb;
+  --color-ink-soft: #aab9c7;
+  --color-ink-faint: #8799a9;
+  --color-line: #4c6d85;
+  --color-line-soft: #344d61;
+  --color-accent: #66c0f4;
+  --color-accent-strong: #66c0f4;
+  --color-accent-soft: #17344a;
+  --color-public: #7bdca7;
+  --color-public-soft: #15362f;
+  --color-private: #f0bd82;
+  --color-private-soft: #392a20;
+  --color-unavailable: #b7c0ca;
+  --color-unavailable-soft: #28333e;
+  --color-error: #ffaca4;
+  --color-error-soft: #3d2226;
+  --color-focus: #9bdcff;
+  --color-on-accent: #07131d;
 
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -56,7 +56,7 @@
   --radius-md: 0.75rem;
   --radius-lg: 1.25rem;
   --radius-round: 999rem;
-  --shadow-panel: 0 1.5rem 4rem rgb(50 40 26 / 9%);
+  --shadow-panel: 0 1.5rem 4rem rgb(0 0 0 / 24%);
   --transition-fast: 150ms ease-out;
   --transition-slow: 350ms cubic-bezier(0.16, 1, 0.3, 1);
   --layout-max: 72rem;
@@ -105,6 +105,6 @@ a:focus-visible {
 }
 
 ::selection {
-  color: var(--color-ink);
-  background: var(--color-accent-soft);
+  color: var(--color-on-accent);
+  background: var(--color-accent);
 }
