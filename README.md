@@ -131,19 +131,19 @@ still runs on pull requests and `main`; the release invokes that reusable CI bef
 
 ### Run a release from the GitHub UI
 
-After the version commit has been merged to `main`, open **Actions → Release → Run workflow**.
-Keep the branch set to `main`, enter the backend `project.version` without the leading `v` (for
-example, `0.1.2`), and run the workflow. The workflow validates the version and commit, runs the
-existing continuous-integration, deployment, and smoke-check jobs, then creates `v0.1.2` and
-publishes release notes in that same run. A tag created with `GITHUB_TOKEN` does not start a second
-workflow.
+After code changes have been merged to `main`, open **Actions → Release → Run workflow**. Keep the
+branch set to `main`, choose `patch`, `minor`, or `major` in the **Version increment** dropdown, and
+run the workflow. It derives the next semantic version from the latest release tag, validates the
+prospective tag and commit, runs the existing continuous-integration, deployment, and smoke-check
+jobs, then commits the calculated backend version, creates the tag, and publishes release notes in
+that same run. A tag created with `GITHUB_TOKEN` does not start a second workflow.
 
-The active release-tag ruleset must permit the GitHub Actions actor to create protected `v*` tags.
-If it does not, the manual run stops before the tag and GitHub release are published, after the
-deployment checks have completed; grant that actor bypass access or use **Releases → Draft a new
-release**, create the same tag on `main`, and publish it to trigger the tag-based path.
-The input version must already match `backend/pyproject.toml`; the workflow does not edit source
-files or bump versions.
+The workflow changes only `backend/pyproject.toml` for the calculated version and uses a conventional
+`chore: prepare release vX.Y.Z` commit. It will not overwrite an existing tag that points to another
+commit. The active release-tag ruleset must permit the GitHub Actions actor to create protected `v*`
+tags. If it does not, the manual run stops before the tag and GitHub release are published, after
+the deployment checks have completed; use **Releases → Draft a new release**, create the same tag on
+`main`, and publish it to trigger the tag-based path.
 
 Configure these values before the first production release:
 

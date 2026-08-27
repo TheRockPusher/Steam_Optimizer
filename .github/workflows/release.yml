@@ -6,10 +6,15 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version without a leading v (for example, 0.1.2)"
+      bump:
+        description: "Version increment to apply"
         required: true
-        type: string
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: read
@@ -30,6 +35,8 @@ jobs:
       release_version: ${{ steps.release.outputs.release_version }}
       release_commit: ${{ steps.release.outputs.release_commit }}
       create_tag: ${{ steps.release.outputs.create_tag }}
+      update_version: ${{ steps.release.outputs.update_version }}
+      base_version: ${{ steps.release.outputs.base_version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -39,32 +46,34 @@ jobs:
         id: release
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
           REF_NAME: ${{ github.ref_name }}
           TAG_COMMIT: ${{ github.sha }}
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
           create_tag=false
+          update_version=false
+          base_version=""
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$REF_NAME" != "main" ]]; then
               echo "Manual production releases must run from main." >&2
               exit 1
             fi
-            if [[ ! "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "Manual release version must match MAJOR.MINOR.PATCH: $INPUT_VERSION" >&2
-              exit 1
-            fi
-            release_version="$INPUT_VERSION"
-            release_tag="v$release_version"
+            case "$INPUT_BUMP" in
+              patch|minor|major) ;;
+              *)
+                echo "Manual release increment must be patch, minor, or major." >&2
+                exit 1
+                ;;
+            esac
           else
             release_tag="$REF_NAME"
             if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
               echo "Release tag must match vMAJOR.MINOR.PATCH: $release_tag" >&2
               exit 1
             fi
-            release_version="${release_tag#v}"
             if [[ "$REF_PROTECTED" != "true" ]]; then
               echo "Release tag must be protected by an active GitHub ruleset." >&2
               exit 1
@@ -86,20 +95,66 @@ jobs:
               print(tomllib.load(pyproject)["project"]["version"])
           PY
           )"
-          if [[ "$release_version" != "$project_version" ]]; then
-            echo "Release version and backend project.version differ." >&2
+          if [[ ! "$project_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "backend project.version must match MAJOR.MINOR.PATCH: $project_version" >&2
             exit 1
           fi
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            latest_tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG_COMMIT" 2>/dev/null || true)"
+            if [[ -n "$latest_tag" ]]; then
+              base_version="${latest_tag#v}"
+            else
+              base_version="$project_version"
+            fi
+            if [[ ! "$base_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Latest release tag must match vMAJOR.MINOR.PATCH: ${latest_tag:-<none>}" >&2
+              exit 1
+            fi
+            release_version="$(
+              BASE_VERSION="$base_version" BUMP_LEVEL="$INPUT_BUMP" python - <<'PY'
+          import os
+
+          major, minor, patch = (int(part) for part in os.environ["BASE_VERSION"].split("."))
+          match os.environ["BUMP_LEVEL"]:
+              case "major":
+                  major, minor, patch = major + 1, 0, 0
+              case "minor":
+                  minor, patch = minor + 1, 0
+              case "patch":
+                  patch += 1
+              case _:
+                  raise SystemExit("invalid release increment")
+          print(f"{major}.{minor}.{patch}")
+          PY
+            )"
+            release_tag="v$release_version"
+            if [[ "$project_version" != "$base_version" && "$project_version" != "$release_version" ]]; then
+              echo "backend project.version must match the latest release or the calculated next version." >&2
+              exit 1
+            fi
+            if [[ "$project_version" != "$release_version" ]]; then
+              update_version=true
+            fi
             existing_commit="$(git ls-remote --refs origin "refs/tags/$release_tag" | cut -f1)"
             if [[ -n "$existing_commit" ]]; then
               if [[ "$existing_commit" != "$TAG_COMMIT" ]]; then
                 echo "Release tag already points to another commit: $release_tag" >&2
                 exit 1
               fi
+              if [[ "$update_version" == "true" ]]; then
+                echo "Release tag exists before the source version bump: $release_tag" >&2
+                exit 1
+              fi
             else
               create_tag=true
+            fi
+          else
+            release_version="${release_tag#v}"
+            base_version="$release_version"
+            if [[ "$release_version" != "$project_version" ]]; then
+              echo "Release tag version and backend project.version differ." >&2
+              exit 1
             fi
           fi
 
@@ -108,6 +163,8 @@ jobs:
             echo "release_version=$release_version"
             echo "release_commit=$TAG_COMMIT"
             echo "create_tag=$create_tag"
+            echo "update_version=$update_version"
+            echo "base_version=$base_version"
           } >> "$GITHUB_OUTPUT"
 
   validate:
@@ -127,6 +184,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.release_tag }}
           TAG_COMMIT: ${{ needs.prepare.outputs.release_commit }}
           TAG_VERSION: ${{ needs.prepare.outputs.release_version }}
+          BASE_VERSION: ${{ needs.prepare.outputs.base_version }}
           EVENT_NAME: ${{ github.event_name }}
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
@@ -155,7 +213,12 @@ jobs:
               print(tomllib.load(pyproject)["project"]["version"])
           PY
           )"
-          if [[ "$TAG_VERSION" != "$project_version" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$project_version" != "$BASE_VERSION" && "$project_version" != "$TAG_VERSION" ]]; then
+              echo "Manual release source version must match the latest release or calculated next version." >&2
+              exit 1
+            fi
+          elif [[ "$TAG_VERSION" != "$project_version" ]]; then
             echo "Release tag version and backend project.version differ." >&2
             exit 1
           fi
@@ -332,13 +395,83 @@ jobs:
           args: --latest --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
+      - name: Commit calculated release version
+        if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.update_version == 'true' }}
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+          BASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          if [[ "$(git rev-parse origin/main)" != "$BASE_COMMIT" ]]; then
+            echo "main changed after release validation; refusing to push the version commit." >&2
+            exit 1
+          fi
+          python - "$RELEASE_VERSION" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path("backend/pyproject.toml")
+          text = path.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{sys.argv[1]}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not find backend project.version.")
+          path.write_text(updated, encoding="utf-8")
+          PY
+          if git diff --quiet -- backend/pyproject.toml; then
+            echo "The calculated release version did not change backend/pyproject.toml." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/pyproject.toml
+          git commit -m "chore: prepare release v$RELEASE_VERSION"
+          git push origin HEAD:main
+      - name: Resolve final release commit
+        id: final
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          UPDATE_VERSION: ${{ needs.prepare.outputs.update_version }}
+          BASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$UPDATE_VERSION" == "true" ]]; then
+            release_commit="$(git rev-parse HEAD)"
+          else
+            release_commit="$BASE_COMMIT"
+          fi
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
+      - name: Verify final release version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          project_version="$(
+            python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("backend/pyproject.toml").open("rb") as pyproject:
+              print(tomllib.load(pyproject)["project"]["version"])
+          PY
+          )"
+          if [[ "$RELEASE_VERSION" != "$project_version" ]]; then
+            echo "Final source version and release version differ." >&2
+            exit 1
+          fi
       - name: Create protected release tag
         if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.create_tag == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+          RELEASE_COMMIT: ${{ steps.final.outputs.release_commit }}
         run: |
           set -euo pipefail
           if ! gh api --method POST "repos/$REPOSITORY/git/refs" \
@@ -352,4 +485,4 @@ jobs:
         with:
           body_path: RELEASE_NOTES.md
           tag_name: ${{ needs.prepare.outputs.release_tag }}
-          target_commitish: ${{ needs.prepare.outputs.release_commit }}
+          target_commitish: ${{ steps.final.outputs.release_commit }}
