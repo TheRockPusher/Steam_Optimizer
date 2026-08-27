@@ -29,14 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
+      contents: write
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       release_version: ${{ steps.release.outputs.release_version }}
       release_commit: ${{ steps.release.outputs.release_commit }}
       create_tag: ${{ steps.release.outputs.create_tag }}
-      update_version: ${{ steps.release.outputs.update_version }}
-      base_version: ${{ steps.release.outputs.base_version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -157,14 +155,46 @@ jobs:
               exit 1
             fi
           fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$update_version" == "true" ]]; then
+            if [[ "$(git rev-parse origin/main)" != "$TAG_COMMIT" ]]; then
+              echo "main changed while preparing the release; refusing to push the version commit." >&2
+              exit 1
+            fi
+            python - "$release_version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path("backend/pyproject.toml")
+          text = path.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{sys.argv[1]}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not find backend project.version.")
+          path.write_text(updated, encoding="utf-8")
+          PY
+            if git diff --quiet -- backend/pyproject.toml; then
+              echo "The calculated release version did not change backend/pyproject.toml." >&2
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add backend/pyproject.toml
+            git commit -m "chore: prepare release v$release_version"
+            git push origin HEAD:main
+            TAG_COMMIT="$(git rev-parse HEAD)"
+          fi
+
 
           {
             echo "release_tag=$release_tag"
             echo "release_version=$release_version"
             echo "release_commit=$TAG_COMMIT"
             echo "create_tag=$create_tag"
-            echo "update_version=$update_version"
-            echo "base_version=$base_version"
           } >> "$GITHUB_OUTPUT"
 
   validate:
@@ -179,12 +209,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_commit }}
       - name: Validate tag, main ancestry, and backend version
         env:
           TAG: ${{ needs.prepare.outputs.release_tag }}
           TAG_COMMIT: ${{ needs.prepare.outputs.release_commit }}
           TAG_VERSION: ${{ needs.prepare.outputs.release_version }}
-          BASE_VERSION: ${{ needs.prepare.outputs.base_version }}
           EVENT_NAME: ${{ github.event_name }}
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
@@ -213,26 +243,23 @@ jobs:
               print(tomllib.load(pyproject)["project"]["version"])
           PY
           )"
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$project_version" != "$BASE_VERSION" && "$project_version" != "$TAG_VERSION" ]]; then
-              echo "Manual release source version must match the latest release or calculated next version." >&2
-              exit 1
-            fi
-          elif [[ "$TAG_VERSION" != "$project_version" ]]; then
+          if [[ "$TAG_VERSION" != "$project_version" ]]; then
             echo "Release tag version and backend project.version differ." >&2
             exit 1
           fi
 
   ci:
     name: Run CI checks
-    needs: validate
+    needs: [prepare, validate]
     uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.release_commit }}
     permissions:
       contents: read
 
   deploy-backend:
     name: Deploy backend to production
-    needs: [validate, ci]
+    needs: [prepare, validate, ci]
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -242,6 +269,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_commit }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -269,7 +298,7 @@ jobs:
 
   deploy-frontend:
     name: Deploy frontend to production
-    needs: smoke-backend
+    needs: [prepare, smoke-backend]
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -279,6 +308,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_commit }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -392,61 +423,9 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --latest --strip header
+          args: --unreleased --tag ${{ needs.prepare.outputs.release_tag }} --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
-      - name: Commit calculated release version
-        if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.update_version == 'true' }}
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
-          BASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --force origin main:refs/remotes/origin/main
-          if [[ "$(git rev-parse origin/main)" != "$BASE_COMMIT" ]]; then
-            echo "main changed after release validation; refusing to push the version commit." >&2
-            exit 1
-          fi
-          python - "$RELEASE_VERSION" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          path = Path("backend/pyproject.toml")
-          text = path.read_text(encoding="utf-8")
-          updated, count = re.subn(
-              r'(?m)^version = "[^"]+"$',
-              f'version = "{sys.argv[1]}"',
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("Could not find backend project.version.")
-          path.write_text(updated, encoding="utf-8")
-          PY
-          if git diff --quiet -- backend/pyproject.toml; then
-            echo "The calculated release version did not change backend/pyproject.toml." >&2
-            exit 1
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend/pyproject.toml
-          git commit -m "chore: prepare release v$RELEASE_VERSION"
-          git push origin HEAD:main
-      - name: Resolve final release commit
-        id: final
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          UPDATE_VERSION: ${{ needs.prepare.outputs.update_version }}
-          BASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$UPDATE_VERSION" == "true" ]]; then
-            release_commit="$(git rev-parse HEAD)"
-          else
-            release_commit="$BASE_COMMIT"
-          fi
-          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
       - name: Verify final release version
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
@@ -471,7 +450,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          RELEASE_COMMIT: ${{ steps.final.outputs.release_commit }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
         run: |
           set -euo pipefail
           if ! gh api --method POST "repos/$REPOSITORY/git/refs" \
@@ -485,4 +464,4 @@ jobs:
         with:
           body_path: RELEASE_NOTES.md
           tag_name: ${{ needs.prepare.outputs.release_tag }}
-          target_commitish: ${{ steps.final.outputs.release_commit }}
+          target_commitish: ${{ needs.prepare.outputs.release_commit }}

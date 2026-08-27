@@ -133,16 +133,16 @@ still runs on pull requests and `main`; the release invokes that reusable CI bef
 
 After code changes have been merged to `main`, open **Actions → Release → Run workflow**. Keep the
 branch set to `main`, choose `patch`, `minor`, or `major` in the **Version increment** dropdown, and
-run the workflow. It derives the next semantic version from the latest release tag, validates the
-prospective tag and commit, runs the existing continuous-integration, deployment, and smoke-check
-jobs, then commits the calculated backend version, creates the tag, and publishes release notes in
-that same run. A tag created with `GITHUB_TOKEN` does not start a second workflow.
+run the workflow. It derives the next semantic version from the latest release tag and creates a
+conventional `chore: prepare release vX.Y.Z` commit that changes only
+`backend/pyproject.toml`. That commit SHA is then used by CI and every Railway deployment, so the
+tested, deployed, and eventually tagged source is identical.
 
-The workflow changes only `backend/pyproject.toml` for the calculated version and uses a conventional
-`chore: prepare release vX.Y.Z` commit. It will not overwrite an existing tag that points to another
-commit. The active release-tag ruleset must permit the GitHub Actions actor to create protected `v*`
-tags. If it does not, the manual run stops before the tag and GitHub release are published, after
-the deployment checks have completed; use **Releases → Draft a new release**, create the same tag on
+The version tag and GitHub release are created only after deployment smoke checks pass. A tag
+created with `GITHUB_TOKEN` does not start a second workflow. The workflow will not overwrite an
+existing tag that points to another commit. The active release-tag ruleset must permit the GitHub
+Actions actor to create protected `v*` tags. If it does not, the manual run stops before the tag
+and GitHub release are published; use **Releases → Draft a new release**, create the same tag on
 `main`, and publish it to trigger the tag-based path.
 
 Configure these values before the first production release:
