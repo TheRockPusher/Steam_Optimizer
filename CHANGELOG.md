@@ -7,6 +7,8 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
 
 - Establish the initial backend, frontend, repository tooling, and documentation scaffold.
 - Add official Steam sign-in artwork and clarify that it does not imply Valve or Steam affiliation.
+- Move Steam sign-in to the top-right header and add accessible ascending and descending
+  sorting controls for every inventory table column.
 - Add SteamApis v2 inventory and pricing: complete public AppID 753/context 6 retrieval with
   provider pagination, current bulk AppID 753 prices, server-only `STEAMAPI_KEY`, provider and
   data-source caveats, and explicit partial price coverage. SteamApis omits currency metadata from its

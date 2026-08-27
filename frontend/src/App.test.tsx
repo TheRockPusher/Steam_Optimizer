@@ -150,6 +150,7 @@ describe("App", () => {
     expect(screen.getByRole("status")).toBe(statusRegion);
 
     const loginLink = screen.getByRole("link", { name: /steam sign-in/i });
+    expect(loginLink.closest("header")).toHaveClass("site-header");
     expect(loginLink).toHaveAccessibleName(
       "Steam sign-in; Steam Optimizer is not affiliated with Valve"
     );
@@ -296,10 +297,10 @@ describe("App", () => {
       "4"
     );
 
-    const inventoryList = screen.getByRole("list", { name: "Inventory items" });
-    const pricedRow = within(inventoryList)
+    const inventoryTable = screen.getByRole("table", { name: "Inventory items" });
+    const pricedRow = within(inventoryTable)
       .getByText("Prismatic Trading Card")
-      .closest("li");
+      .closest("tr");
     expect(pricedRow).not.toBeNull();
     expect(within(pricedRow as HTMLElement).getByText("3")).toBeInTheDocument();
     expect(
@@ -312,9 +313,9 @@ describe("App", () => {
       within(pricedRow as HTMLElement).getByText(/Aug 27, 2026/)
     ).toHaveAttribute("datetime", "2026-08-27T08:15:00Z");
 
-    const nonmarketableRow = within(inventoryList)
+    const nonmarketableRow = within(inventoryTable)
       .getByText("Community Contributor Badge")
-      .closest("li");
+      .closest("tr");
     expect(nonmarketableRow).not.toBeNull();
     expect(
       within(nonmarketableRow as HTMLElement).getByText("Nonmarketable")
@@ -322,6 +323,114 @@ describe("App", () => {
     expect(
       within(nonmarketableRow as HTMLElement).getAllByText("Not applicable")
     ).toHaveLength(3);
+  });
+
+  it("sorts every inventory field in both directions and keeps unavailable values last", async () => {
+    const charlie = {
+      ...inventoryItem(1),
+      name: "Charlie",
+      market_hash_name: "Charlie",
+      quantity: 2,
+      marketable: true,
+      price: {
+        currency: null,
+        highest_buy: "0.10",
+        lowest_sell: "0.30",
+        observed_at: "2026-08-27T12:00:00Z"
+      }
+    };
+    const alpha = {
+      ...inventoryItem(2),
+      name: "Alpha",
+      quantity: 10
+    };
+    const bravo = {
+      ...inventoryItem(3),
+      name: "Bravo",
+      market_hash_name: "Bravo",
+      quantity: 1,
+      marketable: true,
+      price: {
+        currency: null,
+        highest_buy: "0.02",
+        lowest_sell: "0.20",
+        observed_at: "2026-08-26T12:00:00Z"
+      }
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        publicInventorySession(
+          publicInventory([charlie, alpha, bravo], {
+            total_asset_count: 13,
+            priceable_item_count: 2,
+            priced_item_count: 2
+          })
+        )
+      )
+    );
+
+    render(<App />);
+
+    const inventoryTable = await screen.findByRole("table", {
+      name: "Inventory items"
+    });
+    const renderedNames = () =>
+      within(inventoryTable)
+        .getAllByRole("row")
+        .slice(1)
+        .map((row) => within(row).getByRole("rowheader").textContent);
+    const assertSort = (
+      label: string,
+      ascending: string[],
+      descending: string[]
+    ) => {
+      fireEvent.click(
+        screen.getByRole("button", { name: `Sort by ${label}, ascending` })
+      );
+      expect(renderedNames()).toEqual(ascending);
+      expect(
+        screen
+          .getByRole("button", { name: `Sort by ${label}, descending` })
+          .closest("th")
+      ).toHaveAttribute("aria-sort", "ascending");
+
+      fireEvent.click(
+        screen.getByRole("button", { name: `Sort by ${label}, descending` })
+      );
+      expect(renderedNames()).toEqual(descending);
+      expect(
+        screen
+          .getByRole("button", { name: `Sort by ${label}, ascending` })
+          .closest("th")
+      ).toHaveAttribute("aria-sort", "descending");
+    };
+
+    assertSort("Item", ["Alpha", "Bravo", "Charlie"], ["Charlie", "Bravo", "Alpha"]);
+    assertSort(
+      "Quantity",
+      ["Bravo", "Charlie", "Alpha"],
+      ["Alpha", "Charlie", "Bravo"]
+    );
+    assertSort(
+      "Marketability",
+      ["Charlie", "Bravo", "Alpha"],
+      ["Alpha", "Charlie", "Bravo"]
+    );
+    assertSort(
+      "Highest buy",
+      ["Bravo", "Charlie", "Alpha"],
+      ["Charlie", "Bravo", "Alpha"]
+    );
+    assertSort(
+      "Lowest sell",
+      ["Bravo", "Charlie", "Alpha"],
+      ["Charlie", "Bravo", "Alpha"]
+    );
+    assertSort(
+      "Price timestamp",
+      ["Bravo", "Charlie", "Alpha"],
+      ["Charlie", "Bravo", "Alpha"]
+    );
   });
 
   it("rejects a malformed nested item", async () => {
@@ -588,7 +697,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     const unpricedRow = screen
       .getByText("Marketable without a price")
-      .closest("li");
+      .closest("tr");
     expect(unpricedRow).not.toBeNull();
     expect(
       within(unpricedRow as HTMLElement).getAllByText("Unavailable")
@@ -640,18 +749,29 @@ describe("App", () => {
 
     render(<App />);
 
-    const inventoryList = await screen.findByRole("list", {
+    const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
     });
-    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(50);
-    expect(within(inventoryList).getByText("Item 0001")).toBeInTheDocument();
-    expect(within(inventoryList).getByText("Item 0050")).toBeInTheDocument();
+    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(51);
+    expect(within(inventoryTable).getByText("Item 0001")).toBeInTheDocument();
+    expect(within(inventoryTable).getByText("Item 0050")).toBeInTheDocument();
     expect(
-      within(inventoryList).queryByText("Item 0051")
+      within(inventoryTable).queryByText("Item 0051")
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("status", { name: "Inventory pagination status" })
     ).toHaveTextContent("Showing 1–50 of 2,001. Page 1 of 41.");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Item, ascending" })
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Item, descending" })
+    );
+    expect(within(inventoryTable).getByText("Item 2001")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Item, ascending" })
+    );
+    expect(within(inventoryTable).getByText("Item 0001")).toBeInTheDocument();
 
     const previousButton = screen.getByRole("button", {
       name: "Previous inventory page"
@@ -662,15 +782,15 @@ describe("App", () => {
     expect(previousButton).toBeDisabled();
     expect(nextButton).toBeEnabled();
     fireEvent.click(nextButton);
-    expect(within(inventoryList).getByText("Item 0051")).toBeInTheDocument();
-    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(50);
-    expect(within(inventoryList).queryByText("Item 0001")).not.toBeInTheDocument();
+    expect(within(inventoryTable).getByText("Item 0051")).toBeInTheDocument();
+    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(51);
+    expect(within(inventoryTable).queryByText("Item 0001")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("combobox", { name: "Inventory page" }), {
       target: { value: "41" }
     });
-    expect(within(inventoryList).getByText("Item 2001")).toBeInTheDocument();
-    expect(within(inventoryList).getAllByRole("listitem")).toHaveLength(1);
+    expect(within(inventoryTable).getByText("Item 2001")).toBeInTheDocument();
+    expect(within(inventoryTable).getAllByRole("row")).toHaveLength(2);
     expect(
       screen.getByRole("status", { name: "Inventory pagination status" })
     ).toHaveTextContent("Showing 2,001–2,001 of 2,001. Page 41 of 41.");
@@ -702,13 +822,13 @@ describe("App", () => {
 
     render(<App />);
 
-    const inventoryList = await screen.findByRole("list", {
+    const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
     });
     fireEvent.change(screen.getByRole("combobox", { name: "Inventory page" }), {
       target: { value: "3" }
     });
-    expect(within(inventoryList).getByText("Item 0101")).toBeInTheDocument();
+    expect(within(inventoryTable).getByText("Item 0101")).toBeInTheDocument();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam access" })
@@ -720,7 +840,7 @@ describe("App", () => {
       ).toHaveTextContent("Showing 1–10 of 10. Page 1 of 1.");
     });
     expect(
-      within(screen.getByRole("list", { name: "Inventory items" })).getByText(
+      within(screen.getByRole("table", { name: "Inventory items" })).getByText(
         "Item 0201"
       )
     ).toBeInTheDocument();
@@ -737,12 +857,14 @@ describe("App", () => {
         screen.getByRole("status", { name: "Inventory pagination status" })
       ).toHaveTextContent("Showing 1–50 of 100. Page 1 of 2.");
     });
-    const refreshedInventoryList = screen.getByRole("list", {
+    const refreshedInventoryTable = screen.getByRole("table", {
       name: "Inventory items"
     });
-    expect(within(refreshedInventoryList).getByText("Item 0301")).toBeInTheDocument();
     expect(
-      within(refreshedInventoryList).queryByText("Item 0351")
+      within(refreshedInventoryTable).getByText("Item 0301")
+    ).toBeInTheDocument();
+    expect(
+      within(refreshedInventoryTable).queryByText("Item 0351")
     ).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });

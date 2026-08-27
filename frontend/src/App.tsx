@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
 import steamSignInCompact from "./assets/steam/sits_02.png";
 import "./App.css";
@@ -29,6 +29,21 @@ type InventoryItem = {
   marketable: boolean;
   tradable: boolean;
   price: InventoryPrice | null;
+};
+
+type InventorySortField =
+  | "name"
+  | "quantity"
+  | "marketable"
+  | "highest_buy"
+  | "lowest_sell"
+  | "observed_at";
+
+type SortDirection = "ascending" | "descending";
+
+type InventorySort = {
+  field: InventorySortField;
+  direction: SortDirection;
 };
 
 type InventoryCheck = VisibilityCheck & {
@@ -102,6 +117,22 @@ const PRICE_STATUS_LABELS: Record<PriceStatus, string> = {
   partial: "Partial pricing",
   unavailable: "Pricing unavailable"
 };
+
+const INVENTORY_COLUMNS: ReadonlyArray<{
+  field: InventorySortField;
+  label: string;
+}> = [
+    { field: "name", label: "Item" },
+    { field: "quantity", label: "Quantity" },
+    { field: "marketable", label: "Marketability" },
+    { field: "highest_buy", label: "Highest buy" },
+    { field: "lowest_sell", label: "Lowest sell" },
+    { field: "observed_at", label: "Price timestamp" }
+  ];
+const INVENTORY_NAME_COLLATOR = new Intl.Collator("en-US", {
+  numeric: true,
+  sensitivity: "base"
+});
 
 function isVisibilityCheck(value: unknown): value is VisibilityCheck {
   if (typeof value !== "object" || value === null) {
@@ -377,6 +408,7 @@ function LoadingView() {
   );
 }
 
+
 function SignedOutView() {
   return (
     <section className="state-panel connection-panel" aria-labelledby="connect-title">
@@ -387,27 +419,6 @@ function SignedOutView() {
           Continue to Steam in this browser. Steam handles sign-in and returns
           your public Steam identity—your password never comes here.
         </p>
-        <a
-          className="steam-sign-in-link"
-          href={STEAM_LOGIN_URL}
-          aria-describedby="connect-description"
-        >
-          <picture className="steam-sign-in-picture">
-            <source
-              media="(max-width: 40rem)"
-              srcSet={steamSignInCompact}
-              width="109"
-              height="66"
-            />
-            <img
-              className="steam-sign-in-image"
-              src={steamSignInWide}
-              width="180"
-              height="35"
-              alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
-            />
-          </picture>
-        </a>
       </div>
 
       <div className="connection-details" aria-label="Connection details">
@@ -553,6 +564,148 @@ function formatPriceTimestamp(observedAt: string): string {
     : PRICE_TIMESTAMP_FORMATTER.format(observedDate);
 }
 
+function compareDecimalStrings(left: string, right: string): number {
+  const [leftInteger, leftFraction = ""] = left.split(".");
+  const [rightInteger, rightFraction = ""] = right.split(".");
+
+  if (leftInteger.length !== rightInteger.length) {
+    return leftInteger.length - rightInteger.length;
+  }
+
+  const integerComparison = leftInteger.localeCompare(rightInteger);
+  if (integerComparison !== 0) {
+    return integerComparison;
+  }
+
+  const fractionLength = Math.max(leftFraction.length, rightFraction.length);
+  return leftFraction
+    .padEnd(fractionLength, "0")
+    .localeCompare(rightFraction.padEnd(fractionLength, "0"));
+}
+
+function comparePriceTimestamps(left: string, right: string): number {
+  const leftTimestamp = Date.parse(left);
+  const rightTimestamp = Date.parse(right);
+  const leftIsValid = !Number.isNaN(leftTimestamp);
+  const rightIsValid = !Number.isNaN(rightTimestamp);
+
+  if (leftIsValid && rightIsValid) {
+    return leftTimestamp - rightTimestamp;
+  }
+  if (leftIsValid !== rightIsValid) {
+    return leftIsValid ? -1 : 1;
+  }
+  return left.localeCompare(right);
+}
+
+function compareNullableValues<T>(
+  left: T | null,
+  right: T | null,
+  direction: SortDirection,
+  compare: (first: T, second: T) => number
+): number {
+  if (left === null) {
+    return right === null ? 0 : 1;
+  }
+  if (right === null) {
+    return -1;
+  }
+
+  const comparison = compare(left, right);
+  return direction === "ascending" ? comparison : -comparison;
+}
+
+function compareInventoryItems(
+  left: InventoryItem,
+  right: InventoryItem,
+  sort: InventorySort
+): number {
+  switch (sort.field) {
+    case "name":
+      return compareNullableValues(
+        left.name,
+        right.name,
+        sort.direction,
+        INVENTORY_NAME_COLLATOR.compare
+      );
+    case "quantity":
+      return compareNullableValues(
+        left.quantity,
+        right.quantity,
+        sort.direction,
+        (first, second) => first - second
+      );
+    case "marketable":
+      return compareNullableValues(
+        left.marketable ? "Marketable" : "Nonmarketable",
+        right.marketable ? "Marketable" : "Nonmarketable",
+        sort.direction,
+        INVENTORY_NAME_COLLATOR.compare
+      );
+    case "highest_buy":
+      return compareNullableValues(
+        left.price?.highest_buy ?? null,
+        right.price?.highest_buy ?? null,
+        sort.direction,
+        compareDecimalStrings
+      );
+    case "lowest_sell":
+      return compareNullableValues(
+        left.price?.lowest_sell ?? null,
+        right.price?.lowest_sell ?? null,
+        sort.direction,
+        compareDecimalStrings
+      );
+    case "observed_at":
+      return compareNullableValues(
+        left.price?.observed_at ?? null,
+        right.price?.observed_at ?? null,
+        sort.direction,
+        comparePriceTimestamps
+      );
+  }
+}
+
+function InventoryColumnHeader({
+  field,
+  label,
+  sort,
+  onSort
+}: {
+  field: InventorySortField;
+  label: string;
+  sort: InventorySort | null;
+  onSort: (field: InventorySortField) => void;
+}) {
+  const direction = sort?.field === field ? sort.direction : null;
+  const nextDirection = direction === "ascending" ? "descending" : "ascending";
+
+  return (
+    <th scope="col" aria-sort={direction ?? "none"}>
+      <button
+        className="inventory-sort-button"
+        type="button"
+        onClick={() => onSort(field)}
+        aria-label={`Sort by ${label}, ${nextDirection}`}
+      >
+        <span aria-hidden="true">{label}</span>
+        <span className="inventory-sort-arrows" aria-hidden="true">
+          <span
+            className={`inventory-sort-arrow${direction === "ascending" ? " inventory-sort-arrow-active" : ""}`}
+          >
+            ▲
+          </span>
+          <span
+            className={`inventory-sort-arrow${direction === "descending" ? " inventory-sort-arrow-active" : ""}`}
+          >
+            ▼
+          </span>
+        </span>
+      </button>
+    </th>
+  );
+}
+
 function InventoryItemRow({ item }: { item: InventoryItem }) {
   const unavailableLabel = item.marketable ? "Unavailable" : "Not applicable";
   const highestBuy = item.price?.highest_buy;
@@ -564,76 +717,102 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
       : null;
 
   return (
-    <li className="inventory-item">
-      <div className="inventory-item-name">
-        {item.icon_url !== null && (
-          <img
-            className="inventory-item-icon"
-            src={item.icon_url}
-            alt=""
-            loading="lazy"
-            decoding="async"
-          />
-        )}
-        <div>
-          <strong>{item.name}</strong>
-          {marketHashName !== null && (
-            <span className="market-hash-name">{marketHashName}</span>
+    <tr className="inventory-item">
+      <th className="inventory-item-name-cell" scope="row">
+        <div className="inventory-item-name">
+          {item.icon_url !== null && (
+            <img
+              className="inventory-item-icon"
+              src={item.icon_url}
+              alt=""
+              loading="lazy"
+              decoding="async"
+            />
           )}
+          <div>
+            <strong>{item.name}</strong>
+            {marketHashName !== null && (
+              <span className="market-hash-name">{marketHashName}</span>
+            )}
+          </div>
         </div>
-      </div>
-      <div className="inventory-item-field">
+      </th>
+      <td className="inventory-item-field">
         <span className="inventory-field-label">Quantity</span>
         <span className="inventory-quantity">
           {INVENTORY_COUNT_FORMATTER.format(item.quantity)}
         </span>
-      </div>
-      <div className="inventory-item-field">
+      </td>
+      <td className="inventory-item-field">
         <span className="inventory-field-label">Marketability</span>
         <span
           className={`marketability-label ${item.marketable
-              ? "marketability-label-public"
-              : "marketability-label-unavailable"
+            ? "marketability-label-public"
+            : "marketability-label-unavailable"
             }`}
         >
           {item.marketable ? "Marketable" : "Nonmarketable"}
         </span>
-      </div>
-      <div className="inventory-item-field inventory-price-value">
+      </td>
+      <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Highest buy</span>
         <span>
           {typeof highestBuy === "string" ? highestBuy : unavailableLabel}
         </span>
-      </div>
-      <div className="inventory-item-field inventory-price-value">
+      </td>
+      <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Lowest sell</span>
         <span>
           {typeof lowestSell === "string" ? lowestSell : unavailableLabel}
         </span>
-      </div>
-      <div className="inventory-item-field inventory-observed-at">
+      </td>
+      <td className="inventory-item-field inventory-observed-at">
         <span className="inventory-field-label">Price timestamp</span>
         {typeof observedAt === "string" && observedAt.length > 0 ? (
           <time dateTime={observedAt}>{formatPriceTimestamp(observedAt)}</time>
         ) : (
           <span>{unavailableLabel}</span>
         )}
-      </div>
-    </li>
+      </td>
+    </tr>
   );
 }
 
 function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   const [requestedPageIndex, setRequestedPageIndex] = useState(0);
-  const pageCount = Math.max(1, Math.ceil(items.length / INVENTORY_PAGE_SIZE));
+  const [sort, setSort] = useState<InventorySort | null>(null);
+  const sortedItems = useMemo(
+    () =>
+      sort === null
+        ? items
+        : [...items].sort((left, right) =>
+          compareInventoryItems(left, right, sort)
+        ),
+    [items, sort]
+  );
+  const pageCount = Math.max(
+    1,
+    Math.ceil(sortedItems.length / INVENTORY_PAGE_SIZE)
+  );
   const pageIndex = Math.min(requestedPageIndex, pageCount - 1);
 
   const firstItemIndex = pageIndex * INVENTORY_PAGE_SIZE;
   const lastItemIndex = Math.min(
     firstItemIndex + INVENTORY_PAGE_SIZE,
-    items.length
+    sortedItems.length
   );
-  const visibleItems = items.slice(firstItemIndex, lastItemIndex);
+  const visibleItems = sortedItems.slice(firstItemIndex, lastItemIndex);
+
+  function handleSort(field: InventorySortField) {
+    setSort((currentSort) => ({
+      field,
+      direction:
+        currentSort?.field === field && currentSort.direction === "ascending"
+          ? "descending"
+          : "ascending"
+    }));
+    setRequestedPageIndex(0);
+  }
 
   return (
     <section className="inventory-browser" aria-labelledby="inventory-items-title">
@@ -657,8 +836,8 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
       >
         Showing {INVENTORY_COUNT_FORMATTER.format(firstItemIndex + 1)}–
         {INVENTORY_COUNT_FORMATTER.format(lastItemIndex)} of{" "}
-        {INVENTORY_COUNT_FORMATTER.format(items.length)}. Page {pageIndex + 1} of{" "}
-        {pageCount}.
+        {INVENTORY_COUNT_FORMATTER.format(sortedItems.length)}. Page{" "}
+        {pageIndex + 1} of {pageCount}.
       </p>
 
       {pageCount > 1 && (
@@ -701,22 +880,37 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
         </nav>
       )}
 
-      <div className="inventory-list-header" aria-hidden="true">
-        <span>Item</span>
-        <span>Quantity</span>
-        <span>Marketability</span>
-        <span>Highest buy</span>
-        <span>Lowest sell</span>
-        <span>Price timestamp</span>
-      </div>
-      <ul className="inventory-list" aria-labelledby="inventory-items-title">
-        {visibleItems.map((item) => (
-          <InventoryItemRow
-            key={`${item.class_id}:${item.instance_id}`}
-            item={item}
-          />
-        ))}
-      </ul>
+      <table className="inventory-table" aria-labelledby="inventory-items-title">
+        <colgroup>
+          <col className="inventory-column-item" />
+          <col className="inventory-column-quantity" />
+          <col className="inventory-column-marketability" />
+          <col className="inventory-column-price" />
+          <col className="inventory-column-price" />
+          <col className="inventory-column-timestamp" />
+        </colgroup>
+        <thead>
+          <tr>
+            {INVENTORY_COLUMNS.map((column) => (
+              <InventoryColumnHeader
+                key={column.field}
+                field={column.field}
+                label={column.label}
+                sort={sort}
+                onSort={handleSort}
+              />
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {visibleItems.map((item) => (
+            <InventoryItemRow
+              key={`${item.class_id}:${item.instance_id}`}
+              item={item}
+            />
+          ))}
+        </tbody>
+      </table>
     </section>
   );
 }
@@ -1054,10 +1248,35 @@ export function App() {
 
       <header className="site-header">
         <Brand />
-        <p className="boundary-pill">
-          <span aria-hidden="true">●</span>
-          Read-only workspace
-        </p>
+        <div className="site-header-actions">
+          <p className="boundary-pill">
+            <span aria-hidden="true">●</span>
+            Read-only workspace
+          </p>
+          {viewState.kind === "signed-out" && (
+            <a
+              className="steam-sign-in-link"
+              href={STEAM_LOGIN_URL}
+              aria-describedby="connect-description"
+            >
+              <picture className="steam-sign-in-picture">
+                <source
+                  media="(max-width: 40rem)"
+                  srcSet={steamSignInCompact}
+                  width="109"
+                  height="66"
+                />
+                <img
+                  className="steam-sign-in-image"
+                  src={steamSignInWide}
+                  width="180"
+                  height="35"
+                  alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+                />
+              </picture>
+            </a>
+          )}
+        </div>
       </header>
 
       <main id="main-content" className="page-main">
