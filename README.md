@@ -68,8 +68,8 @@ The current connection and inventory stage provides:
   `partial`, or `unavailable` price coverage: `complete` when all priceable rows are priced,
   `partial` when some but not all priceable rows are priced, and `unavailable` when zero
   priceable rows are priced or the provider is unavailable.
-- A responsive interface that exposes all retrieved items without rendering the entire inventory at
-  once.
+- A responsive, sortable inventory interface that paginates all retrieved items and lets users
+  switch game grouping on or off.
 
 SteamApis is a third-party provider: inventory availability, response fields, and price snapshots
 depend on provider data and availability and may differ from Steam Community at a given time. The

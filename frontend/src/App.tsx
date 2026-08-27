@@ -1146,9 +1146,26 @@ function groupInventoryItems(
 function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   const [requestedPageIndex, setRequestedPageIndex] = useState(0);
   const [sort, setSort] = useState<InventorySort | null>(null);
+  const [groupByGame, setGroupByGame] = useState(true);
   const groupedItems = useMemo(
-    () => groupInventoryItems(items, sort),
-    [items, sort]
+    () =>
+      groupByGame
+        ? groupInventoryItems(items, sort)
+        : [
+          {
+            key: "all",
+            kind: "other" as const,
+            game_app_id: null,
+            game_name: null,
+            items:
+              sort === null
+                ? items
+                : [...items].sort((left, right) =>
+                  compareInventoryItems(left, right, sort)
+                )
+          }
+        ],
+    [groupByGame, items, sort]
   );
   const pageCount = Math.max(
     1,
@@ -1207,10 +1224,23 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
           <p className="section-label">Item ledger</p>
           <h3 id="inventory-items-title">Inventory items</h3>
         </div>
-        <p>
-          {INVENTORY_COUNT_FORMATTER.format(items.length)} distinct item{" "}
-          {items.length === 1 ? "type" : "types"}
-        </p>
+        <div className="inventory-browser-settings">
+          <p>
+            {INVENTORY_COUNT_FORMATTER.format(items.length)} distinct item{" "}
+            {items.length === 1 ? "type" : "types"}
+          </p>
+          <label className="inventory-group-setting">
+            <input
+              type="checkbox"
+              checked={groupByGame}
+              onChange={(event) => {
+                setGroupByGame(event.currentTarget.checked);
+                setRequestedPageIndex(0);
+              }}
+            />
+            <span>Group by game</span>
+          </label>
+        </div>
       </div>
 
       <p
@@ -1305,16 +1335,21 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
                   : "Trading cards (game unavailable)";
 
           return (
-            <tbody key={group.key} aria-labelledby={headingId}>
-              <tr className="inventory-group-header">
-                <th
-                  id={headingId}
-                  scope="rowgroup"
-                  colSpan={INVENTORY_COLUMNS.length}
-                >
-                  {groupLabel}
-                </th>
-              </tr>
+            <tbody
+              key={group.key}
+              aria-labelledby={groupByGame ? headingId : undefined}
+            >
+              {groupByGame && (
+                <tr className="inventory-group-header">
+                  <th
+                    id={headingId}
+                    scope="rowgroup"
+                    colSpan={INVENTORY_COLUMNS.length}
+                  >
+                    {groupLabel}
+                  </th>
+                </tr>
+              )}
               {group.items.map((item) => (
                 <InventoryItemRow
                   key={`${item.class_id}:${item.instance_id}`}

@@ -574,7 +574,7 @@ h3 {
 }
 
 .inventory-results-heading > p,
-.inventory-browser-heading > p {
+.inventory-browser-settings > p {
   align-self: end;
   margin-bottom: 0;
   color: var(--color-ink-soft);
@@ -798,8 +798,39 @@ h3 {
   margin-bottom: var(--space-4);
 }
 
-.inventory-browser-heading > p {
+.inventory-browser-settings {
+  display: flex;
+  align-self: end;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.inventory-browser-settings > p {
   font-size: var(--text-sm);
+}
+
+.inventory-group-setting {
+  display: inline-flex;
+  min-height: var(--control-min-height);
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.inventory-group-setting input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+
+.inventory-group-setting input:focus-visible {
+  outline: var(--space-1) solid var(--color-focus);
+  outline-offset: var(--space-1);
 }
 
 .inventory-page-status {
@@ -1342,6 +1373,12 @@ h3 {
     align-items: flex-start;
     flex-direction: column;
     gap: var(--space-3);
+  }
+
+  .inventory-browser-settings {
+    width: 100%;
+    align-self: stretch;
+    align-items: flex-start;
   }
 
   .inventory-pagination {

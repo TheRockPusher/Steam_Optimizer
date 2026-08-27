@@ -1384,6 +1384,27 @@ describe("App", () => {
       })
     );
     expect(zetaRowNames()).toEqual(["Zeta high card", "Zeta low card"]);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Group by game" }));
+    expect(table.tBodies).toHaveLength(1);
+    expect(
+      table.querySelector(".inventory-group-header")
+    ).not.toBeInTheDocument();
+    expect(
+      Array.from(table.querySelectorAll("tr.inventory-item"))
+        .slice(0, 3)
+        .map(
+          (row) => row.querySelector(".inventory-item-name strong")?.textContent
+        )
+    ).toEqual(["Zeta high card", "Alpha card", "Zeta low card"]);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Group by game" }));
+    expect(groupLabels()).toEqual([
+      "Alpha game",
+      "Zeta game",
+      "Trading cards (game unavailable)",
+      "Other inventory items"
+    ]);
   });
 
   it("reports partial gem coverage, rate limiting, and per-card cash provenance", async () => {

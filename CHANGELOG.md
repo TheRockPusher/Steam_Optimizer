@@ -19,8 +19,8 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   Gem yields use the persistent cache described below.
 - Add rate-limited, read-only gem-yield lookups once per game and normal/foil card rarity,
   persist validated results in a Railway-backed SQLite cache, and derive per-card gem cash
-  estimates from the lowest-sell `753-Sack of Gems` price. Group trading cards by game and
-  expose sortable gem and provider-denominated cash-value columns.
+  estimates from the lowest-sell `753-Sack of Gems` price. Let users switch game grouping on
+  or off, and expose sortable gem and provider-denominated cash-value columns.
 - Keep the optional Steam Web API profile key server-only.
 - Configure all Railway services and future Railway processes in EU-West
   (`europe-west4-drams3a`).
