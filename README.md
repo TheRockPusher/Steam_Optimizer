@@ -140,10 +140,9 @@ Railway deployment, so the tested, deployed, and eventually tagged source is ide
 
 The version tag and GitHub release are created only after deployment smoke checks pass. A tag
 created with `GITHUB_TOKEN` does not start a second workflow. The workflow will not overwrite an
-existing tag that points to another commit. The active release-tag ruleset must permit the GitHub
-Actions actor to create protected `v*` tags. If it does not, the manual run stops before the tag
-and GitHub release are published; use **Releases → Draft a new release**, create the same tag on
-`main`, and publish it to trigger the tag-based path.
+existing tag that points to another commit. The active release-tag ruleset permits new `v*` tags
+but prevents their update or deletion; adding a tag-creation restriction would block the
+repository-scoped `GITHUB_TOKEN`.
 
 Configure these values before the first production release:
 

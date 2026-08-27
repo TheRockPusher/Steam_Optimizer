@@ -88,10 +88,9 @@ increment** dropdown. The dispatched run derives the next semantic version from 
 tag and first commits the synchronized backend project and lockfile version. CI and both Railway
 deployments use that exact commit SHA, ensuring the tested, deployed, and tagged source is
 identical. The version tag and GitHub release are created only after smoke checks pass; the run
-does not rely on a second tag event. The active release-tag ruleset must permit the GitHub Actions
-actor to create protected `v*`
-tags. Otherwise, the manual run stops before publishing the tag and release; use **Releases →
-Draft a new release** and create the protected tag on `main` to use the tag-triggered path.
+does not rely on a second tag event. The active release-tag ruleset permits new `v*` tags while
+preventing their update or deletion, allowing the repository-scoped `GITHUB_TOKEN` to publish the
+validated release tag.
 
 The workflow uses Railway CLI 5.44.1 to upload `./backend` and then `./frontend` with
 `--path-as-root`, explicitly selecting the project, `production` environment, and service. It

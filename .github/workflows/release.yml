@@ -447,7 +447,7 @@ jobs:
             echo "Final source version and release version differ." >&2
             exit 1
           fi
-      - name: Create protected release tag
+      - name: Create release tag
         if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.create_tag == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -459,7 +459,7 @@ jobs:
           if ! gh api --method POST "repos/$REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_TAG" \
             -f "sha=$RELEASE_COMMIT"; then
-            echo "Could not create the protected release tag. Grant the GitHub Actions actor bypass access to the release-tag ruleset, or use the protected-tag UI flow." >&2
+            echo "Could not create the release tag. Ensure the release-tag ruleset permits tag creation." >&2
             exit 1
           fi
       - name: Create GitHub release
