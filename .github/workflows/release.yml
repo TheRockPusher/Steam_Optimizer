@@ -429,6 +429,14 @@ jobs:
           args: --unreleased --tag ${{ needs.prepare.outputs.release_tag }} --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
+      - name: Update checked-in changelog with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ needs.prepare.outputs.release_tag }}
+        env:
+          OUTPUT: CHANGELOG.md
+
       - name: Verify final release version
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
@@ -447,6 +455,26 @@ jobs:
             echo "Final source version and release version differ." >&2
             exit 1
           fi
+      - name: Commit updated changelog
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md is already current."
+            exit 0
+          fi
+          git fetch origin main --no-tags
+          if [[ "$(git rev-parse origin/main)" != "$RELEASE_COMMIT" ]]; then
+            echo "main changed while publishing the changelog; refusing to push." >&2
+            exit 1
+          fi
+          git commit -m "docs: update changelog for $RELEASE_TAG"
+          git push origin HEAD:main
       - name: Create release tag
         if: ${{ github.event_name == 'workflow_dispatch' && needs.prepare.outputs.create_tag == 'true' }}
         env:
