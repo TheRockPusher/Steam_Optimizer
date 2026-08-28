@@ -1,6 +1,21 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.7.2
+
+
+### Bug Fixes
+- Derive gem keys from SteamApis market buckets
+- Reject malformed gem bucket metadata
+
+
+### Documentation
+- Update changelog for v0.7.1
+
+
+### Maintenance
+- Prepare release v0.7.2
+
 ## v0.7.1
 
 
