@@ -921,13 +921,20 @@ def test_cache_only_refresh_never_calls_or_starts_provider() -> None:
     cached_key: tuple[str, CardRarity] = ("10", "normal")
     missing_key: tuple[str, CardRarity] = ("20", "foil")
     negative_key: tuple[str, CardRarity] = ("30", "normal")
+    expired_negative_key: tuple[str, CardRarity] = ("40", "foil")
     cache = GemPriceCache(":memory:")
     cache.put_positive(*cached_key, resolution_for("Cached"))
     cache.put_negative(*negative_key)
+    cache.put_negative(
+        *expired_negative_key,
+        now=time.time() - GEM_NEGATIVE_CACHE_TTL_SECONDS - 1,
+    )
     provider = ScriptedProvider()
     service = GemPricingService(settings(), cache=cache, provider=provider)
 
-    result = service.read_cached((cached_key, missing_key, negative_key))
+    result = service.read_cached(
+        (cached_key, missing_key, negative_key, expired_negative_key)
+    )
 
     assert result.values[cached_key].gem_yield == 20
     assert result.pending_count == 1

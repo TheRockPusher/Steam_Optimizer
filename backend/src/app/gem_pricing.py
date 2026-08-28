@@ -1465,10 +1465,7 @@ class GemPricingService:
                 pending_count += 1
                 continue
             if cached.status == "negative":
-                if cached.expired:
-                    pending_count += 1
-                else:
-                    terminal_negative_count += 1
+                terminal_negative_count += 1
                 continue
             resolution = cached.resolution()
             if resolution is None:
