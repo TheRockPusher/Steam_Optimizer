@@ -479,32 +479,40 @@ def _parse_owner_actions(owner_actions: object) -> _GemKeyParse:
     return _GemKeyParse(key=unique[0] if unique else None)
 
 
-def _parse_market_bucket_id(value: object) -> GemKey | None:
+def _parse_market_bucket_id(value: object) -> _GemKeyParse:
+    if value is None:
+        return _GemKeyParse()
     if (
         not isinstance(value, str)
         or not value
         or len(value) > MAX_GEM_LISTING_SCALAR_LENGTH
     ):
-        return None
+        return _GemKeyParse(valid=False)
     match = _MARKET_BUCKET_ID.fullmatch(value)
     if match is None:
-        return None
+        return _GemKeyParse(valid=False)
     app_text, item_text, border_text = match.groups()
     if len(app_text) > MAX_GEM_APP_ID_LENGTH or len(item_text) > len(
         str(MAX_GEM_ITEM_TYPE)
     ):
-        return None
+        return _GemKeyParse(valid=False)
     app_id = _canonical_app_id(app_text)
-    if app_id is None:
-        return None
+    if (
+        app_id is None
+        or app_id != app_text
+        or (len(item_text) > 1 and item_text.startswith("0"))
+    ):
+        return _GemKeyParse(valid=False)
     try:
-        return GemKey(
-            app_id=app_id,
-            item_type=int(item_text),
-            border_color=1 if border_text == "1" else 0,
+        return _GemKeyParse(
+            key=GemKey(
+                app_id=app_id,
+                item_type=int(item_text),
+                border_color=1 if border_text == "1" else 0,
+            )
         )
     except (TypeError, ValueError):
-        return None
+        return _GemKeyParse(valid=False)
 
 
 def _gem_key_from_metadata(
@@ -513,16 +521,16 @@ def _gem_key_from_metadata(
     market_bucket_id: object,
 ) -> GemKey | None:
     parsed_actions = _parse_owner_actions(owner_actions)
-    if not parsed_actions.valid:
-        return None
-    bucket_key = (
+    parsed_bucket = (
         _parse_market_bucket_id(market_bucket_id)
         if item_type in _GEM_CONVERTIBLE_ITEM_TYPES
-        else None
+        else _GemKeyParse()
     )
+    if not parsed_actions.valid or not parsed_bucket.valid:
+        return None
     if parsed_actions.key is None:
-        return bucket_key
-    if bucket_key is None or bucket_key == parsed_actions.key:
+        return parsed_bucket.key
+    if parsed_bucket.key is None or parsed_bucket.key == parsed_actions.key:
         return parsed_actions.key
     return None
 
