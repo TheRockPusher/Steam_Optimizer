@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:
     from collections.abc import (
+        AsyncIterator,
         Awaitable,
         Callable,
         Coroutine,
@@ -54,9 +56,18 @@ class FakeResponse:
         self.status_code = status_code
         self.payload = payload
         self.headers = dict(headers or {})
+        self.text = ""
 
     def json(self) -> object:
         return self.payload
+
+    def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        del chunk_size
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield b""
+
+        return chunks()
 
 
 class FakeHTTPClient:
@@ -88,6 +99,24 @@ class FakeHTTPClient:
         if isinstance(response, BaseException):
             raise response
         return response
+
+    @asynccontextmanager
+    async def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        follow_redirects: bool = False,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> AsyncIterator[FakeResponse]:
+        del method, url, headers, follow_redirects, timeout
+        if not self.responses:
+            raise AssertionError
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        yield response
 
     async def post(self, url: str, *, data: Mapping[str, str]) -> FakeResponse:
         del url, data

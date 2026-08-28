@@ -340,7 +340,7 @@ def test_inventory_gem_key_schema_publishes_canonical_bounds() -> None:
 
 
 def test_inventory_metadata_is_independent_of_item_class() -> None:
-    tags = [
+    tags: list[dict[str, object]] = [
         {"category": "item_class", "internal_name": "item_class_3"},
         {
             "category": "Game",
