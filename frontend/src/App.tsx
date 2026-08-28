@@ -1016,63 +1016,43 @@ function SteamIdentity({ user }: { user: SteamUser }) {
   );
 }
 
-type AccessCardProps =
-  | { surface: "profile"; check: VisibilityCheck }
-  | { surface: "inventory"; check: InventoryCheck };
-
-function AccessCard({ surface, check }: AccessCardProps) {
-  const title = surface === "profile" ? "Steam profile" : "Steam inventory";
-  const privateGuidance =
-    surface === "profile"
-      ? "Your Steam profile is not public."
-      : "Your Steam inventory is not public.";
-  const isRateLimited =
-    surface === "inventory" &&
-    check.status === "unavailable" &&
-    check.rate_limited;
-  const statusLabel = isRateLimited ? "Try later" : STATUS_LABELS[check.status];
+function AccessSummary({
+  profile,
+  inventory
+}: {
+  profile: VisibilityCheck;
+  inventory: InventoryCheck;
+}) {
+  const inventoryStatusLabel =
+    inventory.status === "unavailable" && inventory.rate_limited
+      ? "Try later"
+      : STATUS_LABELS[inventory.status];
 
   return (
-    <article
-      className={`access-card access-card-${check.status}`}
-      aria-labelledby={`${surface}-title`}
-    >
-      <div className="access-card-heading">
-        <div>
-          <p className="card-index">{surface === "profile" ? "01" : "02"}</p>
-          <h3 id={`${surface}-title`}>{title}</h3>
-        </div>
-        <p className={`access-badge access-badge-${check.status}`}>
+    <dl className="access-summary" aria-label="Steam access status">
+      <div className={`access-summary-item access-summary-${profile.status}`}>
+        <dt>Profile</dt>
+        <dd
+          className={`access-badge access-badge-${profile.status}`}
+          aria-label={`Steam profile: ${STATUS_LABELS[profile.status]}`}
+        >
           <span className="status-dot" aria-hidden="true" />
-          {statusLabel}
-        </p>
+          {STATUS_LABELS[profile.status]}
+        </dd>
       </div>
-
-      <p className="check-message">{check.message}</p>
-
-      {check.status === "private" && (
-        <p className="result-guidance">
-          {privateGuidance}{" "}
-          <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
-            Open Steam privacy settings
-            <span className="visually-hidden"> (opens in a new tab)</span>
-          </a>
-          , then recheck.
-        </p>
-      )}
-
-      {check.status === "unavailable" &&
-        (isRateLimited ? (
-          <p className="result-guidance">
-            Steam is temporarily limiting automated checks. This is not a
-            privacy result and does not mean your inventory is private.
-          </p>
-        ) : (
-          <p className="result-guidance">
-            This is not a privacy result. Recheck when the service is available.
-          </p>
-        ))}
-    </article>
+      <div
+        className={`access-summary-item access-summary-${inventory.status}`}
+      >
+        <dt>Inventory</dt>
+        <dd
+          className={`access-badge access-badge-${inventory.status}`}
+          aria-label={`Steam inventory: ${inventoryStatusLabel}`}
+        >
+          <span className="status-dot" aria-hidden="true" />
+          {inventoryStatusLabel}
+        </dd>
+      </div>
+    </dl>
   );
 }
 
@@ -1702,15 +1682,10 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   return (
     <section className="inventory-browser" aria-labelledby="inventory-items-title">
       <div className="inventory-browser-heading">
-        <div>
-          <p className="section-label">Item ledger</p>
-          <h3 id="inventory-items-title">Inventory items</h3>
-        </div>
+        <h3 id="inventory-items-title" className="visually-hidden">
+          Inventory items
+        </h3>
         <div className="inventory-browser-settings">
-          <p>
-            {INVENTORY_COUNT_FORMATTER.format(items.length)} distinct item{" "}
-            {items.length === 1 ? "type" : "types"}
-          </p>
           <label className="inventory-group-setting">
             <input
               type="checkbox"
@@ -1724,6 +1699,7 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
           </label>
         </div>
       </div>
+
       <div
         className="inventory-view-tabs"
         role="tablist"
@@ -1844,11 +1820,6 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
                 )} item ${worthMoreAsGemsItems.length === 1 ? "type is" : "types are"
                 } currently worth more as gems.`}
             </p>
-            <p className="inventory-view-explanation">
-              Worth more as gems compares each trading card&apos;s per-card gem
-              cash value against its current lowest-sell market price. Missing
-              values are excluded from this view.
-            </p>
             {activeItems.length === 0 ? (
               <div className="inventory-filtered-empty">
                 <h4>No items are worth more as gems</h4>
@@ -1944,6 +1915,98 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
   );
 }
 
+function InventoryPricingSummary({
+  inventory,
+  isRefreshingGems,
+  onRefreshGems
+}: {
+  inventory: InventoryCheck;
+  isRefreshingGems: boolean;
+  onRefreshGems: () => void;
+}) {
+  const marketStatusLabel = PRICE_STATUS_LABELS[inventory.price_status];
+  const gemStatusLabel = GEM_STATUS_LABELS[inventory.gem_status];
+  const totalAssetCount = INVENTORY_COUNT_FORMATTER.format(
+    inventory.total_asset_count
+  );
+  const marketPricingCount = `${INVENTORY_COUNT_FORMATTER.format(
+    inventory.priced_item_count
+  )}/${INVENTORY_COUNT_FORMATTER.format(inventory.priceable_item_count)}`;
+  const gemPricingCount = `${INVENTORY_COUNT_FORMATTER.format(
+    inventory.gem_priced_item_count
+  )}/${INVENTORY_COUNT_FORMATTER.format(
+    inventory.gem_priceable_item_count
+  )}`;
+
+  return (
+    <div className="inventory-pricing-summary" aria-label="Inventory pricing summary">
+      <dl className="inventory-pricing-metrics">
+        <div
+          className="inventory-pricing-stat inventory-pricing-stat-total"
+          aria-label={`Total assets: ${totalAssetCount}`}
+        >
+          <dt>Items</dt>
+          <dd>{totalAssetCount}</dd>
+        </div>
+        <div
+          className={`inventory-pricing-stat inventory-pricing-stat-${inventory.price_status}`}
+          aria-label={`Market pricing: ${marketStatusLabel}. ${marketPricingCount} item types priced`}
+        >
+          <dt>
+            <span className="status-dot" aria-hidden="true" />
+            Market
+          </dt>
+          <dd>{marketPricingCount}</dd>
+        </div>
+        <div
+          className={`inventory-pricing-stat inventory-pricing-stat-${inventory.gem_status}`}
+          aria-label={`Gem pricing: ${gemStatusLabel}. ${gemPricingCount} trading-card item types priced`}
+        >
+          <dt>
+            <span className="status-dot" aria-hidden="true" />
+            Gems
+          </dt>
+          <dd>{gemPricingCount}</dd>
+        </div>
+      </dl>
+      <button
+        className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
+        type="button"
+        onClick={onRefreshGems}
+        disabled={isRefreshingGems || inventory.gem_priceable_item_count === 0}
+        aria-label={
+          isRefreshingGems ? "Refreshing gem values" : "Refresh gem values"
+        }
+        title="Refresh cached gem values"
+      >
+        <span aria-hidden="true">↻</span>
+      </button>
+    </div>
+  );
+}
+
+function inventoryPriceCoverageMessage(inventory: InventoryCheck): string {
+  return inventory.priceable_item_count === 0
+    ? "No marketable item types require a price lookup."
+    : `SteamApis price data is available for ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.priced_item_count
+    )} of ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.priceable_item_count
+    )} marketable item ${inventory.priceable_item_count === 1 ? "type" : "types"
+    }.`;
+}
+
+function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
+  return inventory.gem_priceable_item_count === 0
+    ? "No trading-card item types require a gem lookup."
+    : `Gem values are available for ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.gem_priced_item_count
+    )} of ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.gem_priceable_item_count
+    )} trading-card item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
+    }.`;
+}
+
 function InventoryResults({
   inventory,
   isRefreshingGems,
@@ -1974,175 +2037,24 @@ function InventoryResults({
     }
   }
 
-  const coverageMessage =
-    inventory.priceable_item_count === 0
-      ? "No marketable item types require a price lookup."
-      : `SteamApis price data is available for ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.priced_item_count
-      )} of ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.priceable_item_count
-      )} marketable item ${inventory.priceable_item_count === 1 ? "type" : "types"
-      }.`;
-  const gemCoverageMessage =
-    inventory.gem_priceable_item_count === 0
-      ? "No trading-card item types require a gem lookup."
-      : `Gem values are available for ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.gem_priced_item_count
-      )} of ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.gem_priceable_item_count
-      )} trading-card item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
-      }.`;
-  const gemCashContext = inventory.gem_cash_context;
-
   return (
     <section className="inventory-results" aria-labelledby="inventory-results-title">
       <div className="inventory-results-heading">
         <div>
-          <p className="section-label">Public inventory</p>
-          <h2 id="inventory-results-title">What is in your inventory</h2>
+          <p className="section-label">Inventory</p>
+          <h2 id="inventory-results-title">Items and boosters</h2>
         </div>
-        <p>
-          Quantities combine matching Steam assets. Prices are read-only market
-          context, not sale offers.
-        </p>
+        <InventoryPricingSummary
+          inventory={inventory}
+          isRefreshingGems={isRefreshingGems}
+          onRefreshGems={onRefreshGems}
+        />
       </div>
-
-      <section className="price-coverage" aria-labelledby="price-coverage-title">
-        <div className="price-coverage-heading">
-          <div>
-            <p className="section-label">Price coverage</p>
-            <h3 id="price-coverage-title">Current market snapshot</h3>
-          </div>
-          <p
-            className={`pricing-status pricing-status-${inventory.price_status}`}
-          >
-            <span className="status-dot" aria-hidden="true" />
-            {PRICE_STATUS_LABELS[inventory.price_status]}
-          </p>
-        </div>
-        <p className="price-coverage-copy">{coverageMessage}</p>
-        <p className="price-message">
-          SteamApis does not specify the currency for this feed. Values are
-          shown exactly as received, without a currency symbol.
+      {refreshMessage !== null && (
+        <p className="inventory-refresh-status" aria-live="polite">
+          {refreshMessage}
         </p>
-        {inventory.price_message.trim().length > 0 && (
-          <p className="price-message">{inventory.price_message}</p>
-        )}
-        <dl className="inventory-summary">
-          <div>
-            <dt>Total assets</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(inventory.total_asset_count)}
-            </dd>
-          </div>
-          <div>
-            <dt>Distinct item types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(inventory.unique_item_count)}
-            </dd>
-          </div>
-          <div>
-            <dt>Priceable types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.priceable_item_count
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt>Types with prices</dt>
-            <dd>{INVENTORY_COUNT_FORMATTER.format(inventory.priced_item_count)}</dd>
-          </div>
-        </dl>
-      </section>
-
-      <section className="gem-coverage" aria-labelledby="gem-coverage-title">
-        <div className="gem-coverage-heading">
-          <div>
-            <p className="section-label">Gem coverage</p>
-            <h3 id="gem-coverage-title">Trading-card gem values</h3>
-          </div>
-          <div className="gem-coverage-actions">
-            <p
-              className={`gem-status gem-status-${inventory.gem_status}`}
-            >
-              <span className="status-dot" aria-hidden="true" />
-              {GEM_STATUS_LABELS[inventory.gem_status]}
-            </p>
-            <button
-              className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
-              type="button"
-              onClick={onRefreshGems}
-              disabled={
-                isRefreshingGems || inventory.gem_priceable_item_count === 0
-              }
-              aria-label={
-                isRefreshingGems
-                  ? "Refreshing gem values"
-                  : "Refresh gem values"
-              }
-              title="Refresh cached gem values"
-            >
-              <span aria-hidden="true">↻</span>
-            </button>
-          </div>
-        </div>
-        <p className="gem-coverage-copy">{gemCoverageMessage}</p>
-        {inventory.gem_message.trim().length > 0 && (
-          <p className="gem-message">{inventory.gem_message}</p>
-        )}
-        {refreshMessage !== null && (
-          <p className="gem-message gem-refresh-message">{refreshMessage}</p>
-        )}
-        {inventory.gem_rate_limited && (
-          <p className="gem-message gem-rate-limit-message">
-            Steam Community is temporarily rate-limiting gem lookups. Cached
-            values remain available
-            {inventory.gem_retry_after_seconds !== null
-              ? `; try again in ${inventory.gem_retry_after_seconds}s`
-              : ""}
-            .
-          </p>
-        )}
-        <p className="gem-cash-provenance">
-          Gem cash value uses the SteamApis lowest-sell basis for{" "}
-          {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed has
-          unknown currency. Each value is a per-card replacement-cost estimate.
-        </p>
-        {gemCashContext !== null && (
-          <p className="gem-cash-context">
-            Current sack price: {gemCashContext.sack_price}
-            {gemCashContext.observed_at !== null &&
-              gemCashContext.observed_at.length > 0 && (
-                <>
-                  {" "}
-                  <time dateTime={gemCashContext.observed_at}>
-                    ({formatPriceTimestamp(gemCashContext.observed_at)})
-                  </time>
-                </>
-              )}
-            .
-          </p>
-        )}
-        <dl className="gem-summary">
-          <div>
-            <dt>Gem-priceable types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.gem_priceable_item_count
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt>Types with gem values</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.gem_priced_item_count
-              )}
-            </dd>
-          </div>
-        </dl>
-      </section>
+      )}
       <div
         className="inventory-view-tabs inventory-result-tabs"
         role="tablist"
@@ -2249,6 +2161,147 @@ function InventoryResults({
     </section>
   );
 }
+function InventoryFaq({
+  profile,
+  inventory
+}: {
+  profile: VisibilityCheck;
+  inventory: InventoryCheck;
+}) {
+  const hasPrivateSurface =
+    profile.status === "private" || inventory.status === "private";
+  const gemCashContext = inventory.gem_cash_context;
+
+  return (
+    <section className="faq" aria-labelledby="faq-title">
+      <div className="faq-heading">
+        <p className="section-label">FAQ</p>
+        <h2 id="faq-title">About these results</h2>
+      </div>
+      <div className="faq-list">
+        <details className="faq-item">
+          <summary>What do the Steam access statuses mean?</summary>
+          <div className="faq-answer">
+            <p>
+              <strong>Public</strong> means Steam exposed that surface to the
+              check. <strong>Private</strong> means Steam did not expose it.
+              <strong> Unavailable</strong> means the service could not verify
+              it and is not a privacy result.
+            </p>
+            <p>
+              <strong>Profile check:</strong> {profile.message}
+            </p>
+            <p>
+              <strong>Inventory check:</strong> {inventory.message}
+            </p>
+            {hasPrivateSurface && (
+              <p>
+                To change a private surface,{" "}
+                <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
+                  open Steam privacy settings
+                  <span className="visually-hidden">
+                    {" "}
+                    (opens in a new tab)
+                  </span>
+                </a>{" "}
+                and recheck Steam access.
+              </p>
+            )}
+            {inventory.status === "unavailable" && inventory.rate_limited && (
+              <p>
+                Steam is temporarily limiting automated checks. This does not
+                mean the inventory is private.
+              </p>
+            )}
+          </div>
+        </details>
+        <details className="faq-item">
+          <summary>How do the market and gem numbers work?</summary>
+          <div className="faq-answer">
+            <p>
+              The Market number is priced marketable item types over
+              priceable item types. The Gems number is priced trading-card item
+              types over trading-card item types that can be checked.
+            </p>
+            <p>
+              Worth more as gems compares each trading card&apos;s per-card gem
+              cash value against its current lowest-sell market price. Missing
+              values are excluded from this view.
+            </p>
+            <p>{inventoryPriceCoverageMessage(inventory)}</p>
+            <p>
+              SteamApis does not specify the market feed currency. Values are
+              shown exactly as received, without a currency symbol.
+            </p>
+            {inventory.price_message.trim().length > 0 && (
+              <p>
+                <strong>Market note:</strong> {inventory.price_message}
+              </p>
+            )}
+            <p>{inventoryGemCoverageMessage(inventory)}</p>
+            {inventory.gem_message.trim().length > 0 && (
+              <p>
+                <strong>Gem note:</strong> {inventory.gem_message}
+              </p>
+            )}
+            {inventory.gem_rate_limited && (
+              <p>
+                Steam Community is temporarily rate-limiting gem lookups.
+                Cached values remain available
+                {inventory.gem_retry_after_seconds !== null
+                  ? `; try again in ${inventory.gem_retry_after_seconds}s`
+                  : ""}
+                .
+              </p>
+            )}
+            <p>
+              Gem cash value uses the SteamApis lowest-sell basis for{" "}
+              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed
+              has unknown currency. Each value is a per-card replacement-cost
+              estimate.
+            </p>
+            {gemCashContext !== null && (
+              <p>
+                Current sack price: {gemCashContext.sack_price}
+                {gemCashContext.observed_at !== null &&
+                  gemCashContext.observed_at.length > 0 && (
+                    <>
+                      {" "}
+                      <time dateTime={gemCashContext.observed_at}>
+                        ({formatPriceTimestamp(gemCashContext.observed_at)})
+                      </time>
+                    </>
+                  )}
+                .
+              </p>
+            )}
+          </div>
+        </details>
+        <details className="faq-item">
+          <summary>Why can the item count differ from table rows?</summary>
+          <div className="faq-answer">
+            <p>
+              Items is the total number of Steam assets. The table combines
+              matching assets into distinct item types, so one row can
+              represent more than one item.
+            </p>
+          </div>
+        </details>
+        <details className="faq-item">
+          <summary>Can Steam Optimizer change my Steam account?</summary>
+          <div className="faq-answer">
+            <p>
+              No. Steam Optimizer only reads information Steam exposes
+              publicly. It cannot trade, sell, craft, or change your account.
+              Any future account action stays manual and happens on Steam.
+            </p>
+          </div>
+        </details>
+      </div>
+    </section>
+  );
+}
+
 
 function SignedInView({
   session,
@@ -2283,26 +2336,32 @@ function SignedInView({
     <section className="account-view" aria-labelledby="account-title">
       <div className="account-header">
         <SteamIdentity user={session.user} />
-        <div className="account-actions">
-          <button
-            className="secondary-action"
-            type="button"
-            onClick={onRecheck}
-            disabled={isRecheckDisabled}
-            aria-describedby={
-              retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
-            }
-          >
-            {isRechecking ? "Checking…" : "Recheck Steam access"}
-          </button>
-          <button
-            className="text-action"
-            type="button"
-            onClick={onLogout}
-            disabled={isSigningOut || isRechecking || isRefreshingGems}
-          >
-            {isSigningOut ? "Signing out…" : "Sign out on this device"}
-          </button>
+        <div className="account-header-side">
+          <AccessSummary
+            profile={session.checks.profile}
+            inventory={session.checks.inventory}
+          />
+          <div className="account-actions">
+            <button
+              className="secondary-action"
+              type="button"
+              onClick={onRecheck}
+              disabled={isRecheckDisabled}
+              aria-describedby={
+                retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
+              }
+            >
+              {isRechecking ? "Checking…" : "Recheck Steam access"}
+            </button>
+            <button
+              className="text-action"
+              type="button"
+              onClick={onLogout}
+              disabled={isSigningOut || isRechecking || isRefreshingGems}
+            >
+              {isSigningOut ? "Signing out…" : "Sign out on this device"}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2319,22 +2378,6 @@ function SignedInView({
         </p>
       )}
 
-      <div className="access-intro">
-        <div>
-          <p className="section-label">Public access check</p>
-          <h2>What Steam exposes right now</h2>
-        </div>
-        <p>
-          These checks are independent. An unavailable check means we could not
-          verify it—not that the surface is private.
-        </p>
-      </div>
-
-      <div className="access-grid">
-        <AccessCard surface="profile" check={session.checks.profile} />
-        <AccessCard surface="inventory" check={session.checks.inventory} />
-      </div>
-
       {session.checks.inventory.status === "public" && (
         <InventoryResults
           inventory={session.checks.inventory}
@@ -2343,6 +2386,10 @@ function SignedInView({
           onRefreshGems={onRefreshGems}
         />
       )}
+      <InventoryFaq
+        profile={session.checks.profile}
+        inventory={session.checks.inventory}
+      />
     </section>
   );
 }
@@ -2600,14 +2647,17 @@ export function App() {
       </header>
 
       <main id="main-content" className="page-main">
-        <section className="hero" aria-labelledby="page-title">
-          <p className="eyebrow">Understand what Steam makes public</p>
-          <h1 id="page-title">A clearer view of your Steam inventory.</h1>
-          <p className="hero-copy">
-            Connect your account to verify which Steam surfaces are public before
-            using read-only inventory and badge tools.
-          </p>
-        </section>
+        {viewState.kind !== "signed-in" && (
+          <section className="hero" aria-labelledby="page-title">
+            <p className="eyebrow">Understand what Steam makes public</p>
+            <h1 id="page-title">A clearer view of your Steam inventory.</h1>
+            <p className="hero-copy">
+              Connect your account to verify which Steam surfaces are public before
+              using read-only inventory and badge tools.
+            </p>
+          </section>
+        )}
+
         <p
           className="visually-hidden"
           role="status"
@@ -2637,7 +2687,7 @@ export function App() {
           />
         )}
 
-        <ReadOnlyBoundary />
+        {viewState.kind !== "signed-in" && <ReadOnlyBoundary />}
       </main>
 
       <footer className="site-footer">
