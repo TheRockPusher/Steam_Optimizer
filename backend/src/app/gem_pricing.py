@@ -1426,6 +1426,14 @@ class GemPricingService:
                 limiter=limiter,
             )
         self.provider = provider
+        provider_limiter = getattr(provider, "limiter", None)
+        self.limiter = (
+            limiter
+            if limiter is not None
+            else provider_limiter
+            if isinstance(provider_limiter, SteamCommunityLimiter)
+            else None
+        )
         self._queue: asyncio.Queue[_QueuedLookup] | None = None
         self._scheduled: set[GemKey] = set()
         self._worker_task: asyncio.Task[None] | None = None

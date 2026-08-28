@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import GemKey, GemScanResult
 from app.main import app, create_app
 from app.settings import Settings
@@ -40,6 +41,13 @@ class LifecycleGateway:
     ) -> GemScanResult:
         del keys
         return GemScanResult(values={})
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        del game_app_ids
+        return BoosterScanResult(values={})
 
 
 class LifecycleHttpClient:

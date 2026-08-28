@@ -1,6 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
-import steamSignInCompact from "./assets/steam/sits_02.png";
+import {
+  clearInventoryCache,
+  clearInventoryCacheExcept,
+  readInventoryCache,
+  readInventoryCacheEpoch,
+  writeInventoryCache
+} from "./inventoryCache";
 import "./App.css";
 
 type VisibilityStatus = "public" | "private" | "unavailable";
@@ -54,6 +67,8 @@ type BoosterInfo = {
   game_name: string | null;
   market_hash_name: string | null;
   card_count: 3;
+  card_set_size: number | null;
+  gem_cost: number | null;
   price: InventoryPrice | null;
 };
 
@@ -156,7 +171,6 @@ type SignedInSession = {
   user: SteamUser;
   checks: {
     profile: VisibilityCheck;
-    inventory: InventoryCheck;
   };
 };
 
@@ -167,13 +181,35 @@ type GemRefreshValue = GemRefreshGroup & {
   gem_yield: number;
 };
 
+type BoosterRefreshValue = {
+  game_app_id: string;
+  card_set_size: number | null;
+  gem_cost: number | null;
+};
+
 type GemRefreshResponse = {
   values: GemRefreshValue[];
   pending_group_count: number;
+  boosters: BoosterRefreshValue[];
+  pending_booster_count: number;
   gem_rate_limited: boolean;
   gem_retry_after_seconds: number | null;
 };
 
+type InventoryState = {
+  inventory: InventoryCheck | null;
+  refreshedAt: string | null;
+  source: "cache" | "network" | null;
+  isLoading: boolean;
+  message: string | null;
+};
+
+type InventoryLoadResult = {
+  kind: "cache" | "network" | "error" | "session-changed";
+  inventory?: InventoryCheck;
+  refreshedAt?: string;
+  preserved?: boolean;
+};
 
 
 type ViewState =
@@ -184,6 +220,7 @@ type ViewState =
 const MILLISECONDS_PER_SECOND = 1000;
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
 const SESSION_URL = `${API_BASE_URL}/api/auth/session`;
+const INVENTORY_URL = `${API_BASE_URL}/api/auth/inventory`;
 const GEM_REFRESH_URL = `${API_BASE_URL}/api/auth/gems`;
 const LOGOUT_URL = `${API_BASE_URL}/api/auth/logout`;
 const STEAM_LOGIN_URL = `${API_BASE_URL}/api/auth/steam/start`;
@@ -196,6 +233,7 @@ const MAX_DECIMAL_LENGTH = 16_384;
 const GEM_MAX_APP_ID_LENGTH = 20;
 const GEM_MAX_ITEM_TYPE = 1_000_000_000;
 const MAX_GEM_REFRESH_GROUPS = 10_000;
+const MAX_BOOSTER_REFRESH_GROUPS = 10_000;
 const ITEM_TYPE_LABELS: Record<ItemType, string> = {
   badge: "Badge",
   trading_card: "Trading card",
@@ -431,6 +469,27 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
   );
 }
 
+function gemCostForCardSetSize(cardSetSize: number): number {
+  return Math.floor((12000 + cardSetSize) / (2 * cardSetSize));
+}
+
+function isBoosterDerivation(
+  cardSetSize: unknown,
+  gemCost: unknown
+): boolean {
+  if (cardSetSize === null || gemCost === null) {
+    return cardSetSize === null && gemCost === null;
+  }
+
+  return (
+    isSafeInteger(cardSetSize, 5) &&
+    cardSetSize <= 15 &&
+    isSafeInteger(gemCost, 0) &&
+    gemCost === gemCostForCardSetSize(cardSetSize)
+  );
+}
+
+
 function isBoosterInfo(value: unknown): value is BoosterInfo {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -450,6 +509,7 @@ function isBoosterInfo(value: unknown): value is BoosterInfo {
         booster.market_hash_name.length > 0)
     ) ||
     booster.card_count !== 3 ||
+    !isBoosterDerivation(booster.card_set_size, booster.gem_cost) ||
     (booster.price !== null && !isInventoryPrice(booster.price))
   ) {
     return false;
@@ -717,7 +777,12 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
         (check.gem_priceable_item_count > 0 || check.status !== "public"))
   );
 }
-
+function isCacheableInventory(value: unknown): value is InventoryCheck {
+  return (
+    isInventoryCheck(value) &&
+    (value.status === "public" || value.status === "private")
+  );
+}
 function isSessionResponse(value: unknown): value is SessionResponse {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -735,7 +800,9 @@ function isSessionResponse(value: unknown): value is SessionResponse {
   if (!session.authenticated) {
     return true;
   }
-
+  if ("inventory" in session) {
+    return false;
+  }
   if (
     typeof session.user !== "object" ||
     session.user === null ||
@@ -744,6 +811,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
   ) {
     return false;
   }
+
 
   const user = session.user as Partial<SteamUser>;
   const checks = session.checks as {
@@ -758,7 +826,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
     (typeof user.display_name === "string" || user.display_name === null) &&
     (typeof user.avatar_url === "string" || user.avatar_url === null) &&
     isVisibilityCheck(checks.profile) &&
-    isInventoryCheck(checks.inventory)
+    !("inventory" in checks)
   );
 }
 function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
@@ -770,6 +838,9 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
     !Array.isArray(refresh.values) ||
     !isSafeInteger(refresh.pending_group_count, 0) ||
     refresh.pending_group_count > MAX_GEM_REFRESH_GROUPS ||
+    !Array.isArray(refresh.boosters) ||
+    !isSafeInteger(refresh.pending_booster_count, 0) ||
+    refresh.pending_booster_count > MAX_BOOSTER_REFRESH_GROUPS ||
     typeof refresh.gem_rate_limited !== "boolean" ||
     typeof refresh.gem_retry_after_seconds === "undefined" ||
     (refresh.gem_retry_after_seconds !== null &&
@@ -806,6 +877,25 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
     }
     keys.add(key);
   }
+
+  const boosterKeys = new Set<string>();
+  for (const entry of refresh.boosters) {
+    if (typeof entry !== "object" || entry === null) {
+      return false;
+    }
+    const candidate = entry as Partial<BoosterRefreshValue>;
+    if (
+      !isDecimalString(candidate.game_app_id) ||
+      !isBoosterDerivation(candidate.card_set_size, candidate.gem_cost)
+    ) {
+      return false;
+    }
+    if (boosterKeys.has(candidate.game_app_id)) {
+      return false;
+    }
+    boosterKeys.add(candidate.game_app_id);
+  }
+
   return true;
 }
 
@@ -830,11 +920,21 @@ function gemRefreshGroups(items: InventoryItem[]): GemRefreshGroup[] {
   });
 }
 
+function boosterRefreshGameAppIds(boosters: BoosterInfo[]): string[] {
+  return [...new Set(boosters.map((booster) => booster.game_app_id))].sort(
+    compareDecimalStrings
+  );
+}
+
 async function requestGemRefreshBatch(
-  groups: GemRefreshGroup[]
+  groups: GemRefreshGroup[],
+  boosterGameAppIds: string[]
 ): Promise<GemRefreshResponse> {
   const response = await fetch(GEM_REFRESH_URL, {
-    body: JSON.stringify({ groups }),
+    body: JSON.stringify({
+      groups,
+      booster_game_app_ids: boosterGameAppIds
+    }),
     credentials: "include",
     headers: {
       Accept: "application/json",
@@ -850,11 +950,17 @@ async function requestGemRefreshBatch(
     throw new Error("The gem refresh service returned an invalid response.");
   }
   const requestedKeys = new Set(groups.map(gemKeyToken));
+  const requestedBoosterIds = new Set(boosterGameAppIds);
   if (
     payload.values.length > groups.length ||
     payload.pending_group_count > groups.length - payload.values.length ||
     payload.values.some(
       (entry) => !requestedKeys.has(gemKeyToken(entry))
+    ) ||
+    payload.boosters.length > requestedBoosterIds.size ||
+    payload.pending_booster_count > requestedBoosterIds.size ||
+    payload.boosters.some(
+      (entry) => !requestedBoosterIds.has(entry.game_app_id)
     )
   ) {
     throw new Error("The gem refresh service returned unrequested values.");
@@ -866,16 +972,32 @@ async function requestGemRefresh(
   inventory: InventoryCheck
 ): Promise<GemRefreshResponse> {
   const groups = gemRefreshGroups(inventory.items);
+  const boosterGameAppIds = boosterRefreshGameAppIds(inventory.boosters);
   const values: GemRefreshValue[] = [];
+  const boosters: BoosterRefreshValue[] = [];
   let pendingGroupCount = 0;
+  let pendingBoosterCount = 0;
   let gemRateLimited = false;
   let gemRetryAfterSeconds: number | null = null;
+  const batchCount = Math.max(
+    Math.ceil(groups.length / MAX_GEM_REFRESH_GROUPS),
+    Math.ceil(boosterGameAppIds.length / MAX_BOOSTER_REFRESH_GROUPS)
+  );
 
-  for (let offset = 0; offset < groups.length; offset += MAX_GEM_REFRESH_GROUPS) {
-    const batch = groups.slice(offset, offset + MAX_GEM_REFRESH_GROUPS);
-    const response = await requestGemRefreshBatch(batch);
+  for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
+    const groupOffset = batchIndex * MAX_GEM_REFRESH_GROUPS;
+    const boosterOffset = batchIndex * MAX_BOOSTER_REFRESH_GROUPS;
+    const response = await requestGemRefreshBatch(
+      groups.slice(groupOffset, groupOffset + MAX_GEM_REFRESH_GROUPS),
+      boosterGameAppIds.slice(
+        boosterOffset,
+        boosterOffset + MAX_BOOSTER_REFRESH_GROUPS
+      )
+    );
     values.push(...response.values);
+    boosters.push(...response.boosters);
     pendingGroupCount += response.pending_group_count;
+    pendingBoosterCount += response.pending_booster_count;
     gemRateLimited ||= response.gem_rate_limited;
     if (
       response.gem_retry_after_seconds !== null &&
@@ -889,6 +1011,8 @@ async function requestGemRefresh(
   return {
     values,
     pending_group_count: pendingGroupCount,
+    boosters,
+    pending_booster_count: pendingBoosterCount,
     gem_rate_limited: gemRateLimited,
     gem_retry_after_seconds: gemRetryAfterSeconds
   };
@@ -900,6 +1024,11 @@ function mergeGemRefresh(
 ): InventoryCheck {
   const yields = new Map<string, number>(
     refresh.values.map((entry) => [gemKeyToken(entry), entry.gem_yield])
+  );
+  const boosterValues = new Map<string, BoosterRefreshValue>(
+    refresh.boosters.map(
+      (entry) => [entry.game_app_id, entry] as const
+    )
   );
   const items = inventory.items.map((item) => {
     if (item.gem_key === null) {
@@ -920,6 +1049,17 @@ function mergeGemRefresh(
             gemYield,
             inventory.gem_cash_context.sack_price
           )
+    };
+  });
+  const boosters = inventory.boosters.map((booster) => {
+    const refreshedBooster = boosterValues.get(booster.game_app_id);
+    if (typeof refreshedBooster === "undefined") {
+      return booster;
+    }
+    return {
+      ...booster,
+      card_set_size: refreshedBooster.card_set_size,
+      gem_cost: refreshedBooster.gem_cost
     };
   });
   const gemPriceableCount = items.filter(
@@ -945,6 +1085,7 @@ function mergeGemRefresh(
   return {
     ...inventory,
     items,
+    boosters,
     gem_status: gemStatus,
     gem_message: gemMessage,
     gem_priceable_item_count: gemPriceableCount,
@@ -953,6 +1094,8 @@ function mergeGemRefresh(
     gem_retry_after_seconds: refresh.gem_retry_after_seconds
   };
 }
+
+class InventorySessionChangedError extends Error { }
 
 
 async function requestSession(signal?: AbortSignal): Promise<SessionResponse> {
@@ -974,10 +1117,33 @@ async function requestSession(signal?: AbortSignal): Promise<SessionResponse> {
   return payload;
 }
 
-function toViewState(session: SessionResponse): ViewState {
-  return session.authenticated
-    ? { kind: "signed-in", session }
-    : { kind: "signed-out" };
+async function requestInventory(
+  steamId: string,
+  signal?: AbortSignal
+): Promise<InventoryCheck> {
+  const response = await fetch(INVENTORY_URL, {
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      "X-Expected-Steam-ID": steamId
+    },
+    method: "POST",
+    signal
+  });
+
+  if (response.status === 401) {
+    throw new InventorySessionChangedError();
+  }
+  if (!response.ok) {
+    throw new Error("The inventory service returned an error.");
+  }
+
+  const payload: unknown = await response.json();
+  if (!isInventoryCheck(payload)) {
+    throw new Error("The inventory service returned an invalid response.");
+  }
+
+  return payload;
 }
 
 function secondsUntilDeadline(deadlineMs: number | null, nowMs: number): number {
@@ -991,92 +1157,72 @@ function secondsUntilDeadline(deadlineMs: number | null, nowMs: number): number 
   );
 }
 
-function Brand() {
+type PageKind = "home" | "faq";
+
+function Brand({ currentPage }: { currentPage: PageKind }) {
   return (
-    <div className="brand" aria-label="Steam Optimizer">
+    <a
+      className="brand"
+      href="/"
+      aria-label="Steam Optimizer home"
+      aria-current={currentPage === "home" ? "page" : undefined}
+    >
       <span className="brand-mark" aria-hidden="true">
         SO
       </span>
       <span className="brand-name">Steam Optimizer</span>
-    </div>
+    </a>
   );
 }
 
-function ReadOnlyBoundary() {
+function SiteHeader({
+  currentPage,
+  children
+}: {
+  currentPage: PageKind;
+  children?: ReactNode;
+}) {
   return (
-    <aside className="boundary-note" aria-labelledby="boundary-title">
-      <p className="section-label">Read-only by design</p>
-      <h2 id="boundary-title">Your account stays under your control.</h2>
-      <p>
-        Steam Optimizer only reads information Steam exposes publicly. It cannot
-        trade, sell, craft, or change your account. Any future account action
-        stays manual and happens on Steam.
-      </p>
-    </aside>
+    <header className="site-header">
+      <Brand currentPage={currentPage} />
+      <div className="site-header-actions">
+        <nav className="primary-nav" aria-label="Primary navigation">
+          <a
+            className="nav-link"
+            href="/faq"
+            aria-current={currentPage === "faq" ? "page" : undefined}
+          >
+            FAQ
+          </a>
+        </nav>
+        {children}
+      </div>
+    </header>
+  );
+}
+
+function SiteFooter() {
+  return (
+    <footer className="site-footer">
+      <p>Steam Optimizer</p>
+      <div className="footer-links">
+        <a href="/faq">FAQ</a>
+        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
+          Privacy &amp; Steam data terms
+          <span className="visually-hidden"> (opens in a new tab)</span>
+        </a>
+      </div>
+    </footer>
   );
 }
 
 function LoadingView() {
   return (
-    <section className="state-panel loading-panel" aria-labelledby="loading-title">
-      <div>
-        <p className="section-label">Steam connection</p>
-        <h2 id="loading-title">Checking your connection</h2>
-        <p className="state-copy">
-          Looking for an existing local session. No Steam credentials are sent
-          from this page.
-        </p>
-      </div>
-      <div className="loading-indicator">
+    <section className="session-status" aria-label="Steam session">
+      <p className="loading-indicator">
         <span className="loading-dot" aria-hidden="true" />
-        Checking session…
-      </div>
-    </section>
-  );
-}
-
-
-function SignedOutView() {
-  return (
-    <section className="state-panel connection-panel" aria-labelledby="connect-title">
-      <div className="connection-copy">
-        <p className="section-label">Stage one · Connect</p>
-        <h2 id="connect-title">Connect Steam to check public access.</h2>
-        <p id="connect-description" className="state-copy">
-          Continue to Steam in this browser. Steam handles sign-in and returns
-          your public Steam identity—your password never comes here.
-        </p>
-      </div>
-
-      <div className="connection-details" aria-label="Connection details">
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            01
-          </span>
-          <p>
-            <strong>Steam verifies you.</strong>
-            <span>Authentication happens on Steam Community.</span>
-          </p>
-        </div>
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            02
-          </span>
-          <p>
-            <strong>We check public surfaces.</strong>
-            <span>Profile and inventory access are reported separately.</span>
-          </p>
-        </div>
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            03
-          </span>
-          <p>
-            <strong>You decide what comes next.</strong>
-            <span>No account actions are automated.</span>
-          </p>
-        </div>
-      </div>
+        Checking your Steam session…
+      </p>
     </section>
   );
 }
@@ -1084,15 +1230,14 @@ function SignedOutView() {
 function ApiUnavailableView({ onRetry }: { onRetry: () => void }) {
   return (
     <section
-      className="state-panel unavailable-panel"
+      className="session-alert"
       aria-labelledby="unavailable-title"
     >
       <div>
-        <p className="section-label">Connection service</p>
         <h2 id="unavailable-title">Steam connection is unavailable.</h2>
-        <p className="state-copy">
-          We could not reach the app's session service. This is a service or
-          configuration problem—not a Steam privacy result.
+        <p>
+          The session service could not be reached. This is not a Steam privacy
+          result.
         </p>
       </div>
       <button className="secondary-action" type="button" onClick={onRetry}>
@@ -1102,85 +1247,99 @@ function ApiUnavailableView({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-function SteamIdentity({ user }: { user: SteamUser }) {
+function SteamIdentity({
+  user,
+  isSigningOut,
+  isBusy,
+  onLogout
+}: {
+  user: SteamUser;
+  isSigningOut: boolean;
+  isBusy: boolean;
+  onLogout: () => void;
+}) {
   const displayName = user.display_name?.trim() || "Steam member";
   const initials = displayName.slice(0, 2).toUpperCase();
 
   return (
-    <div className="identity">
-      {user.avatar_url ? (
-        <img className="avatar" src={user.avatar_url} alt="" />
-      ) : (
-        <span className="avatar avatar-fallback" aria-hidden="true">
-          {initials}
+    <details className="account-menu">
+      <summary
+        className="identity-trigger"
+        aria-label={`Connected Steam account: ${displayName}`}
+      >
+        {user.avatar_url ? (
+          <img className="avatar" src={user.avatar_url} alt="" />
+        ) : (
+          <span className="avatar avatar-fallback" aria-hidden="true">
+            {initials}
+          </span>
+        )}
+        <span className="identity-name">{displayName}</span>
+        <span className="identity-chevron" aria-hidden="true">
+          ⌄
         </span>
-      )}
-      <div>
-        <p className="section-label">Connected Steam identity</p>
-        <h2 id="account-title">{displayName}</h2>
+      </summary>
+      <div className="account-popover">
+        <p className="section-label">Connected Steam account</p>
+        <p className="account-name">{displayName}</p>
         <p className="steam-id">Steam ID {user.steam_id}</p>
+        <button
+          className="text-action"
+          type="button"
+          onClick={onLogout}
+          disabled={isSigningOut || isBusy}
+        >
+          {isSigningOut ? "Signing out…" : "Sign out"}
+        </button>
       </div>
-    </div>
+    </details>
   );
 }
 
-type AccessCardProps =
-  | { surface: "profile"; check: VisibilityCheck }
-  | { surface: "inventory"; check: InventoryCheck };
-
-function AccessCard({ surface, check }: AccessCardProps) {
-  const title = surface === "profile" ? "Steam profile" : "Steam inventory";
-  const privateGuidance =
-    surface === "profile"
-      ? "Your Steam profile is not public."
-      : "Your Steam inventory is not public.";
-  const isRateLimited =
-    surface === "inventory" &&
-    check.status === "unavailable" &&
-    check.rate_limited;
-  const statusLabel = isRateLimited ? "Try later" : STATUS_LABELS[check.status];
+function AccessSummary({
+  profile,
+  inventory,
+  isInventoryLoading
+}: {
+  profile: VisibilityCheck;
+  inventory: InventoryCheck | null;
+  isInventoryLoading: boolean;
+}) {
+  const inventoryStatus = inventory?.status ?? "unavailable";
+  const inventoryStatusLabel =
+    inventory === null
+      ? isInventoryLoading
+        ? "Checking…"
+        : "Unavailable"
+      : inventory.status === "unavailable" && inventory.rate_limited
+        ? "Try later"
+        : STATUS_LABELS[inventory.status];
 
   return (
-    <article
-      className={`access-card access-card-${check.status}`}
-      aria-labelledby={`${surface}-title`}
-    >
-      <div className="access-card-heading">
-        <div>
-          <p className="card-index">{surface === "profile" ? "01" : "02"}</p>
-          <h3 id={`${surface}-title`}>{title}</h3>
-        </div>
-        <p className={`access-badge access-badge-${check.status}`}>
+    <dl className="access-summary" aria-label="Steam access status">
+      <div className={`access-summary-item access-summary-${profile.status}`}>
+        <dt>Profile</dt>
+        <dd
+          className={`access-badge access-badge-${profile.status}`}
+          aria-label={`Steam profile: ${STATUS_LABELS[profile.status]}`}
+        >
           <span className="status-dot" aria-hidden="true" />
-          {statusLabel}
-        </p>
+          {STATUS_LABELS[profile.status]}
+        </dd>
       </div>
-
-      <p className="check-message">{check.message}</p>
-
-      {check.status === "private" && (
-        <p className="result-guidance">
-          {privateGuidance}{" "}
-          <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
-            Open Steam privacy settings
-            <span className="visually-hidden"> (opens in a new tab)</span>
-          </a>
-          , then recheck.
-        </p>
-      )}
-
-      {check.status === "unavailable" &&
-        (isRateLimited ? (
-          <p className="result-guidance">
-            Steam is temporarily limiting automated checks. This is not a
-            privacy result and does not mean your inventory is private.
-          </p>
-        ) : (
-          <p className="result-guidance">
-            This is not a privacy result. Recheck when the service is available.
-          </p>
-        ))}
-    </article>
+      <div
+        className={`access-summary-item access-summary-${inventoryStatus}`}
+      >
+        <dt>Inventory</dt>
+        <dd
+          className={`access-badge access-badge-${inventoryStatus}`}
+          aria-label={`Steam inventory: ${inventoryStatusLabel}`}
+        >
+          <span className="status-dot" aria-hidden="true" />
+          {inventoryStatusLabel}
+        </dd>
+      </div>
+    </dl>
   );
 }
 
@@ -1816,15 +1975,10 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   return (
     <section className="inventory-browser" aria-labelledby="inventory-items-title">
       <div className="inventory-browser-heading">
-        <div>
-          <p className="section-label">Item ledger</p>
-          <h3 id="inventory-items-title">Inventory items</h3>
-        </div>
+        <h3 id="inventory-items-title" className="visually-hidden">
+          Inventory items
+        </h3>
         <div className="inventory-browser-settings">
-          <p>
-            {INVENTORY_COUNT_FORMATTER.format(items.length)} distinct item{" "}
-            {items.length === 1 ? "type" : "types"}
-          </p>
           <label className="inventory-group-setting">
             <input
               type="checkbox"
@@ -1838,6 +1992,7 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
           </label>
         </div>
       </div>
+
       <div
         className="inventory-view-tabs"
         role="tablist"
@@ -1958,11 +2113,7 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
                 )} gem-convertible item ${worthMoreAsGemsItems.length === 1 ? "type is" : "types are"
                 } currently worth more as gems.`}
             </p>
-            <p className="inventory-view-explanation">
-              Worth more as gems compares each gem-convertible item&apos;s
-              per-item gem cash value against its current lowest-sell market
-              price. Missing values are excluded from this view.
-            </p>
+
             {activeItems.length === 0 ? (
               <div className="inventory-filtered-empty">
                 <h4>No items are worth more as gems</h4>
@@ -2000,9 +2151,9 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
         </p>
       </div>
       <p className="booster-coverage-copy">
-        Every Steam booster pack contains three trading cards. Prices are
-        read-only SteamApis order-book values, and this feed does not identify
-        the currency.
+        Gem cost is derived from the public normal-card set size. Every Steam
+        booster pack contains three cards. Market prices are read-only SteamApis
+        order-book values, and this feed does not identify the currency.
       </p>
       <div className="booster-grid">
         {boosters.map((booster) => {
@@ -2038,6 +2189,22 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
                   <dd>{highestBuy ?? "Unavailable"}</dd>
                 </div>
                 <div>
+                  <dt>Gem cost</dt>
+                  <dd>
+                    {booster.gem_cost === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.gem_cost)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Cards in set</dt>
+                  <dd>
+                    {booster.card_set_size === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.card_set_size)}
+                  </dd>
+                </div>
+                <div>
                   <dt>Cards per booster</dt>
                   <dd>{INVENTORY_COUNT_FORMATTER.format(booster.card_count)}</dd>
                 </div>
@@ -2056,6 +2223,98 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
       </div>
     </section>
   );
+}
+
+function InventoryPricingSummary({
+  inventory,
+  isRefreshingGems,
+  onRefreshGems
+}: {
+  inventory: InventoryCheck;
+  isRefreshingGems: boolean;
+  onRefreshGems: () => void;
+}) {
+  const marketStatusLabel = PRICE_STATUS_LABELS[inventory.price_status];
+  const gemStatusLabel = GEM_STATUS_LABELS[inventory.gem_status];
+  const totalAssetCount = INVENTORY_COUNT_FORMATTER.format(
+    inventory.total_asset_count
+  );
+  const marketPricingCount = `${INVENTORY_COUNT_FORMATTER.format(
+    inventory.priced_item_count
+  )}/${INVENTORY_COUNT_FORMATTER.format(inventory.priceable_item_count)}`;
+  const gemPricingCount = `${INVENTORY_COUNT_FORMATTER.format(
+    inventory.gem_priced_item_count
+  )}/${INVENTORY_COUNT_FORMATTER.format(
+    inventory.gem_priceable_item_count
+  )}`;
+
+  return (
+    <div className="inventory-pricing-summary" aria-label="Inventory pricing summary">
+      <dl className="inventory-pricing-metrics">
+        <div
+          className="inventory-pricing-stat inventory-pricing-stat-total"
+          aria-label={`Total assets: ${totalAssetCount}`}
+        >
+          <dt>Items</dt>
+          <dd>{totalAssetCount}</dd>
+        </div>
+        <div
+          className={`inventory-pricing-stat inventory-pricing-stat-${inventory.price_status}`}
+          aria-label={`Market pricing: ${marketStatusLabel}. ${marketPricingCount} item types priced`}
+        >
+          <dt>
+            <span className="status-dot" aria-hidden="true" />
+            Market
+          </dt>
+          <dd>{marketPricingCount}</dd>
+        </div>
+        <div
+          className={`inventory-pricing-stat inventory-pricing-stat-${inventory.gem_status}`}
+          aria-label={`Gem pricing: ${gemStatusLabel}. ${gemPricingCount} gem-convertible item types priced`}
+        >
+          <dt>
+            <span className="status-dot" aria-hidden="true" />
+            Gems
+          </dt>
+          <dd>{gemPricingCount}</dd>
+        </div>
+      </dl>
+      <button
+        className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
+        type="button"
+        onClick={onRefreshGems}
+        disabled={isRefreshingGems || inventory.gem_priceable_item_count === 0}
+        aria-label={
+          isRefreshingGems ? "Refreshing gem values" : "Refresh gem values"
+        }
+        title="Refresh cached gem values"
+      >
+        <span aria-hidden="true">↻</span>
+      </button>
+    </div>
+  );
+}
+
+function inventoryPriceCoverageMessage(inventory: InventoryCheck): string {
+  return inventory.priceable_item_count === 0
+    ? "No marketable item types require a price lookup."
+    : `SteamApis price data is available for ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.priced_item_count
+    )} of ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.priceable_item_count
+    )} marketable item ${inventory.priceable_item_count === 1 ? "type" : "types"
+    }.`;
+}
+
+function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
+  return inventory.gem_priceable_item_count === 0
+    ? "No gem-convertible item types require a gem lookup."
+    : `Gem values are available for ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.gem_priced_item_count
+    )} of ${INVENTORY_COUNT_FORMATTER.format(
+      inventory.gem_priceable_item_count
+    )} gem-convertible item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
+    }.`;
 }
 
 function InventoryResults({
@@ -2088,175 +2347,25 @@ function InventoryResults({
     }
   }
 
-  const coverageMessage =
-    inventory.priceable_item_count === 0
-      ? "No marketable item types require a price lookup."
-      : `SteamApis price data is available for ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.priced_item_count
-      )} of ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.priceable_item_count
-      )} marketable item ${inventory.priceable_item_count === 1 ? "type" : "types"
-      }.`;
-  const gemCoverageMessage =
-    inventory.gem_priceable_item_count === 0
-      ? "No gem-convertible item types require a gem lookup."
-      : `Gem values are available for ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.gem_priced_item_count
-      )} of ${INVENTORY_COUNT_FORMATTER.format(
-        inventory.gem_priceable_item_count
-      )} gem-convertible item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
-      }.`;
-  const gemCashContext = inventory.gem_cash_context;
 
   return (
     <section className="inventory-results" aria-labelledby="inventory-results-title">
       <div className="inventory-results-heading">
         <div>
-          <p className="section-label">Public inventory</p>
-          <h2 id="inventory-results-title">What is in your inventory</h2>
+          <p className="section-label">Inventory</p>
+          <h2 id="inventory-results-title">Items and boosters</h2>
         </div>
-        <p>
-          Quantities combine matching Steam assets. Prices are read-only market
-          context, not sale offers.
-        </p>
+        <InventoryPricingSummary
+          inventory={inventory}
+          isRefreshingGems={isRefreshingGems}
+          onRefreshGems={onRefreshGems}
+        />
       </div>
-
-      <section className="price-coverage" aria-labelledby="price-coverage-title">
-        <div className="price-coverage-heading">
-          <div>
-            <p className="section-label">Price coverage</p>
-            <h3 id="price-coverage-title">Current market snapshot</h3>
-          </div>
-          <p
-            className={`pricing-status pricing-status-${inventory.price_status}`}
-          >
-            <span className="status-dot" aria-hidden="true" />
-            {PRICE_STATUS_LABELS[inventory.price_status]}
-          </p>
-        </div>
-        <p className="price-coverage-copy">{coverageMessage}</p>
-        <p className="price-message">
-          SteamApis does not specify the currency for this feed. Values are
-          shown exactly as received, without a currency symbol.
+      {refreshMessage !== null && (
+        <p className="inventory-refresh-status" aria-live="polite">
+          {refreshMessage}
         </p>
-        {inventory.price_message.trim().length > 0 && (
-          <p className="price-message">{inventory.price_message}</p>
-        )}
-        <dl className="inventory-summary">
-          <div>
-            <dt>Total assets</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(inventory.total_asset_count)}
-            </dd>
-          </div>
-          <div>
-            <dt>Distinct item types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(inventory.unique_item_count)}
-            </dd>
-          </div>
-          <div>
-            <dt>Priceable types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.priceable_item_count
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt>Types with prices</dt>
-            <dd>{INVENTORY_COUNT_FORMATTER.format(inventory.priced_item_count)}</dd>
-          </div>
-        </dl>
-      </section>
-
-      <section className="gem-coverage" aria-labelledby="gem-coverage-title">
-        <div className="gem-coverage-heading">
-          <div>
-            <p className="section-label">Gem coverage</p>
-            <h3 id="gem-coverage-title">Gem-convertible item values</h3>
-          </div>
-          <div className="gem-coverage-actions">
-            <p
-              className={`gem-status gem-status-${inventory.gem_status}`}
-            >
-              <span className="status-dot" aria-hidden="true" />
-              {GEM_STATUS_LABELS[inventory.gem_status]}
-            </p>
-            <button
-              className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
-              type="button"
-              onClick={onRefreshGems}
-              disabled={
-                isRefreshingGems || inventory.gem_priceable_item_count === 0
-              }
-              aria-label={
-                isRefreshingGems
-                  ? "Refreshing gem values"
-                  : "Refresh gem values"
-              }
-              title="Refresh cached gem values"
-            >
-              <span aria-hidden="true">↻</span>
-            </button>
-          </div>
-        </div>
-        <p className="gem-coverage-copy">{gemCoverageMessage}</p>
-        {inventory.gem_message.trim().length > 0 && (
-          <p className="gem-message">{inventory.gem_message}</p>
-        )}
-        {refreshMessage !== null && (
-          <p className="gem-message gem-refresh-message">{refreshMessage}</p>
-        )}
-        {inventory.gem_rate_limited && (
-          <p className="gem-message gem-rate-limit-message">
-            Steam Community is temporarily rate-limiting gem lookups. Cached
-            values remain available
-            {inventory.gem_retry_after_seconds !== null
-              ? `; try again in ${inventory.gem_retry_after_seconds}s`
-              : ""}
-            .
-          </p>
-        )}
-        <p className="gem-cash-provenance">
-          Gem cash value uses the SteamApis lowest-sell basis for{" "}
-          {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed has
-          unknown currency. Each value is a per-item replacement-cost estimate.
-        </p>
-        {gemCashContext !== null && (
-          <p className="gem-cash-context">
-            Current sack price: {gemCashContext.sack_price}
-            {gemCashContext.observed_at !== null &&
-              gemCashContext.observed_at.length > 0 && (
-                <>
-                  {" "}
-                  <time dateTime={gemCashContext.observed_at}>
-                    ({formatPriceTimestamp(gemCashContext.observed_at)})
-                  </time>
-                </>
-              )}
-            .
-          </p>
-        )}
-        <dl className="gem-summary">
-          <div>
-            <dt>Gem-convertible types</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.gem_priceable_item_count
-              )}
-            </dd>
-          </div>
-          <div>
-            <dt>Gem-convertible types with values</dt>
-            <dd>
-              {INVENTORY_COUNT_FORMATTER.format(
-                inventory.gem_priced_item_count
-              )}
-            </dd>
-          </div>
-        </dl>
-      </section>
+      )}
       <div
         className="inventory-view-tabs inventory-result-tabs"
         role="tablist"
@@ -2363,146 +2472,601 @@ function InventoryResults({
     </section>
   );
 }
+function InventoryFaq({
+  profile,
+  inventory
+}: {
+  profile: VisibilityCheck;
+  inventory: InventoryCheck;
+}) {
+  const hasPrivateSurface =
+    profile.status === "private" || inventory.status === "private";
+  const gemCashContext = inventory.gem_cash_context;
+
+  return (
+    <section className="inventory-faq" aria-labelledby="faq-title">
+      <div className="inventory-faq-heading">
+        <p className="section-label">FAQ</p>
+        <h2 id="faq-title">About these results</h2>
+      </div>
+      <div className="inventory-faq-list">
+        <details className="inventory-faq-item">
+          <summary>What do the Steam access statuses mean?</summary>
+          <div className="inventory-faq-answer">
+            <p>
+              <strong>Public</strong> means Steam exposed that surface to the
+              check. <strong>Private</strong> means Steam did not expose it.
+              <strong> Unavailable</strong> means the service could not verify
+              it and is not a privacy result.
+            </p>
+            <p>
+              <strong>Profile check:</strong> {profile.message}
+            </p>
+            <p>
+              <strong>Inventory check:</strong> {inventory.message}
+            </p>
+            {hasPrivateSurface && (
+              <p>
+                To change a private surface,{" "}
+                <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
+                  open Steam privacy settings
+                  <span className="visually-hidden">
+                    {" "}
+                    (opens in a new tab)
+                  </span>
+                </a>{" "}
+                and recheck Steam access.
+              </p>
+            )}
+            {inventory.status === "unavailable" && inventory.rate_limited && (
+              <p>
+                Steam is temporarily limiting automated checks. This does not
+                mean the inventory is private.
+              </p>
+            )}
+          </div>
+        </details>
+        <details className="inventory-faq-item">
+          <summary>How do the market and gem numbers work?</summary>
+          <div className="inventory-faq-answer">
+            <p>
+              The Market number is priced marketable item types over
+              priceable item types. The Gems number is priced gem-convertible
+              item types over gem-convertible item types that can be checked.
+            </p>
+            <p>
+              Worth more as gems compares each gem-convertible item&apos;s
+              per-item gem cash value against its current lowest-sell market
+              price. Missing values are excluded from this view.
+            </p>
+            <p>{inventoryPriceCoverageMessage(inventory)}</p>
+            <p>
+              SteamApis does not specify the market feed currency. Values are
+              shown exactly as received, without a currency symbol.
+            </p>
+            {inventory.price_message.trim().length > 0 && (
+              <p>
+                <strong>Market note:</strong> {inventory.price_message}
+              </p>
+            )}
+            <p>{inventoryGemCoverageMessage(inventory)}</p>
+            <p>
+              <a href="/faq#gem-values">How gem values work</a> explains the
+              source data and replacement-cost calculation.
+            </p>
+            {inventory.gem_message.trim().length > 0 && (
+              <p>
+                <strong>Gem note:</strong> {inventory.gem_message}
+              </p>
+            )}
+            {inventory.gem_rate_limited && (
+              <p>
+                Steam Community is temporarily rate-limiting gem lookups.
+                Cached values remain available
+                {inventory.gem_retry_after_seconds !== null
+                  ? `; try again in ${inventory.gem_retry_after_seconds}s`
+                  : ""}
+                .
+              </p>
+            )}
+            <p>
+              Gem cash value uses the SteamApis lowest-sell basis for{" "}
+              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed
+              has unknown currency. Each value is a per-item replacement-cost
+              estimate.
+            </p>
+            {gemCashContext !== null && (
+              <p>
+                Current sack price: {gemCashContext.sack_price}
+                {gemCashContext.observed_at !== null &&
+                  gemCashContext.observed_at.length > 0 && (
+                    <>
+                      {" "}
+                      <time dateTime={gemCashContext.observed_at}>
+                        ({formatPriceTimestamp(gemCashContext.observed_at)})
+                      </time>
+                    </>
+                  )}
+                .
+              </p>
+            )}
+          </div>
+        </details>
+        <details className="inventory-faq-item">
+          <summary>Why can the item count differ from table rows?</summary>
+          <div className="inventory-faq-answer">
+            <p>
+              Items is the total number of Steam assets. The table combines
+              matching assets into distinct item types, so one row can
+              represent more than one item.
+            </p>
+          </div>
+        </details>
+        <details className="inventory-faq-item">
+          <summary>Can Steam Optimizer change my Steam account?</summary>
+          <div className="inventory-faq-answer">
+            <p>
+              No. Steam Optimizer only reads information Steam exposes
+              publicly. It cannot trade, sell, craft, or change your account.
+              Any future account action stays manual and happens on Steam.
+            </p>
+          </div>
+        </details>
+      </div>
+    </section>
+  );
+}
+
 
 function SignedInView({
   session,
+  inventoryState,
   isRechecking,
+  isRefreshingInventory,
   isRefreshingGems,
-  isSigningOut,
   retryAfterSeconds,
   actionMessage,
+  inventoryActionMessage,
   gemRefreshMessage,
-  onRecheck,
-  onRefreshGems,
-  onLogout
+  onRefreshInventory,
+  onRefreshGems
 }: {
   session: SignedInSession;
+  inventoryState: InventoryState;
   isRechecking: boolean;
+  isRefreshingInventory: boolean;
   isRefreshingGems: boolean;
-  isSigningOut: boolean;
   retryAfterSeconds: number;
   actionMessage: string | null;
+  inventoryActionMessage: string | null;
   gemRefreshMessage: string | null;
-  onRecheck: () => void;
+  onRefreshInventory: () => void;
   onRefreshGems: () => void;
-  onLogout: () => void;
 }) {
-  const isRecheckDisabled =
+  const isInventoryRefreshDisabled =
+    isRefreshingInventory ||
+    inventoryState.isLoading ||
     isRechecking ||
     isRefreshingGems ||
-    isSigningOut ||
     retryAfterSeconds > 0;
 
   return (
-    <section className="account-view" aria-labelledby="account-title">
-      <div className="account-header">
-        <SteamIdentity user={session.user} />
-        <div className="account-actions">
-          <button
-            className="secondary-action"
-            type="button"
-            onClick={onRecheck}
-            disabled={isRecheckDisabled}
-            aria-describedby={
-              retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
-            }
-          >
-            {isRechecking ? "Checking…" : "Recheck Steam access"}
-          </button>
-          <button
-            className="text-action"
-            type="button"
-            onClick={onLogout}
-            disabled={isSigningOut || isRechecking || isRefreshingGems}
-          >
-            {isSigningOut ? "Signing out…" : "Sign out on this device"}
-          </button>
-        </div>
-      </div>
-
-      {(isRechecking || actionMessage) && (
-        <p className={`action-status${actionMessage ? " action-status-error" : ""}`}>
-          {isRechecking ? "Rechecking profile and inventory access…" : actionMessage}
+    <section className="account-view">
+      {(isRechecking || actionMessage || inventoryActionMessage) && (
+        <p
+          className={`action-status${actionMessage || inventoryActionMessage
+            ? " action-status-error"
+            : ""
+            }`}
+          aria-live="polite"
+        >
+          {isRechecking
+            ? "Rechecking Steam profile access…"
+            : actionMessage ?? inventoryActionMessage}
         </p>
       )}
 
       {retryAfterSeconds > 0 && (
-        <p id="recheck-cooldown" className="action-status cooldown-status">
-          Repeated immediate recheck requests are disabled. Try again in{" "}
+        <p id="inventory-cooldown" className="action-status cooldown-status">
+          Repeated immediate inventory refreshes are disabled. Try again in{" "}
           {retryAfterSeconds}s.
         </p>
       )}
-
-      <div className="access-intro">
-        <div>
-          <p className="section-label">Public access check</p>
-          <h2>What Steam exposes right now</h2>
-        </div>
-        <p>
-          These checks are independent. An unavailable check means we could not
-          verify it—not that the surface is private.
+      <div className="inventory-cache-toolbar">
+        <p className="inventory-cache-status" aria-live="polite">
+          {inventoryState.refreshedAt !== null ? (
+            <>
+              Inventory last refreshed{" "}
+              <time dateTime={inventoryState.refreshedAt}>
+                {formatPriceTimestamp(inventoryState.refreshedAt)}
+              </time>
+              {inventoryState.source === "cache" ? " (cached)" : ""}.
+            </>
+          ) : inventoryState.isLoading ? (
+            "Checking your Steam inventory…"
+          ) : (
+            inventoryState.message ?? "Inventory has not been loaded yet."
+          )}
         </p>
+        <button
+          className="secondary-action"
+          type="button"
+          onClick={onRefreshInventory}
+          disabled={isInventoryRefreshDisabled}
+          aria-describedby={
+            retryAfterSeconds > 0 ? "inventory-cooldown" : undefined
+          }
+        >
+          {isRefreshingInventory
+            ? "Refreshing inventory…"
+            : inventoryState.isLoading
+              ? "Checking inventory…"
+              : "Refresh inventory"}
+        </button>
       </div>
 
-      <div className="access-grid">
-        <AccessCard surface="profile" check={session.checks.profile} />
-        <AccessCard surface="inventory" check={session.checks.inventory} />
-      </div>
-
-      {session.checks.inventory.status === "public" && (
+      {inventoryState.inventory?.status === "public" && (
         <InventoryResults
-          inventory={session.checks.inventory}
+          inventory={inventoryState.inventory}
           isRefreshingGems={isRefreshingGems}
           refreshMessage={gemRefreshMessage}
           onRefreshGems={onRefreshGems}
+        />
+      )}
+      {inventoryState.inventory !== null && (
+        <InventoryFaq
+          profile={session.checks.profile}
+          inventory={inventoryState.inventory}
         />
       )}
     </section>
   );
 }
 
-export function App() {
+function HomePage() {
   const [viewState, setViewState] = useState<ViewState>({ kind: "loading" });
+  const [inventoryState, setInventoryState] = useState<InventoryState>({
+    inventory: null,
+    refreshedAt: null,
+    source: null,
+    isLoading: false,
+    message: null
+  });
   const [isRechecking, setIsRechecking] = useState(false);
+  const [isRefreshingInventory, setIsRefreshingInventory] = useState(false);
   const [isRefreshingGems, setIsRefreshingGems] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [retryDeadlineMs, setRetryDeadlineMs] = useState<number | null>(null);
   const [countdownNowMs, setCountdownNowMs] = useState(() => performance.now());
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [inventoryActionMessage, setInventoryActionMessage] = useState<
+    string | null
+  >(null);
   const [gemRefreshMessage, setGemRefreshMessage] = useState<string | null>(null);
   const [statusAnnouncement, setStatusAnnouncement] = useState("Checking session…");
   const retryDeadlineRef = useRef<number | null>(null);
   const recheckInFlightRef = useRef(false);
+  const inventoryRefreshInFlightRef = useRef(false);
   const gemRefreshInFlightRef = useRef(false);
+  const activeSteamIdRef = useRef<string | null>(null);
+  const inventoryStateRef = useRef(inventoryState);
+  const inventoryRequestTokenRef = useRef(0);
+  const inventoryLoadPromiseRef = useRef<{
+    steamId: string;
+    token: number;
+    promise: Promise<InventoryLoadResult>;
+  } | null>(null);
   const retryAfterSeconds = secondsUntilDeadline(
     retryDeadlineMs,
     countdownNowMs
   );
 
-  const applySession = useCallback((session: SessionResponse) => {
-    const nowMs = performance.now();
-    const deadlineMs =
-      session.authenticated &&
-        session.checks.inventory.retry_after_seconds !== null
-        ? nowMs +
-        session.checks.inventory.retry_after_seconds *
-        MILLISECONDS_PER_SECOND
-        : null;
-
-    retryDeadlineRef.current = deadlineMs;
-    setRetryDeadlineMs(deadlineMs);
-    setCountdownNowMs(nowMs);
-    setViewState(toViewState(session));
+  const updateInventoryState = useCallback((nextState: InventoryState) => {
+    inventoryStateRef.current = nextState;
+    setInventoryState(nextState);
   }, []);
+
+  const setInventoryRetryDeadline = useCallback(
+    (inventory: InventoryCheck | null) => {
+      const nowMs = performance.now();
+      const deadlineMs =
+        inventory?.retry_after_seconds !== null &&
+          inventory?.retry_after_seconds !== undefined
+          ? nowMs + inventory.retry_after_seconds * MILLISECONDS_PER_SECOND
+          : null;
+      retryDeadlineRef.current = deadlineMs;
+      setRetryDeadlineMs(deadlineMs);
+      setCountdownNowMs(nowMs);
+    },
+    []
+  );
+
+  const isCurrentInventoryRequest = useCallback(
+    (token: number, steamId: string): boolean =>
+      activeSteamIdRef.current === steamId &&
+      inventoryRequestTokenRef.current === token,
+    []
+  );
+
+  const loadInventoryForUser = useCallback((
+    steamId: string,
+    forceNetwork = false
+  ): Promise<InventoryLoadResult> => {
+    const existingLoad = inventoryLoadPromiseRef.current;
+    if (!forceNetwork && existingLoad?.steamId === steamId) {
+      return existingLoad.promise;
+    }
+
+    const token = inventoryRequestTokenRef.current + 1;
+    inventoryRequestTokenRef.current = token;
+    activeSteamIdRef.current = steamId;
+    const previousState = inventoryStateRef.current;
+    updateInventoryState({
+      ...previousState,
+      isLoading: true,
+      message: null
+    });
+
+    const promise = (async (): Promise<InventoryLoadResult> => {
+      try {
+        if (!forceNetwork) {
+          let cached: {
+            refreshed_at: string;
+            inventory: InventoryCheck;
+          } | null = null;
+          try {
+            await clearInventoryCacheExcept(steamId);
+            if (isCurrentInventoryRequest(token, steamId)) {
+              cached = await readInventoryCache(
+                steamId,
+                isCacheableInventory
+              );
+            }
+          } catch {
+            cached = null;
+          }
+          if (!isCurrentInventoryRequest(token, steamId)) {
+            return { kind: "error" };
+          }
+          if (cached !== null) {
+            setInventoryRetryDeadline(cached.inventory);
+            updateInventoryState({
+              inventory: cached.inventory,
+              refreshedAt: cached.refreshed_at,
+              source: "cache",
+              isLoading: false,
+              message: null
+            });
+            return {
+              kind: "cache",
+              inventory: cached.inventory,
+              refreshedAt: cached.refreshed_at
+            };
+          }
+        }
+
+        const cacheEpoch = await readInventoryCacheEpoch();
+        const inventory = await requestInventory(steamId);
+        if (!isCurrentInventoryRequest(token, steamId)) {
+          return { kind: "error" };
+        }
+        setInventoryRetryDeadline(inventory);
+
+        const currentState = inventoryStateRef.current;
+        if (
+          inventory.status === "unavailable" &&
+          currentState.inventory !== null &&
+          currentState.inventory.status !== "unavailable"
+        ) {
+          updateInventoryState({
+            ...currentState,
+            isLoading: false,
+            message: null
+          });
+          return {
+            kind: "network",
+            inventory,
+            preserved: true
+          };
+        }
+
+        if (
+          inventory.status === "public" ||
+          inventory.status === "private"
+        ) {
+          const fetchedAt = new Date().toISOString();
+          const storedAt =
+            cacheEpoch === null
+              ? undefined
+              : await writeInventoryCache(
+                steamId,
+                inventory,
+                isCacheableInventory,
+                fetchedAt,
+                cacheEpoch
+              );
+          if (!isCurrentInventoryRequest(token, steamId)) {
+            return { kind: "error" };
+          }
+          if (storedAt === null) {
+            updateInventoryState({
+              ...inventoryStateRef.current,
+              isLoading: false
+            });
+            return { kind: "session-changed" };
+          }
+          const refreshedAt = storedAt ?? fetchedAt;
+          updateInventoryState({
+            inventory,
+            refreshedAt,
+            source: "network",
+            isLoading: false,
+            message: null
+          });
+          return {
+            kind: "network",
+            inventory,
+            refreshedAt
+          };
+        }
+
+        updateInventoryState({
+          inventory,
+          refreshedAt: null,
+          source: "network",
+          isLoading: false,
+          message: null
+        });
+        return { kind: "network", inventory };
+      } catch (error) {
+        if (!isCurrentInventoryRequest(token, steamId)) {
+          return { kind: "error" };
+        }
+        if (error instanceof InventorySessionChangedError) {
+          updateInventoryState({
+            ...inventoryStateRef.current,
+            isLoading: false
+          });
+          return { kind: "session-changed" };
+        }
+        const currentState = inventoryStateRef.current;
+        updateInventoryState({
+          ...currentState,
+          isLoading: false,
+          message:
+            currentState.inventory === null
+              ? "We could not load your Steam inventory. Try refreshing when the service is available."
+              : null
+        });
+        return {
+          kind: "error",
+          preserved: currentState.inventory !== null
+        };
+      } finally {
+        if (inventoryLoadPromiseRef.current?.token === token) {
+          inventoryLoadPromiseRef.current = null;
+        }
+      }
+    })();
+
+    inventoryLoadPromiseRef.current = {
+      steamId,
+      token,
+      promise
+    };
+    return promise;
+  }, [
+    isCurrentInventoryRequest,
+    setInventoryRetryDeadline,
+    updateInventoryState
+  ]);
+
+  const presentSession = useCallback(async (
+    session: SessionResponse,
+    shouldLoadInventory: boolean
+  ): Promise<InventoryLoadResult | null> => {
+    if (!session.authenticated) {
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+      inventoryLoadPromiseRef.current = null;
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setRetryDeadlineMs(null);
+      retryDeadlineRef.current = null;
+      setViewState({ kind: "signed-out" });
+      return null;
+    }
+
+    const previousSteamId = activeSteamIdRef.current;
+    const accountChanged =
+      previousSteamId !== null && previousSteamId !== session.user.steam_id;
+    activeSteamIdRef.current = session.user.steam_id;
+    setViewState({ kind: "signed-in", session });
+
+    const needsInventory =
+      shouldLoadInventory ||
+      accountChanged ||
+      previousSteamId === null;
+    if (!needsInventory) {
+      return null;
+    }
+
+    if (accountChanged || shouldLoadInventory) {
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setInventoryRetryDeadline(null);
+    }
+    return loadInventoryForUser(session.user.steam_id);
+  }, [
+    loadInventoryForUser,
+    setInventoryRetryDeadline,
+    updateInventoryState
+  ]);
+
+  const loadCurrentSession = useCallback(
+    async (signal?: AbortSignal) => {
+      let session = await requestSession(signal);
+      let result = await presentSession(session, true);
+      if (result?.kind === "session-changed" && !signal?.aborted) {
+        session = await requestSession(signal);
+        result = await presentSession(session, true);
+      }
+      return { session, result };
+    },
+    [presentSession]
+  );
 
   useEffect(() => {
     const controller = new AbortController();
 
     void requestSession(controller.signal)
-      .then((session) => {
-        if (!controller.signal.aborted) {
-          applySession(session);
-          setStatusAnnouncement("");
+      .then(async (initialSession) => {
+        let session = initialSession;
+        let result = await presentSession(session, true);
+        if (result?.kind === "session-changed" && !controller.signal.aborted) {
+          session = await requestSession(controller.signal);
+          result = await presentSession(session, true);
+        }
+        return { session, result };
+      })
+      .then(({ session, result }) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (!session.authenticated) {
+          setStatusAnnouncement(
+            "Your local session has ended. Sign in again to load saved inventory."
+          );
+        } else if (
+          result?.kind === "cache" &&
+          result.refreshedAt !== undefined
+        ) {
+          setStatusAnnouncement(
+            `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+              result.refreshedAt
+            )}.`
+          );
+        } else if (result?.kind === "network" && result.inventory) {
+          setStatusAnnouncement(
+            `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`
+          );
+        } else if (
+          result?.kind === "error" ||
+          result?.kind === "session-changed"
+        ) {
+          setStatusAnnouncement(
+            "We could not load your Steam inventory. Refresh when the service is available."
+          );
         }
       })
       .catch(() => {
@@ -2512,8 +3076,12 @@ export function App() {
         }
       });
 
-    return () => controller.abort();
-  }, [applySession]);
+    return () => {
+      controller.abort();
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+    };
+  }, [presentSession]);
 
   useEffect(() => {
     if (retryDeadlineMs === null) {
@@ -2542,11 +3110,26 @@ export function App() {
   async function handleRetry() {
     setViewState({ kind: "loading" });
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setStatusAnnouncement("Checking session…");
 
     try {
-      applySession(await requestSession());
-      setStatusAnnouncement("");
+      const { session, result } = await loadCurrentSession();
+      if (!session.authenticated) {
+        setStatusAnnouncement(
+          "Your local session has ended. Sign in again to load saved inventory."
+        );
+      } else if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+        setStatusAnnouncement(
+          `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`
+        );
+      } else if (result?.kind === "network" && result.inventory) {
+        setStatusAnnouncement(
+          `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`
+        );
+      }
     } catch {
       setViewState({ kind: "api-unavailable" });
       setStatusAnnouncement("Steam connection is unavailable.");
@@ -2556,9 +3139,9 @@ export function App() {
   async function handleRecheck() {
     if (
       recheckInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
       gemRefreshInFlightRef.current ||
-      isSigningOut ||
-      secondsUntilDeadline(retryDeadlineRef.current, performance.now()) > 0
+      isSigningOut
     ) {
       return;
     }
@@ -2566,20 +3149,53 @@ export function App() {
     recheckInFlightRef.current = true;
     setIsRechecking(true);
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setGemRefreshMessage(null);
-    setStatusAnnouncement("Rechecking profile and inventory access…");
+    setStatusAnnouncement("Rechecking Steam profile access…");
 
     try {
-      const session = await requestSession();
-      applySession(session);
-      setStatusAnnouncement(
-        session.authenticated
-          ? `Recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Steam inventory: ${STATUS_LABELS[session.checks.inventory.status]}.`
-          : "Your local session has ended. Sign in again to recheck Steam access."
-      );
+      let session = await requestSession();
+      const previousSteamId = activeSteamIdRef.current;
+      let result = await presentSession(session, false);
+      if (result?.kind === "session-changed") {
+        const current = await loadCurrentSession();
+        session = current.session;
+        result = current.result;
+      }
+      if (!session.authenticated) {
+        setStatusAnnouncement(
+          "Your local session has ended. Sign in again to recheck Steam profile access."
+        );
+      } else if (
+        previousSteamId !== null &&
+        previousSteamId !== session.user.steam_id
+      ) {
+        let inventoryOutcome = "Inventory could not be loaded.";
+        if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+          inventoryOutcome = `Loaded cached inventory last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`;
+        } else if (result?.kind === "network" && result.inventory) {
+          inventoryOutcome = `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`;
+        }
+        setStatusAnnouncement(
+          `Account changed. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. ${inventoryOutcome}`
+        );
+      } else if (
+        result?.kind === "network" &&
+        result.inventory?.status === "unavailable"
+      ) {
+        setStatusAnnouncement(
+          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Inventory is unavailable.`
+        );
+      } else {
+        setStatusAnnouncement(
+          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}.`
+        );
+      }
     } catch {
       const message =
-        "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
+        "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
       setActionMessage(message);
       setStatusAnnouncement(message);
     } finally {
@@ -2587,17 +3203,106 @@ export function App() {
       setIsRechecking(false);
     }
   }
+
+  async function handleInventoryRefresh() {
+    if (
+      inventoryRefreshInFlightRef.current ||
+      recheckInFlightRef.current ||
+      gemRefreshInFlightRef.current ||
+      isSigningOut ||
+      inventoryStateRef.current.isLoading ||
+      viewState.kind !== "signed-in" ||
+      retryAfterSeconds > 0
+    ) {
+      return;
+    }
+
+    const steamId = viewState.session.user.steam_id;
+    inventoryRefreshInFlightRef.current = true;
+    setIsRefreshingInventory(true);
+    setInventoryActionMessage(null);
+    setGemRefreshMessage(null);
+    setStatusAnnouncement("Refreshing inventory…");
+
+    try {
+      let result: InventoryLoadResult | null = await loadInventoryForUser(
+        steamId,
+        true
+      );
+      if (result.kind === "session-changed") {
+        const current = await loadCurrentSession();
+        if (!current.session.authenticated) {
+          setStatusAnnouncement(
+            "Your local session has ended. Sign in again to refresh inventory."
+          );
+          return;
+        }
+        result = current.result;
+        if (current.session.user.steam_id !== steamId) {
+          let inventoryOutcome = "Inventory could not be loaded.";
+          if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+            inventoryOutcome = `Loaded cached inventory last refreshed ${formatPriceTimestamp(
+              result.refreshedAt
+            )}.`;
+          } else if (result?.kind === "network" && result.inventory) {
+            inventoryOutcome = `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`;
+          }
+          setStatusAnnouncement(
+            `Account changed. Steam profile: ${STATUS_LABELS[current.session.checks.profile.status]}. ${inventoryOutcome}`
+          );
+          return;
+        }
+      }
+      if (result?.kind === "network" && result.inventory !== undefined) {
+        if (result.inventory.status === "unavailable") {
+          const message =
+            "We could not refresh inventory right now. Your previous inventory results have not changed.";
+          setInventoryActionMessage(message);
+          setStatusAnnouncement(message);
+        } else {
+          setStatusAnnouncement(
+            `Inventory refresh complete: ${STATUS_LABELS[result.inventory.status]}.`
+          );
+        }
+      } else if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+        setStatusAnnouncement(
+          `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`
+        );
+      } else {
+        const message =
+          "We could not refresh inventory right now. Your previous inventory results have not changed.";
+        setInventoryActionMessage(message);
+        setStatusAnnouncement(message);
+      }
+    } catch {
+      const message =
+        "We could not refresh inventory right now. Your previous inventory results have not changed.";
+      setInventoryActionMessage(message);
+      setStatusAnnouncement(message);
+    } finally {
+      inventoryRefreshInFlightRef.current = false;
+      setIsRefreshingInventory(false);
+    }
+  }
+
   async function handleGemRefresh() {
     if (
       gemRefreshInFlightRef.current ||
       recheckInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
       isSigningOut ||
       viewState.kind !== "signed-in" ||
-      viewState.session.checks.inventory.status !== "public"
+      inventoryStateRef.current.inventory?.status !== "public"
     ) {
       return;
     }
-    const inventory = viewState.session.checks.inventory;
+    const inventory = inventoryStateRef.current.inventory;
+    const steamId = activeSteamIdRef.current;
+    if (inventory === null || steamId === null) {
+      return;
+    }
     if (gemRefreshGroups(inventory.items).length === 0) {
       return;
     }
@@ -2608,25 +3313,36 @@ export function App() {
     setStatusAnnouncement("Refreshing cached gem values…");
 
     try {
+      const cacheEpoch = await readInventoryCacheEpoch();
       const refresh = await requestGemRefresh(inventory);
       const mergedInventory = mergeGemRefresh(inventory, refresh);
-      setViewState((current) =>
-        current.kind === "signed-in"
-          ? {
-            kind: "signed-in",
-            session: {
-              ...current.session,
-              checks: {
-                ...current.session.checks,
-                inventory: mergeGemRefresh(
-                  current.session.checks.inventory,
-                  refresh
-                )
-              }
-            }
-          }
-          : current
-      );
+      if (activeSteamIdRef.current !== steamId) {
+        return;
+      }
+      const currentState = inventoryStateRef.current;
+      if (currentState.inventory === null) {
+        return;
+      }
+      const currentRefreshedAt = currentState.refreshedAt;
+      const storedAt =
+        cacheEpoch === null || currentRefreshedAt === null
+          ? undefined
+          : await writeInventoryCache(
+            steamId,
+            mergedInventory,
+            isCacheableInventory,
+            currentRefreshedAt,
+            cacheEpoch,
+            currentRefreshedAt
+          );
+      if (activeSteamIdRef.current !== steamId || storedAt === null) {
+        return;
+      }
+      updateInventoryState({
+        ...currentState,
+        inventory: mergedInventory,
+        message: null
+      });
       setGemRefreshMessage("Gem values refreshed from the background cache.");
       setStatusAnnouncement(
         `Gem refresh complete. ${mergedInventory.gem_priced_item_count} of ${mergedInventory.gem_priceable_item_count} gem-convertible item types have gem values.`
@@ -2642,13 +3358,17 @@ export function App() {
     }
   }
 
-
   async function handleLogout() {
-    if (gemRefreshInFlightRef.current) {
+    if (
+      gemRefreshInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
+      recheckInFlightRef.current
+    ) {
       return;
     }
     setIsSigningOut(true);
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setGemRefreshMessage(null);
     setStatusAnnouncement("Signing out…");
 
@@ -2661,8 +3381,24 @@ export function App() {
       if (response.status !== 204) {
         throw new Error("The logout service returned an unexpected response.");
       }
-
-      applySession({ authenticated: false });
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+      inventoryLoadPromiseRef.current = null;
+      try {
+        await clearInventoryCache();
+      } catch {
+        // Cache cleanup must not prevent a successful server sign-out.
+      }
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setRetryDeadlineMs(null);
+      retryDeadlineRef.current = null;
+      setViewState({ kind: "signed-out" });
       setStatusAnnouncement("Signed out successfully.");
     } catch {
       const message =
@@ -2676,52 +3412,67 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <title>Steam Optimizer</title>
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
 
-      <header className="site-header">
-        <Brand />
-        <div className="site-header-actions">
-          <p className="boundary-pill">
-            <span aria-hidden="true">●</span>
-            Read-only workspace
-          </p>
-          {viewState.kind === "signed-out" && (
-            <a
-              className="steam-sign-in-link"
-              href={STEAM_LOGIN_URL}
-              aria-describedby="connect-description"
+      <SiteHeader currentPage="home">
+        {viewState.kind === "signed-out" && (
+          <a className="steam-sign-in-link" href={STEAM_LOGIN_URL}>
+            <picture className="steam-sign-in-picture">
+              <img
+                className="steam-sign-in-image"
+                src={steamSignInWide}
+                width="180"
+                height="35"
+                alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+              />
+            </picture>
+          </a>
+        )}
+        {viewState.kind === "signed-in" && (
+          <div className="site-account">
+            <AccessSummary
+              profile={viewState.session.checks.profile}
+              inventory={inventoryState.inventory}
+              isInventoryLoading={inventoryState.isLoading}
+            />
+            <button
+              className="secondary-action"
+              type="button"
+              aria-label="Recheck Steam profile"
+              onClick={() => void handleRecheck()}
+              disabled={
+                isRechecking ||
+                isRefreshingInventory ||
+                isRefreshingGems ||
+                isSigningOut
+              }
             >
-              <picture className="steam-sign-in-picture">
-                <source
-                  media="(max-width: 40rem)"
-                  srcSet={steamSignInCompact}
-                  width="109"
-                  height="66"
-                />
-                <img
-                  className="steam-sign-in-image"
-                  src={steamSignInWide}
-                  width="180"
-                  height="35"
-                  alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
-                />
-              </picture>
-            </a>
-          )}
-        </div>
-      </header>
+              {isRechecking ? "Checking…" : "Recheck"}
+            </button>
+            <SteamIdentity
+              user={viewState.session.user}
+              isSigningOut={isSigningOut}
+              isBusy={
+                isRechecking || isRefreshingInventory || isRefreshingGems
+              }
+              onLogout={() => void handleLogout()}
+            />
+          </div>
+        )}
+      </SiteHeader>
 
       <main id="main-content" className="page-main">
-        <section className="hero" aria-labelledby="page-title">
-          <p className="eyebrow">Understand what Steam makes public</p>
-          <h1 id="page-title">A clearer view of your Steam inventory.</h1>
-          <p className="hero-copy">
-            Connect your account to verify which Steam surfaces are public before
-            using read-only inventory and badge tools.
-          </p>
-        </section>
+        {viewState.kind !== "signed-in" && (
+          <section className="hero" aria-labelledby="page-title">
+            <h1 id="page-title">Compare your Steam inventory.</h1>
+            <p className="hero-copy">
+              Check public access, market prices, and card gem values.
+            </p>
+          </section>
+        )}
         <p
           className="visually-hidden"
           role="status"
@@ -2732,36 +3483,139 @@ export function App() {
         </p>
 
         {viewState.kind === "loading" && <LoadingView />}
-        {viewState.kind === "signed-out" && <SignedOutView />}
         {viewState.kind === "api-unavailable" && (
           <ApiUnavailableView onRetry={() => void handleRetry()} />
         )}
         {viewState.kind === "signed-in" && (
           <SignedInView
             session={viewState.session}
+            inventoryState={inventoryState}
             isRechecking={isRechecking}
+            isRefreshingInventory={isRefreshingInventory}
             isRefreshingGems={isRefreshingGems}
-            isSigningOut={isSigningOut}
             retryAfterSeconds={retryAfterSeconds}
             actionMessage={actionMessage}
+            inventoryActionMessage={inventoryActionMessage}
             gemRefreshMessage={gemRefreshMessage}
-            onRecheck={() => void handleRecheck()}
+            onRefreshInventory={() => void handleInventoryRefresh()}
             onRefreshGems={() => void handleGemRefresh()}
-            onLogout={() => void handleLogout()}
           />
         )}
 
-        <ReadOnlyBoundary />
       </main>
 
-      <footer className="site-footer">
-        <p>Steam Optimizer</p>
-        <p>Public data in. Manual decisions out.</p>
-        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
-          Privacy &amp; Steam data terms
-          <span className="visually-hidden"> (opens in a new tab)</span>
-        </a>
-      </footer>
+      <SiteFooter />
     </div>
   );
+}
+
+function FaqPage() {
+  return (
+    <div className="app-shell">
+      <title>FAQ | Steam Optimizer</title>
+      <a className="skip-link" href="#main-content">
+        Skip to main content
+      </a>
+      <SiteHeader currentPage="faq" />
+
+      <main id="main-content" className="page-main faq-main">
+        <header className="faq-hero">
+          <p className="eyebrow">FAQ</p>
+          <h1>Steam inventory questions, answered.</h1>
+          <p className="hero-copy">
+            The details on access, pricing, gems, and privacy.
+          </p>
+        </header>
+
+        <div className="faq-list">
+          <section id="account-access">
+            <h2>Can Steam Optimizer change my account?</h2>
+            <p>
+              No. Steam Optimizer reads public Steam Community data. It cannot
+              trade, sell, craft, buy, or change your account. Any action you
+              choose stays manual and happens on Steam.
+            </p>
+            <p>
+              Sign-in is handled by Steam Community. Your Steam password never
+              reaches this app.
+            </p>
+          </section>
+
+          <section id="visibility">
+            <h2>Why can profile and inventory access differ?</h2>
+            <p>
+              Steam exposes profile and inventory visibility separately. A
+              public profile can still have a private inventory.
+            </p>
+            <p>
+              Unavailable is not the same as private. It means Steam or the
+              session service could not complete that check, including during
+              rate limits.
+            </p>
+          </section>
+
+          <section id="market-prices">
+            <h2>Where do market prices come from?</h2>
+            <p>
+              Market snapshots come from SteamApis and are shown exactly as
+              received. The feed does not identify its currency, and values are
+              context—not sale offers.
+            </p>
+          </section>
+
+          <section id="gem-values">
+            <h2>How are gem values calculated?</h2>
+            <p>
+              Steam Community provides the gem yield for eligible inventory
+              items. The cash estimate uses the SteamApis lowest-sell price for{" "}
+              {GEM_CASH_MARKET_HASH_NAME}, divided across{" "}
+              {INVENTORY_COUNT_FORMATTER.format(GEM_CASH_SACK_SIZE)} gems. It is
+              a per-item replacement-cost estimate.
+            </p>
+            <p>
+              “Worth more as gems” compares that estimate with the item&apos;s
+              current lowest-sell market price. Items missing either value are
+              excluded.
+            </p>
+          </section>
+
+          <section id="refreshes">
+            <h2>Why can pricing refreshes be delayed?</h2>
+            <p>
+              Steam Community and pricing providers can rate-limit requests.
+              Cached values remain visible while a refresh is delayed or only
+              partly complete.
+            </p>
+          </section>
+
+          <section id="privacy-settings">
+            <h2>How do I make my inventory public?</h2>
+            <p>
+              Open{" "}
+              <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
+                Steam privacy settings
+                <span className="visually-hidden"> (opens in a new tab)</span>
+              </a>
+              , change Inventory to Public, then return and recheck access.
+            </p>
+          </section>
+
+          <section id="affiliation">
+            <h2>Is this affiliated with Valve?</h2>
+            <p>
+              No. Steam Optimizer is an independent open-source project and is
+              not affiliated with Valve.
+            </p>
+          </section>
+        </div>
+      </main>
+
+      <SiteFooter />
+    </div>
+  );
+}
+
+export function App() {
+  const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
+  return pathname === "/faq" ? <FaqPage /> : <HomePage />;
 }

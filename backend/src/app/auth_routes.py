@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import hmac
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Literal, cast
 
@@ -14,8 +13,13 @@ if TYPE_CHECKING:
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
+from app.booster_pricing import (
+    BoosterResolution,
+    BoosterScanResult,
+    derive_booster_gem_cost,
+)
 from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
 from app.gem_pricing import GemBorderColor, GemKey
 from app.steam_gateway import InventoryCheck, ProfileCheck
@@ -31,8 +35,13 @@ from app.steam_openid import (
 STATE_PURPOSE = "login-state"
 SESSION_PURPOSE = "session"
 MAX_GEM_REFRESH_GROUPS = 10_000
+MAX_BOOSTER_REFRESH_GROUPS = 10_000
 _AUTHENTICATION_REQUIRED_MESSAGE = "Steam authentication is required."
 _GEM_REFRESH_UNAVAILABLE_MESSAGE = "Gem value refresh is unavailable."
+_DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
+_DUPLICATE_BOOSTER_REFRESH_GROUP_ERROR = "Booster refresh game AppIDs must be unique."
+_INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
+_INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 
 Clock = Callable[[], datetime]
 
@@ -50,7 +59,6 @@ class SessionCheck(BaseModel):
 
 class SessionChecks(BaseModel):
     profile: SessionCheck
-    inventory: InventoryCheck
 
 
 class AuthenticatedSessionResponse(BaseModel):
@@ -72,6 +80,11 @@ SessionResponse = Annotated[
     Field(discriminator="authenticated"),
 ]
 
+BoosterGameAppId = Annotated[
+    str,
+    Field(pattern=r"^(?:0|[1-9][0-9]*)$", max_length=20),
+]
+
 
 class GemRefreshGroup(BaseModel):
     app_id: str = Field(pattern=r"^(?:0|[1-9][0-9]*)$", max_length=20)
@@ -81,10 +94,41 @@ class GemRefreshGroup(BaseModel):
 
 class GemRefreshRequest(BaseModel):
     groups: list[GemRefreshGroup] = Field(max_length=MAX_GEM_REFRESH_GROUPS)
+    booster_game_app_ids: list[BoosterGameAppId] = Field(
+        default_factory=list,
+        max_length=MAX_BOOSTER_REFRESH_GROUPS,
+    )
+
+    @model_validator(mode="after")
+    def require_unique_groups(self) -> GemRefreshRequest:
+        gem_keys = {
+            (group.app_id, group.item_type, group.border_color) for group in self.groups
+        }
+        if len(gem_keys) != len(self.groups):
+            raise ValueError(_DUPLICATE_GEM_REFRESH_GROUP_ERROR)
+        if len(set(self.booster_game_app_ids)) != len(self.booster_game_app_ids):
+            raise ValueError(_DUPLICATE_BOOSTER_REFRESH_GROUP_ERROR)
+        return self
 
 
 class GemRefreshValue(GemRefreshGroup):
     gem_yield: StrictInt = Field(ge=0)
+
+
+class BoosterRefreshValue(BaseModel):
+    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
+    card_set_size: int | None = Field(default=None, ge=5, le=15)
+    gem_cost: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_derived_cost(self) -> BoosterRefreshValue:
+        if (self.card_set_size is None) != (self.gem_cost is None):
+            raise ValueError(_INVALID_BOOSTER_PAIR_ERROR)
+        if self.card_set_size is not None and self.gem_cost != derive_booster_gem_cost(
+            self.card_set_size
+        ):
+            raise ValueError(_INVALID_BOOSTER_COST_ERROR)
+        return self
 
 
 class GemRefreshResponse(BaseModel):
@@ -96,6 +140,8 @@ class GemRefreshResponse(BaseModel):
         ge=0,
         le=900,
     )
+    boosters: list[BoosterRefreshValue] = Field(default_factory=list)
+    pending_booster_count: int = Field(default=0, ge=0)
 
 
 def _utc_now() -> datetime:
@@ -172,7 +218,6 @@ def _unavailable_inventory() -> InventoryCheck:
 def _session_response(
     steam_id: str,
     profile: ProfileCheck,
-    inventory: InventoryCheck,
 ) -> AuthenticatedSessionResponse:
     return AuthenticatedSessionResponse(
         user=SessionUser(
@@ -185,7 +230,6 @@ def _session_response(
                 status=profile.status,
                 message=profile.message,
             ),
-            inventory=inventory,
         ),
     )
 
@@ -366,26 +410,55 @@ def create_auth_router(
             )
         except (InvalidCookieError, ValueError):
             return UnauthenticatedSessionResponse()
-        profile_result, inventory_result = await asyncio.gather(
-            steam_gateway.check_profile(steam_id),
-            steam_gateway.check_inventory(steam_id),
-            return_exceptions=True,
-        )
+        try:
+            profile_result = await steam_gateway.check_profile(steam_id)
+        except Exception:  # noqa: BLE001 - preserve unavailable profile status
+            profile_result = _unavailable_profile()
         profile = (
-            _unavailable_profile()
-            if isinstance(profile_result, BaseException)
-            else profile_result
+            profile_result
             if isinstance(profile_result, ProfileCheck)
             else _unavailable_profile()
         )
-        inventory = (
-            _unavailable_inventory()
-            if isinstance(inventory_result, BaseException)
-            else inventory_result
-            if isinstance(inventory_result, InventoryCheck)
-            else _unavailable_inventory()
-        )
-        return _session_response(steam_id, profile, inventory)
+        return _session_response(steam_id, profile)
+
+    @router.post(
+        "/api/auth/inventory",
+        response_model=InventoryCheck,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def auth_inventory(request: Request, response: Response) -> InventoryCheck:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            steam_id = _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        expected_steam_id = request.headers.get("x-expected-steam-id")
+        if expected_steam_id != steam_id:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            return await steam_gateway.check_inventory(steam_id)
+        except Exception:  # noqa: BLE001 - map gateway failures to unavailable
+            return _unavailable_inventory()
 
     @router.post(
         "/api/auth/gems",
@@ -445,28 +518,98 @@ def create_auth_router(
                 status_code=503,
                 detail=_GEM_REFRESH_UNAVAILABLE_MESSAGE,
             ) from error
+        requested_booster_ids = tuple(
+            sorted(
+                set(payload.booster_game_app_ids),
+                key=lambda value: (len(value), value),
+            )
+        )
+        booster_pending_count = len(requested_booster_ids)
+        booster_scan = BoosterScanResult(
+            values={},
+            pending_count=booster_pending_count,
+        )
+        if requested_booster_ids:
+            try:
+                candidate_booster_scan = await steam_gateway.refresh_boosters(
+                    requested_booster_ids
+                )
+                if isinstance(candidate_booster_scan, BoosterScanResult):
+                    booster_scan = candidate_booster_scan
+                    booster_pending_count = min(
+                        len(requested_booster_ids),
+                        max(0, candidate_booster_scan.pending_count),
+                    )
+            except (
+                AttributeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                # Booster refresh is independent; unknown values remain null.
+                booster_scan = BoosterScanResult(
+                    values={},
+                    pending_count=booster_pending_count,
+                )
+
         requested_keys = set(keys)
+        gem_values = [
+            GemRefreshValue(
+                app_id=key.app_id,
+                item_type=key.item_type,
+                border_color=key.border_color,
+                gem_yield=resolution.gem_yield,
+            )
+            for key, resolution in sorted(
+                scan.values.items(),
+                key=lambda entry: (
+                    int(entry[0].app_id),
+                    entry[0].item_type,
+                    entry[0].border_color,
+                ),
+            )
+            if key in requested_keys and getattr(resolution, "key", None) == key
+        ]
+
+        booster_values = []
+        for game_app_id in requested_booster_ids:
+            resolution = (
+                booster_scan.values.get(game_app_id)
+                if isinstance(booster_scan.values, Mapping)
+                else None
+            )
+            if not isinstance(resolution, BoosterResolution):
+                resolution = None
+            try:
+                booster_values.append(
+                    BoosterRefreshValue(
+                        game_app_id=game_app_id,
+                        card_set_size=(
+                            resolution.card_set_size if resolution is not None else None
+                        ),
+                        gem_cost=(
+                            resolution.gem_cost if resolution is not None else None
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                booster_values.append(
+                    BoosterRefreshValue(
+                        game_app_id=game_app_id,
+                        card_set_size=None,
+                        gem_cost=None,
+                    )
+                )
         return GemRefreshResponse(
-            values=[
-                GemRefreshValue(
-                    app_id=key.app_id,
-                    item_type=key.item_type,
-                    border_color=key.border_color,
-                    gem_yield=resolution.gem_yield,
-                )
-                for key, resolution in sorted(
-                    scan.values.items(),
-                    key=lambda entry: (
-                        int(entry[0].app_id),
-                        entry[0].item_type,
-                        entry[0].border_color,
-                    ),
-                )
-                if key in requested_keys and getattr(resolution, "key", None) == key
-            ],
-            pending_group_count=scan.pending_count,
+            values=gem_values,
+            pending_group_count=min(len(keys), max(0, scan.pending_count)),
             gem_rate_limited=scan.rate_limited,
             gem_retry_after_seconds=scan.retry_after_seconds,
+            boosters=booster_values,
+            pending_booster_count=booster_pending_count,
         )
 
     @router.post("/api/auth/logout", status_code=204)

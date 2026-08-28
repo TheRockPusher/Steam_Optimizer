@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Iterable, Mapping
+import sqlite3
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
@@ -14,15 +16,28 @@ import ijson
 from ijson.common import IncompleteJSONError, JSONError
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
+from app.booster_pricing import (
+    BoosterPricingService,
+    BoosterResolution,
+    BoosterScanResult,
+    derive_booster_gem_cost,
+)
 from app.gem_pricing import (
     SACK_OF_GEMS_MARKET_HASH_NAME,
     GemKey,
     GemPricingService,
     GemScanResult,
     ItemType,
+    SteamCommunityLimiter,
     canonical_decimal,
     gem_cash_value,
     parse_item_metadata,
+)
+from app.steamapis_price_cache import (
+    CachedPrice,
+    PriceCacheRead,
+    SteamApisPriceCache,
+    SteamApisPriceRefresh,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +57,8 @@ STEAM_OPTIMIZER_USER_AGENT = (
 _CANONICAL_SACK_PRICE_ERROR = "Sack price must be a canonical decimal."
 _CANONICAL_GEM_CASH_VALUE_ERROR = "Gem cash value must be a canonical decimal."
 _INVALID_ITEM_GEM_METADATA_ERROR = "Inventory item gem metadata is inconsistent."
+_INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
+_INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 
 CheckStatus = Literal["public", "private", "unavailable"]
 PriceStatus = Literal["complete", "partial", "unavailable"]
@@ -86,6 +103,7 @@ MAX_CONCURRENT_BULK_STREAMS = 1
 STEAM_ICON_HOSTNAME = "community.cloudflare.steamstatic.com"
 STEAMAPIS_BULK_HOST_SUFFIX = ".r2.cloudflarestorage.com"
 _BULK_STREAM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BULK_STREAMS)
+_PRICE_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
 _MAX_OBSERVED_AT_DECIMAL = Decimal(MAX_OBSERVED_AT_MILLISECONDS)
 _PRICE_STREAM_JSON_ERRORS = (IncompleteJSONError, JSONError)
 
@@ -120,13 +138,25 @@ class InventoryPrice(BaseModel):
 
 
 class BoosterInfo(BaseModel):
-    game_app_id: str = Field(pattern=r"^[0-9]+$")
+    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
     game_name: str | None = Field(default=None, max_length=MAX_INVENTORY_TEXT_LENGTH)
     market_hash_name: str | None = Field(
         default=None, max_length=MAX_PRICE_STREAM_SCALAR_LENGTH
     )
     card_count: Literal[3] = BOOSTER_CARD_COUNT
+    card_set_size: int | None = Field(default=None, ge=5, le=15)
+    gem_cost: int | None = Field(default=None, ge=0)
     price: InventoryPrice | None = None
+
+    @model_validator(mode="after")
+    def validate_derived_cost(self) -> BoosterInfo:
+        if (self.card_set_size is None) != (self.gem_cost is None):
+            raise ValueError(_INVALID_BOOSTER_PAIR_ERROR)
+        if self.card_set_size is not None and self.gem_cost != derive_booster_gem_cost(
+            self.card_set_size
+        ):
+            raise ValueError(_INVALID_BOOSTER_COST_ERROR)
+        return self
 
 
 class GemCashContext(BaseModel):
@@ -232,6 +262,13 @@ class SteamGatewayProtocol(Protocol):
         keys: Iterable[GemKey],
     ) -> GemScanResult:
         """Read cached gem values without fetching a Steam inventory."""
+        ...
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        """Read cached booster card-set sizes without fetching an inventory."""
         ...
 
 
@@ -522,6 +559,54 @@ def _response_content_length_within(
     return int(normalized) <= maximum
 
 
+def _validated_bulk_redirect(response: HTTPResponse, api_key: str) -> str:
+    if response.status_code not in (301, 302, 303, 307, 308):
+        raise InvalidSteamApisPayloadError
+    response_headers = getattr(response, "headers", None)
+    if not isinstance(response_headers, Mapping):
+        raise InvalidSteamApisPayloadError
+    location = _header(response_headers, "location")
+    if not isinstance(location, str) or not location:
+        raise InvalidSteamApisPayloadError
+    redirect = urljoin(STEAMAPIS_ITEMS_ENDPOINT, location)
+    try:
+        parsed = urlsplit(redirect)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise InvalidSteamApisPayloadError from error
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or hostname is None
+        or not hostname.casefold().endswith(STEAMAPIS_BULK_HOST_SUFFIX)
+        or port not in (None, 443)
+        or api_key in redirect
+        or api_key in unquote(redirect)
+        or any(
+            part.split("=", 1)[0].casefold() == "x-api-key"
+            for part in unquote(parsed.query).split("&")
+            if part
+        )
+    ):
+        raise InvalidSteamApisPayloadError
+    return redirect
+
+
+def _validate_bulk_response(response: HTTPResponse) -> None:
+    if not 200 <= response.status_code < 300 or not _response_content_length_within(
+        response, MAX_PRICE_STREAM_BYTES
+    ):
+        raise InvalidSteamApisPayloadError
+
+
+def _validate_price_generation(refresh: SteamApisPriceRefresh) -> None:
+    if refresh.accepted_count == 0:
+        raise InvalidSteamApisPayloadError
+
+
 def _unavailable_price_lookup() -> _PriceLookup:
     return _PriceLookup(
         status="unavailable",
@@ -671,7 +756,9 @@ def _booster_games(items: list[InventoryItem]) -> list[tuple[str, str | None]]:
 def _booster_infos(
     games: list[tuple[str, str | None]],
     prices: Mapping[str, InventoryPrice],
+    resolutions: Mapping[str, BoosterResolution] | None = None,
 ) -> list[BoosterInfo]:
+    resolved = resolutions or {}
     boosters: list[BoosterInfo] = []
     for game_app_id, game_name in games:
         market_hash_name = (
@@ -679,12 +766,25 @@ def _booster_infos(
             if game_name is not None
             else None
         )
+        resolution = resolved.get(game_app_id)
+        try:
+            is_valid_resolution = isinstance(
+                resolution, BoosterResolution
+            ) and resolution.gem_cost == derive_booster_gem_cost(
+                resolution.card_set_size
+            )
+        except (TypeError, ValueError):
+            is_valid_resolution = False
+        if not is_valid_resolution:
+            resolution = None
         boosters.append(
             BoosterInfo(
                 game_app_id=game_app_id,
                 game_name=game_name,
                 market_hash_name=market_hash_name,
                 card_count=BOOSTER_CARD_COUNT,
+                card_set_size=resolution.card_set_size if resolution else None,
+                gem_cost=resolution.gem_cost if resolution else None,
                 price=prices.get(market_hash_name)
                 if market_hash_name is not None
                 else None,
@@ -726,6 +826,7 @@ class _PriceLookup:
     message: str
     prices: Mapping[str, InventoryPrice]
     priced_names: frozenset[str]
+    used_stale_cache: bool = False
 
 
 @dataclass(slots=True)
@@ -901,17 +1002,70 @@ def _merge_price(
     priced_names.add(name)
 
 
+def _price_lookup_from_cache(
+    cache_read: PriceCacheRead,
+    requested_names: frozenset[str],
+) -> _PriceLookup:
+    prices: dict[str, InventoryPrice] = {}
+    priced_names: set[str] = set()
+    for requested_name in requested_names:
+        if not isinstance(requested_name, str):
+            continue
+        entry: CachedPrice | None = cache_read.prices.get(requested_name)
+        if entry is None:
+            entry = cache_read.prices.get(unquote(requested_name))
+        if entry is None:
+            continue
+        prices[requested_name] = InventoryPrice(
+            highest_buy=entry.highest_buy,
+            lowest_sell=entry.lowest_sell,
+            observed_at=entry.observed_at,
+        )
+        priced_names.add(requested_name)
+    priced = frozenset(priced_names)
+    if len(priced) == len(requested_names):
+        status: PriceStatus = "complete"
+        message = "Prices are current for all marketable inventory items."
+    elif priced:
+        status = "partial"
+        message = "Prices are unavailable for some marketable inventory items."
+    else:
+        status = "unavailable"
+        message = "Steam item prices are unavailable."
+    return _PriceLookup(
+        status=status,
+        message=message,
+        prices=prices,
+        priced_names=priced,
+        used_stale_cache=cache_read.has_generation and not cache_read.fresh,
+    )
+
+
+def _price_refresh_lock(cache: SteamApisPriceCache) -> asyncio.Lock:
+    if cache.path == ":memory:":
+        key = f":memory:{id(cache)}"
+    else:
+        key = str(Path(cache.path).expanduser().absolute())
+    lock = _PRICE_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PRICE_REFRESH_LOCKS[key] = lock
+    return lock
+
+
 async def _stream_prices(
     response: HTTPResponse,
     requested_names: frozenset[str],
+    on_price: Callable[[str, InventoryPrice], None] | None = None,
 ) -> tuple[dict[str, InventoryPrice], set[str]]:
     prices: dict[str, InventoryPrice] = {}
     priced_names: set[str] = set()
     stack: list[_PriceFrame] = []
     nesting = 0
     token_count = 0
+    saw_items_array = False
 
-    async for _prefix, event, value in ijson.parse_async(
+    async for prefix, event, value in ijson.parse_async(
         _AsyncByteReader(
             response.aiter_bytes(),
             max_decoded_bytes=MAX_PRICE_STREAM_BYTES,
@@ -944,7 +1098,7 @@ async def _stream_prices(
                     parent.highest_buy = frame.highest_buy
                 if frame.lowest_sell is not None:
                     parent.lowest_sell = frame.lowest_sell
-            if frame.market_hash_name:
+            if prefix == "items.item" and frame.market_hash_name:
                 raw_name = frame.market_hash_name
                 decoded_name = unquote(raw_name)
                 matches = (
@@ -955,10 +1109,17 @@ async def _stream_prices(
                 matched_names = tuple(
                     candidate for candidate in matches if candidate in requested_names
                 )
-                # Do not parse numbers or allocate an InventoryPrice for the
-                # hundreds of thousands of unrequested feed entries.
-                if matched_names:
+                price: InventoryPrice | None = None
+                if on_price is not None:
                     price = _price_from_frame(frame)
+                    if price.highest_buy is not None or price.lowest_sell is not None:
+                        on_price(decoded_name, price)
+                # Do not parse numbers or allocate an InventoryPrice for the
+                # hundreds of thousands of unrequested feed entries unless a
+                # cache refresh is actively persisting this complete feed.
+                if matched_names:
+                    if price is None:
+                        price = _price_from_frame(frame)
                     for candidate in matched_names:
                         _merge_price(prices, priced_names, candidate, price)
             continue
@@ -968,6 +1129,8 @@ async def _stream_prices(
             stack[-1].pending_key = value
             continue
         if event == "start_array":
+            if prefix == "items":
+                saw_items_array = True
             nesting += 1
             if nesting > MAX_PRICE_STREAM_NESTING:
                 raise InvalidSteamApisPayloadError
@@ -993,7 +1156,7 @@ async def _stream_prices(
         elif key in ("updatedAt", "updated_at") and event in ("number", "string"):
             frame.observed_at = value
 
-    if stack or nesting:
+    if not token_count or not saw_items_array or stack or nesting:
         raise InvalidSteamApisPayloadError
     return prices, priced_names
 
@@ -1009,6 +1172,9 @@ class SteamApisClient:
         bulk_http_client: AsyncHTTPClient | None = None,
         bulk_timeout_seconds: float | None = None,
         gem_pricing: GemPricingService | None = None,
+        price_cache: SteamApisPriceCache | None = None,
+        booster_pricing: BoosterPricingService | None = None,
+        limiter: SteamCommunityLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -1019,12 +1185,35 @@ class SteamApisClient:
             else settings.steam_bulk_timeout_seconds
         )
         self._inventory_inflight: dict[str, asyncio.Task[InventoryCheck]] = {}
+        self._price_refresh_task: asyncio.Task[bool] | None = None
+        self.price_cache = price_cache or SteamApisPriceCache(
+            settings.steamapis_price_cache_path
+        )
+        shared_limiter = limiter
+        if shared_limiter is None and gem_pricing is not None:
+            candidate_limiter = getattr(gem_pricing, "limiter", None)
+            if isinstance(candidate_limiter, SteamCommunityLimiter):
+                shared_limiter = candidate_limiter
+        if shared_limiter is None and booster_pricing is not None:
+            candidate_limiter = getattr(booster_pricing, "limiter", None)
+            if isinstance(candidate_limiter, SteamCommunityLimiter):
+                shared_limiter = candidate_limiter
+        self.community_limiter = shared_limiter or SteamCommunityLimiter()
         self.gem_pricing = gem_pricing or GemPricingService(
-            settings, http_client=http_client
+            settings,
+            http_client=http_client,
+            limiter=self.community_limiter,
+        )
+        self.booster_pricing = booster_pricing or BoosterPricingService(
+            settings,
+            http_client=http_client,
+            limiter=self.community_limiter,
         )
 
     async def start(self) -> None:
+        self.price_cache.initialize()
         await self.gem_pricing.start()
+        await self.booster_pricing.start()
 
     async def stop(self) -> None:
         inventory_tasks = tuple(self._inventory_inflight.values())
@@ -1034,7 +1223,21 @@ class SteamApisClient:
         if inventory_tasks:
             await asyncio.gather(*inventory_tasks, return_exceptions=True)
         self._inventory_inflight.clear()
-        await self.gem_pricing.stop()
+
+        price_task = self._price_refresh_task
+        if price_task is not None and not price_task.done():
+            price_task.cancel()
+        if price_task is not None:
+            await asyncio.gather(price_task, return_exceptions=True)
+        self._price_refresh_task = None
+
+        try:
+            await self.booster_pricing.stop()
+        finally:
+            try:
+                await self.gem_pricing.stop()
+            finally:
+                self.price_cache.close()
 
     @property
     def _api_key(self) -> str | None:
@@ -1249,7 +1452,31 @@ class SteamApisClient:
             RuntimeError,
         ):
             price_lookup = _unavailable_price_lookup()
-        boosters = _booster_infos(booster_games, price_lookup.prices)
+
+        booster_scan = BoosterScanResult(values={})
+        if booster_games:
+            try:
+                candidate_booster_scan = await self.booster_pricing.resolve(
+                    game_app_id for game_app_id, _ in booster_games
+                )
+                if isinstance(candidate_booster_scan, BoosterScanResult):
+                    booster_scan = candidate_booster_scan
+            except (
+                AttributeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                # Booster lookup failures must never affect inventory or gem data.
+                booster_scan = BoosterScanResult(values={})
+        boosters = _booster_infos(
+            booster_games,
+            price_lookup.prices,
+            booster_scan.values,
+        )
         for index, item in enumerate(items):
             if not item.marketable or item.market_hash_name is None:
                 continue
@@ -1283,6 +1510,31 @@ class SteamApisClient:
                 gem_scan = GemScanResult(values={})
 
         sack_price = price_lookup.prices.get(SACK_OF_GEMS_MARKET_HASH_NAME)
+        auxiliary_price_exposed = any(
+            booster.price is not None for booster in boosters
+        ) or (
+            sack_price is not None
+            and any(item.item_type == "trading_card" for item in items)
+        )
+        if price_lookup.used_stale_cache and (
+            priced_item_count or auxiliary_price_exposed
+        ):
+            if priced_item_count and price_status == "complete":
+                price_message = "Prices are complete using a cached fallback."
+            elif priced_item_count:
+                price_message = (
+                    "Available prices use a cached fallback; prices are unavailable "
+                    "for some marketable inventory items."
+                )
+            elif priceable_item_count:
+                price_message = (
+                    "Inventory item prices are unavailable; displayed booster or "
+                    "gem market context uses a cached fallback."
+                )
+            else:
+                price_message = (
+                    "Displayed booster or gem market context uses a cached fallback."
+                )
         for index, item in enumerate(items):
             key = item.gem_key
             if key is None:
@@ -1336,52 +1588,59 @@ class SteamApisClient:
                 prices={},
                 priced_names=frozenset(),
             )
+
+        cache_names: set[str] = set(requested_names)
+        cache_names.update(
+            unquote(name) for name in requested_names if isinstance(name, str)
+        )
+        cache_read = self.price_cache.read(cache_names)
+        if self._api_headers() is None:
+            return _price_lookup_from_cache(cache_read, requested_names)
+        if cache_read.fresh or cache_read.retry_suppressed:
+            return _price_lookup_from_cache(cache_read, requested_names)
+
+        task = self._price_refresh_task
+        if task is None:
+            task = asyncio.create_task(self._refresh_prices())
+            self._price_refresh_task = task
+            task.add_done_callback(self._discard_price_refresh_task)
+        try:
+            await asyncio.shield(task)
+        finally:
+            self._discard_price_refresh_task(task)
+
+        cache_read = self.price_cache.read(cache_names)
+        return _price_lookup_from_cache(cache_read, requested_names)
+
+    def _discard_price_refresh_task(
+        self,
+        task: asyncio.Future[bool],
+    ) -> None:
+        if task.done() and self._price_refresh_task is task:
+            self._price_refresh_task = None
+
+    async def _refresh_prices(self) -> bool:
+        lock = _price_refresh_lock(self.price_cache)
+        async with lock:
+            cache_read = self.price_cache.read()
+            if cache_read.fresh or cache_read.retry_suppressed:
+                return True
+            return await self._refresh_prices_uncached()
+
+    async def _refresh_prices_uncached(self) -> bool:
         headers = self._api_headers()
-        if headers is None:
-            return _unavailable_price_lookup()
+        api_key = self._api_key
+        if headers is None or api_key is None:
+            return False
+        refresh: SteamApisPriceRefresh | None = None
         try:
             response = await self.http_client.get(
                 STEAMAPIS_ITEMS_ENDPOINT,
                 headers=headers,
                 follow_redirects=False,
             )
-        except (httpx2.HTTPError, OSError, TimeoutError, RuntimeError):
-            return _unavailable_price_lookup()
-        if response.status_code not in (301, 302, 303, 307, 308):
-            return _unavailable_price_lookup()
-        response_headers = getattr(response, "headers", None)
-        if not isinstance(response_headers, Mapping):
-            return _unavailable_price_lookup()
-        location = _header(response_headers, "location")
-        if not isinstance(location, str) or not location:
-            return _unavailable_price_lookup()
-        redirect = urljoin(STEAMAPIS_ITEMS_ENDPOINT, location)
-        try:
-            parsed = urlsplit(redirect)
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError:
-            return _unavailable_price_lookup()
-        api_key = self._api_key
-        if (
-            parsed.scheme.casefold() != "https"
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or hostname is None
-            or not hostname.casefold().endswith(STEAMAPIS_BULK_HOST_SUFFIX)
-            or port not in (None, 443)
-            or api_key is None
-            or api_key in redirect
-            or api_key in unquote(redirect)
-            or any(
-                part.split("=", 1)[0].casefold() == "x-api-key"
-                for part in unquote(parsed.query).split("&")
-                if part
-            )
-        ):
-            return _unavailable_price_lookup()
-        try:
+            redirect = _validated_bulk_redirect(response, api_key)
+
             async with (
                 _BULK_STREAM_SEMAPHORE,
                 self.bulk_http_client.stream(
@@ -1391,13 +1650,23 @@ class SteamApisClient:
                     timeout=self.bulk_timeout_seconds,
                 ) as cdn_response,
             ):
-                if not 200 <= cdn_response.status_code < 300:
-                    return _unavailable_price_lookup()
-                prices, priced_names = await _stream_prices(
-                    cdn_response, requested_names
+                _validate_bulk_response(cdn_response)
+                refresh_session = self.price_cache.begin_refresh()
+                refresh = refresh_session
+                await _stream_prices(
+                    cdn_response,
+                    frozenset(),
+                    on_price=lambda name, price: refresh_session.add(
+                        name,
+                        price.highest_buy,
+                        price.lowest_sell,
+                        price.observed_at,
+                    ),
                 )
+            _validate_price_generation(refresh_session)
+            refresh_session.commit()
         except _PRICE_STREAM_JSON_ERRORS:
-            return _unavailable_price_lookup()
+            pass
         except (
             httpx2.HTTPError,
             OSError,
@@ -1406,25 +1675,21 @@ class SteamApisClient:
             ValueError,
             ArithmeticError,
             RuntimeError,
+            AttributeError,
+            sqlite3.Error,
         ):
-            return _unavailable_price_lookup()
-
-        priced = frozenset(priced_names)
-        if len(priced) == len(requested_names):
-            status: PriceStatus = "complete"
-            message = "Prices are current for all marketable inventory items."
-        elif priced:
-            status = "partial"
-            message = "Prices are unavailable for some marketable inventory items."
+            pass
+        except BaseException:
+            if refresh is not None:
+                refresh.abort()
+            raise
         else:
-            status = "unavailable"
-            message = "Steam item prices are unavailable."
-        return _PriceLookup(
-            status=status,
-            message=message,
-            prices=prices,
-            priced_names=priced,
-        )
+            refresh = None
+            return True
+        if refresh is not None:
+            refresh.abort()
+        self.price_cache.record_refresh_failure()
+        return False
 
 
 class SteamGateway:
@@ -1437,6 +1702,10 @@ class SteamGateway:
         http_client: AsyncHTTPClient,
         bulk_http_client: AsyncHTTPClient | None = None,
         bulk_timeout_seconds: float | None = None,
+        price_cache: SteamApisPriceCache | None = None,
+        gem_pricing: GemPricingService | None = None,
+        booster_pricing: BoosterPricingService | None = None,
+        limiter: SteamCommunityLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -1446,6 +1715,10 @@ class SteamGateway:
             http_client=http_client,
             bulk_http_client=bulk_http_client,
             bulk_timeout_seconds=bulk_timeout_seconds,
+            price_cache=price_cache,
+            gem_pricing=gem_pricing,
+            booster_pricing=booster_pricing,
+            limiter=limiter,
         )
 
     async def start(self) -> None:
@@ -1537,3 +1810,9 @@ class SteamGateway:
         keys: Iterable[GemKey],
     ) -> GemScanResult:
         return self.steamapis.gem_pricing.read_cached(keys)
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        return self.steamapis.booster_pricing.read_cached(game_app_ids)

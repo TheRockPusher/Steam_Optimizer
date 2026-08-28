@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { clearInventoryCache } from "./inventoryCache";
 
 const privateInventory = {
   status: "private",
@@ -45,8 +46,7 @@ const signedInSession = {
     profile: {
       status: "public",
       message: "Your Steam profile is publicly visible."
-    },
-    inventory: privateInventory
+    }
   }
 };
 
@@ -151,15 +151,6 @@ function publicInventory(
   };
 }
 
-function publicInventorySession(inventory: Record<string, unknown>) {
-  return {
-    ...signedInSession,
-    checks: {
-      ...signedInSession.checks,
-      inventory
-    }
-  };
-}
 
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -168,27 +159,53 @@ function jsonResponse(payload: unknown, status = 200) {
   });
 }
 
-function sessionWithRetry(retryAfterSeconds: number | null) {
+function inventoryWithRetry(retryAfterSeconds: number | null) {
   return {
-    ...signedInSession,
-    checks: {
-      ...signedInSession.checks,
-      inventory: {
-        ...signedInSession.checks.inventory,
-        retry_after_seconds: retryAfterSeconds
-      }
-    }
+    ...privateInventory,
+    retry_after_seconds: retryAfterSeconds
   };
 }
-
-afterEach(() => {
+afterEach(async () => {
+  await clearInventoryCache();
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  window.history.replaceState({}, "", "/");
+});
+
+describe("FAQ", () => {
+  it("renders the dedicated FAQ route without loading a Steam session", () => {
+    window.history.replaceState({}, "", "/faq");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    render(<App />);
+    expect(document.title).toBe("FAQ | Steam Optimizer");
+
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "Steam inventory questions, answered."
+      })
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("navigation", { name: "Primary navigation" }))
+        .getByRole("link", { name: "FAQ" })
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("link", { name: "Steam Optimizer home" })
+    ).toHaveAttribute("href", "/");
+    expect(
+      screen.getByRole("heading", { name: "Can Steam Optimizer change my account?" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "How are gem values calculated?" })
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("App", () => {
-  it("loads the session before offering normal navigation through both official Steam images", async () => {
+  it("loads the session before offering the compact Steam sign-in", async () => {
     let resolveSession!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(
       () =>
@@ -197,11 +214,11 @@ describe("App", () => {
         })
     );
 
-    const { container } = render(<App />);
+    render(<App />);
 
     expect(
-      screen.getByRole("heading", { name: "Checking your connection" })
-    ).toBeInTheDocument();
+      screen.getByRole("region", { name: "Steam session" })
+    ).toHaveTextContent("Checking your Steam session");
     const statusRegion = screen.getByRole("status");
     expect(statusRegion).toHaveTextContent("Checking session");
     expect(
@@ -212,14 +229,10 @@ describe("App", () => {
       resolveSession(jsonResponse({ authenticated: false }));
     });
 
-    expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
-    ).toBeInTheDocument();
+    const loginLink = await screen.findByRole("link", {
+      name: /steam sign-in/i
+    });
     expect(screen.getByRole("status")).toBe(statusRegion);
-
-    const loginLink = screen.getByRole("link", { name: /steam sign-in/i });
     expect(loginLink.closest("header")).toHaveClass("site-header");
     expect(loginLink).toHaveAccessibleName(
       "Steam sign-in; Steam Optimizer is not affiliated with Valve"
@@ -230,13 +243,13 @@ describe("App", () => {
     expect(signInImage.getAttribute("src")).toContain("sits_01.png");
     expect(signInImage).toHaveAttribute("width", "180");
     expect(signInImage).toHaveAttribute("height", "35");
-    const compactSource = container.querySelector("picture source");
-    expect(compactSource?.getAttribute("srcset")).toContain("sits_02.png");
-    expect(compactSource).toHaveAttribute("media", "(max-width: 40rem)");
-    expect(compactSource).toHaveAttribute("width", "109");
-    expect(compactSource).toHaveAttribute("height", "66");
-    expect(screen.getByText(/your password never comes here/i)).toBeInTheDocument();
-    expect(screen.getByText(/cannot trade, sell, craft, or change/i)).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("banner")).getByRole("link", { name: "FAQ" })
+    ).toHaveAttribute("href", "/faq");
+    expect(screen.queryByText("Read-only workspace")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/cannot trade, sell, craft, or change/i)
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /privacy & steam data terms/i })
     ).toHaveAttribute(
@@ -275,37 +288,55 @@ describe("App", () => {
   });
 
   it("renders Steam identity and independent public and private results", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(signedInSession)
-    );
-
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory));
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "Alyx" })
+      await screen.findByLabelText("Connected Steam account: Alyx")
     ).toBeInTheDocument();
     expect(screen.getByText("Steam ID 76561198000000001")).toBeInTheDocument();
 
-    const profileCard = screen.getByRole("article", { name: "Steam profile" });
-    expect(within(profileCard).getByText("Public")).toBeInTheDocument();
-    expect(
-      within(profileCard).getByText("Your Steam profile is publicly visible.")
-    ).toBeInTheDocument();
-
-    const inventoryCard = screen.getByRole("article", {
-      name: "Steam inventory"
+    const profileStatus = screen.getByRole("definition", {
+      name: "Steam profile: Public"
     });
-    expect(within(inventoryCard).getByText("Private")).toBeInTheDocument();
+    expect(profileStatus).toBeInTheDocument();
+
+    const inventoryStatus = screen.getByRole("definition", {
+      name: "Steam inventory: Private"
+    });
+    expect(inventoryStatus).toBeInTheDocument();
+
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(inventoryCard).getByText(
-        "Steam reports that this inventory is private."
-      )
+      within(faq).getByText("Your Steam profile is publicly visible.")
     ).toBeInTheDocument();
     expect(
-      within(inventoryCard).getByRole("link", {
+      within(faq).getByText("Steam reports that this inventory is private.")
+    ).toBeInTheDocument();
+    expect(
+      within(faq).getByRole("link", {
         name: /open Steam privacy settings/i
       })
     ).toHaveAttribute("href", "https://steamcommunity.com/my/edit/settings");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/auth/session",
+      expect.objectContaining({
+        credentials: "include",
+        headers: { Accept: "application/json" }
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/auth/inventory",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST"
+      })
+    );
   });
 
   it("accepts the complete inventory contract and renders exact provider price strings", async () => {
@@ -339,33 +370,38 @@ describe("App", () => {
         price_message: "Current prices were found for every marketable type."
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    expect(
-      await screen.findByRole("heading", { name: "What is in your inventory" })
-    ).toBeInTheDocument();
-    const coverage = screen.getByRole("region", {
-      name: "Current market snapshot"
+    const inventoryRegion = await screen.findByRole("region", {
+      name: "Items and boosters"
     });
-    expect(within(coverage).getByText("Complete pricing")).toBeInTheDocument();
+    const pricingSummary = within(inventoryRegion).getByLabelText(
+      "Inventory pricing summary"
+    );
+    expect(within(pricingSummary).getByText("Items")).toBeInTheDocument();
+    expect(within(pricingSummary).getByText("4")).toBeInTheDocument();
+    expect(within(pricingSummary).getByText("1/1")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(pricingSummary).getByRole("button", {
+        name: "Refresh gem values"
+      })
+    ).toBeDisabled();
+    const faq = screen.getByRole("region", { name: "About these results" });
+    expect(
+      within(faq).getByText(
         "SteamApis price data is available for 1 of 1 marketable item type."
       )
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
-        "SteamApis does not specify the currency for this feed. Values are shown exactly as received, without a currency symbol."
+      within(faq).getByText(
+        "SteamApis does not specify the market feed currency. Values are shown exactly as received, without a currency symbol."
       )
     ).toBeInTheDocument();
-    expect(coverage).not.toHaveTextContent("USD");
-    expect(within(coverage).getByText("Total assets").parentElement).toHaveTextContent(
-      "4"
-    );
+    expect(faq).not.toHaveTextContent("USD");
 
     const inventoryTable = screen.getByRole("table", { name: "Inventory items" });
     const pricedRow = within(inventoryTable)
@@ -519,9 +555,9 @@ describe("App", () => {
         gem_cash_context: validGemCashContext
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -604,9 +640,9 @@ describe("App", () => {
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -712,7 +748,8 @@ describe("App", () => {
       resolveShrink = resolve;
     });
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockImplementationOnce(() => shrinkResponse)
       .mockResolvedValueOnce(
         jsonResponse({
@@ -725,6 +762,8 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -769,6 +808,8 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -829,9 +870,9 @@ describe("App", () => {
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -876,7 +917,7 @@ describe("App", () => {
     ).toBeNull();
   });
 
-  it("renders a game's booster price and cards per booster", async () => {
+  it("renders a game's booster prices, gem cost, and card counts", async () => {
     const inventory = publicInventory([tradingCardItem(1)], {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
@@ -888,6 +929,8 @@ describe("App", () => {
           game_name: "Team Fortress 2",
           market_hash_name: "440-Team Fortress 2 Booster Pack",
           card_count: 3,
+          card_set_size: 8,
+          gem_cost: 750,
           price: {
             currency: null,
             highest_buy: "0.11",
@@ -897,9 +940,9 @@ describe("App", () => {
         }
       ]
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -913,6 +956,10 @@ describe("App", () => {
     });
     expect(within(boosterCard).getByText("0.13")).toBeInTheDocument();
     expect(within(boosterCard).getByText("0.11")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("750", { selector: "dd" })).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("8", { selector: "dd" })).toBeInTheDocument();
     expect(within(boosterCard).getByText("Cards per booster")).toBeInTheDocument();
     expect(within(boosterCard).getByText("3 cards")).toBeInTheDocument();
     expect(
@@ -922,6 +969,39 @@ describe("App", () => {
     expect(
       within(boosterCard).getByText(/Aug 27, 2026/)
     ).toHaveAttribute("datetime", "2026-08-27T00:00:00Z");
+  });
+  it("renders unavailable derived booster values without changing market prices", async () => {
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: validInventoryPrice
+        }
+      ]
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Boosters" }));
+
+    const boosterCard = within(
+      await screen.findByRole("region", { name: "Booster details by game" })
+    ).getByRole("article", { name: "Team Fortress 2" });
+    expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
+    expect(within(boosterCard).getAllByText("Unavailable")).toHaveLength(2);
+    expect(within(boosterCard).getByText("0.20")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("0.10")).toBeInTheDocument();
   });
   it("switches between item and booster result panels with manual keyboard activation", async () => {
     const inventory = publicInventory([tradingCardItem(10)], {
@@ -935,13 +1015,15 @@ describe("App", () => {
           game_name: "Team Fortress 2",
           market_hash_name: "440-Team Fortress 2 Booster Pack",
           card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
           price: validInventoryPrice
         }
       ]
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -1004,9 +1086,9 @@ describe("App", () => {
   });
 
   it("keeps an empty booster view selectable and explains the missing data", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(publicInventory([])))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
 
@@ -1061,17 +1143,14 @@ describe("App", () => {
         observed_at: "2026-08-26T12:00:00Z"
       }
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
-          publicInventory([charlie, alpha, bravo], {
-            total_asset_count: 13,
-            priceable_item_count: 2,
-            priced_item_count: 2
-          })
-        )
-      )
-    );
+    const inventory = publicInventory([charlie, alpha, bravo], {
+      total_asset_count: 13,
+      priceable_item_count: 2,
+      priced_item_count: 2
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -1137,23 +1216,21 @@ describe("App", () => {
   });
 
   it("rejects a malformed nested item", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
-          publicInventory([{ ...inventoryItem(1), quantity: 0 }])
-        )
-      )
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventory([{ ...inventoryItem(1), quantity: 0 }]))
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
 
@@ -1218,29 +1295,28 @@ describe("App", () => {
       marketable: true,
       price
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(
           publicInventory([item], {
             priceable_item_count: 1,
             priced_item_count: 1
           })
         )
-      )
-    );
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
-
   it.each([
     {
       label: "duplicate class and instance rows",
@@ -1343,19 +1419,19 @@ describe("App", () => {
       )
     }
   ])("rejects $label", async ({ inventory }) => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
 
@@ -1383,18 +1459,19 @@ describe("App", () => {
       price_status: "partial",
       price_message: "One marketable type did not have a current order book."
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Current market snapshot"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Partial pricing")).toBeInTheDocument();
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    expect(within(pricingSummary).getByText("1/2")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "SteamApis price data is available for 1 of 2 marketable item types."
       )
     ).toBeInTheDocument();
@@ -1419,26 +1496,27 @@ describe("App", () => {
       price_message:
         "The inventory is public, but current Steam market prices are unavailable."
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Current market snapshot"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Pricing unavailable")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "The inventory is public, but current Steam market prices are unavailable."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("article", { name: "Steam inventory" })
-    ).toHaveTextContent("Public");
+      screen.getByRole("definition", { name: "Steam inventory: Public" })
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("link", { name: /open Steam privacy settings/i })
+      within(faq).queryByRole("link", {
+        name: /open Steam privacy settings/i
+      })
     ).not.toBeInTheDocument();
   });
 
@@ -1446,9 +1524,9 @@ describe("App", () => {
     const items = Array.from({ length: 2001 }, (_, index) =>
       inventoryItem(index + 1)
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(publicInventory(items)))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
 
     render(<App />);
 
@@ -1500,7 +1578,7 @@ describe("App", () => {
     expect(previousButton).toBeEnabled();
   });
 
-  it("clamps the stored inventory page after a recheck shrinks the result", async () => {
+  it("clamps the stored inventory page after an explicit refresh shrinks the result", async () => {
     const initialItems = Array.from({ length: 101 }, (_, index) =>
       inventoryItem(index + 1)
     );
@@ -1512,15 +1590,10 @@ describe("App", () => {
     );
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(initialItems)))
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(shrunkenItems)))
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(grownItems)))
-      );
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(initialItems)))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(shrunkenItems)))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(grownItems)));
 
     render(<App />);
 
@@ -1533,7 +1606,7 @@ describe("App", () => {
     expect(within(inventoryTable).getByText("Item 0101")).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     );
 
     await waitFor(() => {
@@ -1551,7 +1624,7 @@ describe("App", () => {
     ).not.toBeInTheDocument();
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Recheck Steam access" })
+      await screen.findByRole("button", { name: "Refresh inventory" })
     );
 
     await waitFor(() => {
@@ -1568,6 +1641,37 @@ describe("App", () => {
     expect(
       within(refreshedInventoryTable).queryByText("Item 0351")
     ).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("preserves good inventory data and announces an unavailable refresh", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    const failureMessage =
+      "Steam could not provide the inventory right now.";
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...privateInventory,
+          status: "unavailable",
+          message: failureMessage
+        })
+      );
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Items and boosters" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh inventory" })
+    );
+
+    const message =
+      "We could not refresh inventory right now. Your previous inventory results have not changed.";
+    expect(await screen.findByText(message, { selector: ".action-status" }))
+      .toBeInTheDocument();
+    expect(screen.getByText("Item 0001")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
@@ -1597,237 +1701,218 @@ describe("App", () => {
   it.each([undefined, "30", -1, 1.5, Number.MAX_SAFE_INTEGER])(
     "rejects an invalid inventory retry envelope (%j)",
     async (retryAfterSeconds) => {
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        jsonResponse({
-          ...signedInSession,
-          checks: {
-            ...signedInSession.checks,
-            inventory: {
-              ...signedInSession.checks.inventory,
-              retry_after_seconds: retryAfterSeconds
-            }
-          }
-        })
-      );
+      vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse(signedInSession))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...privateInventory,
+            retry_after_seconds: retryAfterSeconds
+          })
+        );
 
       render(<App />);
 
       expect(
-        await screen.findByRole("heading", {
-          name: "Steam connection is unavailable."
+        await screen.findByRole("definition", {
+          name: "Steam inventory: Unavailable"
         })
       ).toBeInTheDocument();
-      expect(
-        screen.queryByRole("heading", { name: signedInSession.user.display_name })
-      ).not.toBeInTheDocument();
     }
   );
 
   it.each([undefined, null, 0, "true"])(
     "rejects an invalid inventory rate-limit marker (%j)",
     async (rateLimited) => {
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        jsonResponse({
-          ...signedInSession,
-          checks: {
-            ...signedInSession.checks,
-            inventory: {
-              ...signedInSession.checks.inventory,
-              rate_limited: rateLimited
-            }
-          }
-        })
-      );
+      vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse(signedInSession))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...privateInventory,
+            rate_limited: rateLimited
+          })
+        );
 
       render(<App />);
 
       expect(
-        await screen.findByRole("heading", {
-          name: "Steam connection is unavailable."
+        await screen.findByRole("definition", {
+          name: "Steam inventory: Unavailable"
         })
       ).toBeInTheDocument();
     }
   );
-
   it("labels an unavailable upstream check separately from privacy", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse({
-        ...signedInSession,
-        checks: {
-          profile: {
-            status: "unavailable",
-            message: "The Steam Web API is not configured."
-          },
-          inventory: {
-            ...signedInSession.checks.inventory,
-            status: "public",
-            message: "Your Steam inventory is publicly accessible.",
-            retry_after_seconds: null,
-            rate_limited: false,
-            gem_status: "complete",
-            gem_message: "No gem-convertible items require gem prices."
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...signedInSession,
+          checks: {
+            profile: {
+              status: "unavailable",
+              message: "The Steam Web API is not configured."
+            }
           }
-        }
-      })
-    );
+        })
+      )
+      .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
-    const profileCard = screen.getByRole("article", { name: "Steam profile" });
-
-    expect(within(profileCard).getByText("Unavailable")).toBeInTheDocument();
+    await screen.findByLabelText("Connected Steam account: Alyx");
+    const profileStatus = screen.getByRole("definition", {
+      name: "Steam profile: Unavailable"
+    });
+    expect(profileStatus).toBeInTheDocument();
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(profileCard).getByText("The Steam Web API is not configured.")
+      within(faq).getByText("The Steam Web API is not configured.")
     ).toBeInTheDocument();
-    expect(within(profileCard).getByText(/not a privacy result/i)).toBeInTheDocument();
-    expect(within(profileCard).queryByText("Private")).not.toBeInTheDocument();
+    expect(within(faq).getByText(/not a privacy result/i)).toBeInTheDocument();
+    expect(profileStatus).not.toHaveTextContent("Private");
   });
 
   it("shows the backend 429 copy and rate-limit guidance instead of privacy guidance", async () => {
     const rateLimitMessage =
       "Steam is temporarily limiting inventory checks. Try again in 30 seconds.";
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse({
-        ...sessionWithRetry(30),
-        checks: {
-          ...sessionWithRetry(30).checks,
-          inventory: {
-            ...signedInSession.checks.inventory,
-            status: "unavailable",
-            message: rateLimitMessage,
-            retry_after_seconds: 30,
-            rate_limited: true
-          }
-        }
-      })
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...privateInventory,
+          status: "unavailable",
+          message: rateLimitMessage,
+          retry_after_seconds: 30,
+          rate_limited: true
+        })
+      );
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
-    const inventoryCard = screen.getByRole("article", {
-      name: "Steam inventory"
+    await screen.findByLabelText("Connected Steam account: Alyx");
+    const inventoryStatus = screen.getByRole("definition", {
+      name: "Steam inventory: Try later"
     });
-    expect(within(inventoryCard).getByText(rateLimitMessage)).toBeInTheDocument();
-    expect(within(inventoryCard).getByText("Try later")).toBeInTheDocument();
+    expect(inventoryStatus).toBeInTheDocument();
+    const faq = screen.getByRole("region", { name: "About these results" });
+    expect(within(faq).getByText(rateLimitMessage)).toBeInTheDocument();
     expect(
-      within(inventoryCard).getByText(
+      within(faq).getByText(
         /Steam is temporarily limiting automated checks/i
       )
-    ).toHaveTextContent(/does not mean your inventory is private/i);
+    ).toHaveTextContent(/does not mean the inventory is private/i);
     expect(
-      within(inventoryCard).queryByRole("link", {
+      within(faq).queryByRole("link", {
         name: /open Steam privacy settings/i
       })
     ).not.toBeInTheDocument();
     expect(
-      within(inventoryCard).queryByText(
-        /Recheck when the service is available/i
-      )
+      within(faq).queryByText(/Recheck when the service is available/i)
     ).not.toBeInTheDocument();
   });
 
   it("applies an authoritative initial cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(3))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(3)));
 
     render(<App />);
     await act(async () => { });
 
-    expect(screen.getByRole("heading", { name: "Alyx" })).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Connected Steam account: Alyx")
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Repeated immediate recheck requests are disabled. Try again in 3s."
+        "Repeated immediate inventory refreshes are disabled. Try again in 3s."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
   });
 
-  it("updates the authoritative cooldown from a recheck response", async () => {
+  it("updates the authoritative cooldown from an inventory refresh response", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(sessionWithRetry(4)));
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(4)));
 
     render(<App />);
     await act(async () => { });
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     );
     await act(async () => { });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(
       screen.getByText(
-        "Repeated immediate recheck requests are disabled. Try again in 4s."
+        "Repeated immediate inventory refreshes are disabled. Try again in 4s."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
   });
-
-  it("guards recheck without fetching during cooldown", async () => {
+  it("guards inventory refresh without fetching during cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(5))
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(5)));
 
     render(<App />);
     await act(async () => { });
 
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
-    expect(recheckButton).toBeDisabled();
+    expect(refreshButton).toBeDisabled();
 
-    recheckButton.removeAttribute("disabled");
-    fireEvent.click(recheckButton);
+    refreshButton.removeAttribute("disabled");
+    fireEvent.click(refreshButton);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("ignores wall-clock jumps while enforcing cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(5))
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(5)));
 
     render(<App />);
     await act(async () => { });
 
     vi.setSystemTime(new Date("2026-08-27T12:00:00Z"));
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
-    recheckButton.removeAttribute("disabled");
-    fireEvent.click(recheckButton);
+    refreshButton.removeAttribute("disabled");
+    fireEvent.click(refreshButton);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
-
-  it("counts down with ceil and enables recheck at the deadline", async () => {
+  it("counts down with ceil and enables refresh at the deadline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(2))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(2)));
 
     render(<App />);
     await act(async () => { });
 
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
     expect(screen.getByText(/Try again in 2s\./i)).toBeInTheDocument();
 
@@ -1835,96 +1920,97 @@ describe("App", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(screen.getByText(/Try again in 1s\./i)).toBeInTheDocument();
-    expect(recheckButton).toBeDisabled();
+    expect(refreshButton).toBeDisabled();
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
     expect(
-      screen.queryByText(/Repeated immediate recheck requests are disabled/i)
+      screen.queryByText(/Repeated immediate inventory refreshes are disabled/i)
     ).not.toBeInTheDocument();
-    expect(recheckButton).toBeEnabled();
+    expect(refreshButton).toBeEnabled();
   });
-
   it("keeps logout available throughout an inventory cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(30))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(30)));
 
     render(<App />);
     await act(async () => { });
 
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "Sign out on this device" })
-    ).toBeEnabled();
+    fireEvent.click(
+      screen.getByLabelText("Connected Steam account: Alyx")
+    );
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
   });
 
-  it("rechecks both access results with credentials and announces both current labels", async () => {
+  it("rechecks profile access separately from cached inventory", async () => {
     const refreshedSession = {
       ...signedInSession,
       checks: {
         profile: {
           status: "private",
           message: "Profile access was checked again."
-        },
-        inventory: {
-          ...signedInSession.checks.inventory,
-          status: "unavailable",
-          message: "Inventory access was checked again.",
-          retry_after_seconds: null,
-          rate_limited: false
         }
       }
     };
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(jsonResponse(refreshedSession));
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Recheck Steam profile" })
     );
 
     await waitFor(() => {
-      expect(screen.getByText("Inventory access was checked again.")).toBeInTheDocument();
+      expect(screen.getByText("Profile access was checked again.")).toBeInTheDocument();
     });
     expect(
-      within(
-        screen.getByRole("article", { name: "Steam inventory" })
-      ).getByText("Unavailable")
+      screen.getByRole("definition", {
+        name: "Steam profile: Private"
+      })
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("definition", {
+        name: "Steam inventory: Private"
+      })
+    ).toBeInTheDocument();
+
     expect(statusRegion).toHaveTextContent(
-      "Recheck complete. Steam profile: Private. Steam inventory: Unavailable."
+      "Profile recheck complete. Steam profile: Private."
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       "/api/auth/session",
       expect.objectContaining({ credentials: "include" })
     );
   });
 
-  it("keeps recheck failures visible and announced without replacing prior results", async () => {
+  it("keeps profile recheck failures visible and announced without replacing prior results", async () => {
     const message =
-      "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
+      "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(new Response(null, { status: 503 }));
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Recheck Steam profile" })
     );
 
     await waitFor(() => {
@@ -1934,9 +2020,9 @@ describe("App", () => {
       screen.getByText(message, { selector: ".action-status" })
     ).toBeInTheDocument();
     expect(
-      within(
-        screen.getByRole("article", { name: "Steam inventory" })
-      ).getByText("Private")
+      screen.getByRole("definition", {
+        name: "Steam inventory: Private"
+      })
     ).toBeInTheDocument();
   });
 
@@ -1989,9 +2075,9 @@ describe("App", () => {
         }
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -2008,11 +2094,15 @@ describe("App", () => {
       "Items (game unavailable)",
       "Other inventory items"
     ]);
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      screen.getByRole("region", { name: "Gem-convertible item values" })
-    ).toHaveTextContent(
-      "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-item replacement-cost estimate."
-    );
+      within(faq).getByText(
+        "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-item replacement-cost estimate."
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(faq).getByRole("link", { name: "How gem values work" })
+    ).toHaveAttribute("href", "/faq#gem-values");
     expect(
       within(screen.getByText("Unknown card").closest("tr") as HTMLElement)
         .getAllByText("Not applicable")
@@ -2092,29 +2182,30 @@ describe("App", () => {
       gem_retry_after_seconds: 30,
       gem_cash_context: null
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Gem-convertible item values"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Partial gem pricing")).toBeInTheDocument();
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    expect(within(pricingSummary).getByText("1/2")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "Gem values are available for 1 of 2 gem-convertible item types."
       )
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText("One gem-convertible group is still pending.")
+      within(faq).getByText("One gem-convertible group is still pending.")
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText(/rate-limiting gem lookups/i)
+      within(faq).getByText(/rate-limiting gem lookups/i)
     ).toHaveTextContent("try again in 30s");
     expect(
-      within(coverage).getByText(/lowest-sell basis/i)
+      within(faq).getByText(/lowest-sell basis/i)
     ).toHaveTextContent(/unknown currency/i);
     const pricedRow = screen.getByText("Card 0001").closest("tr");
     expect(pricedRow).not.toBeNull();
@@ -2139,11 +2230,23 @@ describe("App", () => {
       gem_status: "partial",
       gem_message: "Background gem pricing is still processing gem-convertible item groups.",
       gem_priceable_item_count: 2,
-      gem_priced_item_count: 1
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: validInventoryPrice
+        }
+      ],
     });
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockResolvedValueOnce(
         jsonResponse({
           values: [
@@ -2161,6 +2264,14 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [
+            {
+              game_app_id: "440",
+              card_set_size: 8,
+              gem_cost: 750
+            }
+          ],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -2186,24 +2297,146 @@ describe("App", () => {
       within(screen.getByText("Card 0002").closest("tr") as HTMLElement)
         .getByText("100")
     ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("tab", { name: "Boosters" }));
+    const boosterCard = within(
+      await screen.findByRole("region", { name: "Booster details by game" })
+    ).getByRole("article", { name: "Team Fortress 2" });
+    expect(
+      within(boosterCard).getByText("750", { selector: "dd" })
+    ).toBeInTheDocument();
+    expect(
+      within(boosterCard).getByText("8", { selector: "dd" })
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       "/api/auth/gems",
       expect.objectContaining({
         credentials: "include",
         method: "POST"
       })
     );
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    const request = fetchMock.mock.calls[2][1] as RequestInit;
     expect(JSON.parse(request.body as string)).toEqual({
       groups: [
         { app_id: "440", item_type: 2, border_color: 0 },
         { app_id: "440", item_type: 2, border_color: 1 }
-      ]
+      ],
+      booster_game_app_ids: ["440"]
     });
   });
 
+
+  it.each([
+    { card_set_size: 5, gem_cost: null },
+    { card_set_size: null, gem_cost: 1200 },
+    { card_set_size: 4, gem_cost: 1500 },
+    { card_set_size: 16, gem_cost: 375 },
+    { card_set_size: 5, gem_cost: 1199 },
+    { card_set_size: 5.5, gem_cost: 1091 }
+  ])("rejects malformed booster derivation values %j", async (derivedValues) => {
+    const malformedBooster = {
+      game_app_id: "440",
+      game_name: "Team Fortress 2",
+      market_hash_name: "440-Team Fortress 2 Booster Pack",
+      card_count: 3,
+      ...derivedValues,
+      price: null
+    };
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [malformedBooster]
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("table", { name: "Inventory items" })
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      boosters: [{ game_app_id: "440", card_set_size: 8, gem_cost: 749 }],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [
+        { game_app_id: "440", card_set_size: null, gem_cost: null },
+        { game_app_id: "440", card_set_size: null, gem_cost: null }
+      ],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [{ game_app_id: "999", card_set_size: null, gem_cost: null }],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [{ game_app_id: "440", card_set_size: null, gem_cost: null }],
+      pending_booster_count: -1
+    },
+    {
+      boosters: [{ game_app_id: "440", card_set_size: null, gem_cost: null }],
+      pending_booster_count: undefined
+    }
+  ])("rejects malformed booster refresh envelopes %j", async (refreshFields) => {
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: null
+        }
+      ]
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            {
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
+              gem_yield: 10
+            }
+          ],
+          pending_group_count: 0,
+          ...refreshFields,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh gem values" })
+    );
+    expect(
+      await screen.findAllByText(
+        "We could not refresh cached gem values. Your inventory results have not changed."
+      )
+    ).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
 
   it("rejects gem values without a semantic gem key", async () => {
     const malformedItem = {
@@ -2211,21 +2444,21 @@ describe("App", () => {
       item_type: "badge",
       gem_yield: 1,
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(publicInventory([malformedItem]))
-      )
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventory([malformedItem]))
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
   it("rejects an invalid semantic gem key", async () => {
@@ -2242,15 +2475,15 @@ describe("App", () => {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 0
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
   });
@@ -2281,16 +2514,16 @@ describe("App", () => {
       ...inventoryItem(index + 1),
       item_type: itemType
     }));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(
           publicInventory(items, {
             total_asset_count: items.length,
             unique_item_count: items.length
           })
         )
-      )
-    );
+      );
 
     render(<App />);
 
@@ -2321,9 +2554,9 @@ describe("App", () => {
       total_asset_count: 2,
       unique_item_count: 2
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -2354,9 +2587,9 @@ describe("App", () => {
       item_type: "badge",
       game_name: gameName
     }));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(publicInventory(items)))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
 
     render(<App />);
 
@@ -2407,16 +2640,16 @@ describe("App", () => {
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Gem-convertible item values"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(coverage).toHaveTextContent(
+    expect(faq).toHaveTextContent(
       "Gem values are available for 1 of 2 gem-convertible item types."
     );
     fireEvent.click(
@@ -2456,13 +2689,16 @@ describe("App", () => {
     });
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockResolvedValueOnce(
         jsonResponse({
           values: [
             { app_id: "500", item_type: 4, border_color: 0, gem_yield: 12 }
           ],
           pending_group_count: 1,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -2486,12 +2722,13 @@ describe("App", () => {
     expect(emoticonRow.querySelector(".inventory-gem-value")).toHaveTextContent(
       "Unavailable"
     );
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    const request = fetchMock.mock.calls[2][1] as RequestInit;
     expect(JSON.parse(request.body as string)).toEqual({
       groups: [
         { app_id: "500", item_type: 4, border_color: 0 },
         { app_id: "500", item_type: 5, border_color: 0 }
-      ]
+      ],
+      booster_game_app_ids: []
     });
   });
 
@@ -2508,11 +2745,14 @@ describe("App", () => {
     });
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockResolvedValueOnce(
         jsonResponse({
           values: [],
           pending_group_count: 10_000,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -2521,6 +2761,8 @@ describe("App", () => {
         jsonResponse({
           values: [],
           pending_group_count: 1,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -2532,37 +2774,34 @@ describe("App", () => {
       await screen.findByRole("button", { name: "Refresh gem values" })
     );
     await screen.findByText("Gem values refreshed from the background cache.");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    const firstRequest = fetchMock.mock.calls[1][1] as RequestInit;
-    const secondRequest = fetchMock.mock.calls[2][1] as RequestInit;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const firstRequest = fetchMock.mock.calls[2][1] as RequestInit;
+    const secondRequest = fetchMock.mock.calls[3][1] as RequestInit;
     expect(JSON.parse(firstRequest.body as string).groups).toHaveLength(10_000);
     expect(JSON.parse(secondRequest.body as string).groups).toEqual([
       { app_id: "500", item_type: 10_000, border_color: 0 }
     ]);
   });
-
   it("clears the local session with a credentialed logout POST", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
-
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
-    const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Sign out on this device" })
+      await screen.findByLabelText("Connected Steam account: Alyx")
     );
+    const statusRegion = screen.getByRole("status");
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
+      await screen.findByRole("link", { name: /steam sign-in/i })
     ).toBeInTheDocument();
     expect(screen.getByRole("status")).toBe(statusRegion);
     expect(statusRegion).toHaveTextContent("Signed out successfully.");
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/auth/logout", {
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/auth/logout", {
       credentials: "include",
       method: "POST"
     });
