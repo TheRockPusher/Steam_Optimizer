@@ -21,6 +21,7 @@ from app.cookies import (
     InvalidCookiePurposeError,
     SignedCookieCodec,
 )
+from app.gem_pricing import CardRarity, GemResolution, GemScanResult
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -56,8 +57,12 @@ class UnavailableVerifier:
 class FakeGateway:
     def __init__(self, *, inventory_retry_after_seconds: int | None = None) -> None:
         self.inventory_retry_after_seconds = inventory_retry_after_seconds
+        self.profile_calls = 0
+        self.inventory_calls = 0
+        self.gem_refresh_calls: list[Mapping[tuple[str, CardRarity], None]] = []
 
     async def check_profile(self, steam_id: str) -> ProfileCheck:
+        self.profile_calls += 1
         del steam_id
         return ProfileCheck(
             status="public",
@@ -67,11 +72,30 @@ class FakeGateway:
         )
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
+        self.inventory_calls += 1
         del steam_id
         return InventoryCheck(
             status="private",
             message="inventory private",
             retry_after_seconds=self.inventory_retry_after_seconds,
+        )
+
+    async def refresh_gems(
+        self,
+        groups: Mapping[tuple[str, CardRarity], None],
+    ) -> GemScanResult:
+        self.gem_refresh_calls.append(groups)
+        return GemScanResult(
+            values={
+                key: GemResolution(
+                    item_type=5,
+                    border_color=0 if key[1] == "normal" else 1,
+                    representative_hash="cached",
+                    gem_yield=42,
+                    observed_at="2026-08-28T00:00:00Z",
+                )
+                for key in groups
+            }
         )
 
 
@@ -301,6 +325,84 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
     assert session.headers["cache-control"] == "no-store"
     assert logout.status_code == 204
     assert after_logout.json() == {"authenticated": False}
+
+
+def test_gem_refresh_requires_authenticated_session() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/gems",
+            json={"groups": [{"game_app_id": "440", "card_rarity": "normal"}]},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Steam authentication is required."}
+    assert gateway.gem_refresh_calls == []
+
+
+def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        start = client.get("/api/auth/steam/start", follow_redirects=False)
+        callback = client.get(
+            "/api/auth/steam/callback?"
+            + callback_query(settings, return_to=return_to_from_start(start)),
+            follow_redirects=False,
+        )
+        response = client.post(
+            "/api/auth/gems",
+            json={
+                "groups": [
+                    {"game_app_id": "440", "card_rarity": "normal"},
+                    {"game_app_id": "440", "card_rarity": "foil"},
+                ]
+            },
+        )
+
+    assert callback.status_code == 302
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "values": [
+            {
+                "game_app_id": "440",
+                "card_rarity": "foil",
+                "gem_yield": 42,
+            },
+            {
+                "game_app_id": "440",
+                "card_rarity": "normal",
+                "gem_yield": 42,
+            },
+        ],
+        "pending_group_count": 0,
+        "gem_rate_limited": False,
+        "gem_retry_after_seconds": None,
+    }
+    assert gateway.profile_calls == 0
+    assert gateway.inventory_calls == 0
+    assert gateway.gem_refresh_calls == [
+        {
+            ("440", "normal"): None,
+            ("440", "foil"): None,
+        }
+    ]
 
 
 class FakeResponse:

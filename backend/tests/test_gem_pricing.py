@@ -917,6 +917,22 @@ def test_service_start_initializes_persistent_cache(tmp_path: Path) -> None:
         )
 
 
+def test_cache_only_refresh_never_calls_or_starts_provider() -> None:
+    cached_key: tuple[str, CardRarity] = ("10", "normal")
+    missing_key: tuple[str, CardRarity] = ("20", "foil")
+    cache = GemPriceCache(":memory:")
+    cache.put_positive(*cached_key, resolution_for("Cached"))
+    provider = ScriptedProvider()
+    service = GemPricingService(settings(), cache=cache, provider=provider)
+
+    result = service.read_cached((cached_key, missing_key))
+
+    assert result.values[cached_key].gem_yield == 20
+    assert result.pending_count == 1
+    assert provider.calls == []
+    assert service._worker_task is None
+
+
 def test_service_returns_fresh_and_expired_positive_immediately() -> None:
     key: tuple[str, CardRarity] = ("10", "normal")
     stale_key: tuple[str, CardRarity] = ("20", "foil")

@@ -233,6 +233,13 @@ class SteamGatewayProtocol(Protocol):
         """Fetch and price a Steam inventory."""
         ...
 
+    async def refresh_gems(
+        self,
+        groups: Mapping[tuple[str, CardRarity], None],
+    ) -> GemScanResult:
+        """Read cached gem values without fetching a Steam inventory."""
+        ...
+
 
 def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
@@ -1463,3 +1470,9 @@ class SteamGateway:
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         return await self.steamapis.fetch_inventory(steam_id)
+
+    async def refresh_gems(
+        self,
+        groups: Mapping[tuple[str, CardRarity], None],
+    ) -> GemScanResult:
+        return self.steamapis.gem_pricing.read_cached(groups)

@@ -27,6 +27,8 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   infrastructure or creating, deleting, or replacing it. Derive per-card gem cash estimates from the
   lowest-sell `753-Sack of Gems` price. Let users switch game grouping on or off, and expose sortable
   gem and provider-denominated cash-value columns.
+- Add a signed-in circular gem refresh control that reads completed background-cache values
+  without refetching the Steam profile, inventory, or market feed.
 - Keep the optional Steam Web API profile key server-only.
 - Configure all Railway services and future Railway processes in EU-West
   (`europe-west4-drams3a`).

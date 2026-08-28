@@ -1459,6 +1459,83 @@ describe("App", () => {
       within(pendingRow as HTMLElement).getAllByText("Unavailable")
     ).toHaveLength(2);
   });
+  it("refreshes cached gem values without refetching the inventory", async () => {
+    const normalCard = tradingCardItem(1, {
+      gem_yield: 10,
+      gem_cash_value: null
+    });
+    const foilCard = tradingCardItem(2, {
+      card_rarity: "foil",
+      gem_yield: null,
+      gem_cash_value: null
+    });
+    const inventory = publicInventory([normalCard, foilCard], {
+      gem_status: "partial",
+      gem_message: "Background gem pricing is still processing card groups.",
+      gem_priceable_item_count: 2,
+      gem_priced_item_count: 1
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            {
+              game_app_id: "440",
+              card_rarity: "foil",
+              gem_yield: 100
+            },
+            {
+              game_app_id: "440",
+              card_rarity: "normal",
+              gem_yield: 10
+            }
+          ],
+          pending_group_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    const refresh = await screen.findByRole("button", {
+      name: "Refresh gem values"
+    });
+    expect(refresh).toHaveTextContent("↻");
+    fireEvent.click(refresh);
+
+    expect(
+      await screen.findByText("Gem values refreshed from the background cache.")
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Gem values are available for 2 of 2 trading-card item types."
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Card 0002").closest("tr") as HTMLElement)
+        .getByText("100")
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/auth/gems",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST"
+      })
+    );
+    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    expect(JSON.parse(request.body as string)).toEqual({
+      groups: [
+        { game_app_id: "440", card_rarity: "foil" },
+        { game_app_id: "440", card_rarity: "normal" }
+      ]
+    });
+  });
+
 
   it("rejects card metadata that violates the item-type invariants", async () => {
     const malformedItem = {

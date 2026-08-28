@@ -106,6 +106,22 @@ type SignedInSession = {
 };
 
 type SessionResponse = SignedOutSession | SignedInSession;
+type GemRefreshGroup = {
+  game_app_id: string;
+  card_rarity: CardRarity;
+};
+
+type GemRefreshValue = GemRefreshGroup & {
+  gem_yield: number;
+};
+
+type GemRefreshResponse = {
+  values: GemRefreshValue[];
+  pending_group_count: number;
+  gem_rate_limited: boolean;
+  gem_retry_after_seconds: number | null;
+};
+
 
 type ViewState =
   | { kind: "loading" }
@@ -115,6 +131,7 @@ type ViewState =
 const MILLISECONDS_PER_SECOND = 1000;
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
 const SESSION_URL = `${API_BASE_URL}/api/auth/session`;
+const GEM_REFRESH_URL = `${API_BASE_URL}/api/auth/gems`;
 const LOGOUT_URL = `${API_BASE_URL}/api/auth/logout`;
 const STEAM_LOGIN_URL = `${API_BASE_URL}/api/auth/steam/start`;
 const STEAM_PRIVACY_URL = "https://steamcommunity.com/my/edit/settings";
@@ -550,6 +567,179 @@ function isSessionResponse(value: unknown): value is SessionResponse {
     isInventoryCheck(checks.inventory)
   );
 }
+function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const refresh = value as Partial<GemRefreshResponse>;
+  if (
+    !Array.isArray(refresh.values) ||
+    !isSafeInteger(refresh.pending_group_count, 0) ||
+    typeof refresh.gem_rate_limited !== "boolean" ||
+    typeof refresh.gem_retry_after_seconds === "undefined" ||
+    (refresh.gem_retry_after_seconds !== null &&
+      !isSafeInteger(refresh.gem_retry_after_seconds, 0)) ||
+    (!refresh.gem_rate_limited &&
+      refresh.gem_retry_after_seconds !== null)
+  ) {
+    return false;
+  }
+  const keys = new Set<string>();
+  for (const entry of refresh.values) {
+    if (typeof entry !== "object" || entry === null) {
+      return false;
+    }
+    const candidate = entry as Partial<GemRefreshValue>;
+    if (
+      !isDecimalString(candidate.game_app_id) ||
+      (candidate.card_rarity !== "normal" &&
+        candidate.card_rarity !== "foil") ||
+      !isSafeInteger(candidate.gem_yield, 0)
+    ) {
+      return false;
+    }
+    const key = `${candidate.game_app_id}:${candidate.card_rarity}`;
+    if (keys.has(key)) {
+      return false;
+    }
+    keys.add(key);
+  }
+  return true;
+}
+
+function gemRefreshGroups(items: InventoryItem[]): GemRefreshGroup[] {
+  const groups = new Map<string, GemRefreshGroup>();
+  for (const item of items) {
+    if (
+      item.item_type !== "trading_card" ||
+      item.game_app_id === null ||
+      item.card_rarity === null
+    ) {
+      continue;
+    }
+    const key = `${item.game_app_id}:${item.card_rarity}`;
+    groups.set(key, {
+      game_app_id: item.game_app_id,
+      card_rarity: item.card_rarity
+    });
+  }
+  return [...groups.values()].sort((left, right) => {
+    const appComparison = compareDecimalStrings(
+      left.game_app_id,
+      right.game_app_id
+    );
+    return appComparison === 0
+      ? left.card_rarity.localeCompare(right.card_rarity)
+      : appComparison;
+  });
+}
+
+async function requestGemRefresh(
+  inventory: InventoryCheck
+): Promise<GemRefreshResponse> {
+  const groups = gemRefreshGroups(inventory.items);
+  const response = await fetch(GEM_REFRESH_URL, {
+    body: JSON.stringify({ groups }),
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    method: "POST"
+  });
+  if (!response.ok) {
+    throw new Error("The gem refresh service returned an error.");
+  }
+  const payload: unknown = await response.json();
+  if (!isGemRefreshResponse(payload)) {
+    throw new Error("The gem refresh service returned an invalid response.");
+  }
+  const requestedKeys = new Set(
+    groups.map((group) => `${group.game_app_id}:${group.card_rarity}`)
+  );
+  if (
+    payload.values.length > groups.length ||
+    payload.values.some(
+      (entry) =>
+        !requestedKeys.has(`${entry.game_app_id}:${entry.card_rarity}`)
+    )
+  ) {
+    throw new Error("The gem refresh service returned unrequested values.");
+  }
+  return payload;
+}
+
+function mergeGemRefresh(
+  inventory: InventoryCheck,
+  refresh: GemRefreshResponse
+): InventoryCheck {
+  const yields = new Map<string, number>(
+    refresh.values.map(
+      (entry) =>
+        [`${entry.game_app_id}:${entry.card_rarity}`, entry.gem_yield] as const
+    )
+  );
+  const items = inventory.items.map((item) => {
+    if (
+      item.item_type !== "trading_card" ||
+      item.game_app_id === null ||
+      item.card_rarity === null
+    ) {
+      return item;
+    }
+    const key = `${item.game_app_id}:${item.card_rarity}`;
+    if (!yields.has(key)) {
+      return item;
+    }
+    const gemYield = yields.get(key);
+    if (typeof gemYield !== "number") {
+      return item;
+    }
+    return {
+      ...item,
+      gem_yield: gemYield,
+      gem_cash_value:
+        inventory.gem_cash_context === null
+          ? null
+          : gemCashValueForYield(
+            gemYield,
+            inventory.gem_cash_context.sack_price
+          )
+    };
+  });
+  const gemPriceableCount = items.filter(
+    (item) => item.item_type === "trading_card"
+  ).length;
+  const gemPricedCount = items.filter(
+    (item) =>
+      item.item_type === "trading_card" && item.gem_yield !== null
+  ).length;
+  const gemStatus: GemStatus =
+    gemPriceableCount === 0 || gemPricedCount === gemPriceableCount
+      ? "complete"
+      : gemPricedCount > 0
+        ? "partial"
+        : "unavailable";
+  const gemMessage =
+    gemStatus === "complete"
+      ? gemPriceableCount === 0
+        ? "No trading cards require gem prices."
+        : "Gem prices are current for all trading cards."
+      : refresh.pending_group_count > 0
+        ? "Background gem pricing is still processing uncached card groups."
+        : "Gem prices are unavailable for some trading cards.";
+  return {
+    ...inventory,
+    items,
+    gem_status: gemStatus,
+    gem_message: gemMessage,
+    gem_priceable_item_count: gemPriceableCount,
+    gem_priced_item_count: gemPricedCount,
+    gem_rate_limited: refresh.gem_rate_limited,
+    gem_retry_after_seconds: refresh.gem_retry_after_seconds
+  };
+}
+
 
 async function requestSession(signal?: AbortSignal): Promise<SessionResponse> {
   const response = await fetch(SESSION_URL, {
@@ -1364,7 +1554,17 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   );
 }
 
-function InventoryResults({ inventory }: { inventory: InventoryCheck }) {
+function InventoryResults({
+  inventory,
+  isRefreshingGems,
+  refreshMessage,
+  onRefreshGems
+}: {
+  inventory: InventoryCheck;
+  isRefreshingGems: boolean;
+  refreshMessage: string | null;
+  onRefreshGems: () => void;
+}) {
   const coverageMessage =
     inventory.priceable_item_count === 0
       ? "No marketable item types require a price lookup."
@@ -1453,16 +1653,37 @@ function InventoryResults({ inventory }: { inventory: InventoryCheck }) {
             <p className="section-label">Gem coverage</p>
             <h3 id="gem-coverage-title">Trading-card gem values</h3>
           </div>
-          <p
-            className={`gem-status gem-status-${inventory.gem_status}`}
-          >
-            <span className="status-dot" aria-hidden="true" />
-            {GEM_STATUS_LABELS[inventory.gem_status]}
-          </p>
+          <div className="gem-coverage-actions">
+            <p
+              className={`gem-status gem-status-${inventory.gem_status}`}
+            >
+              <span className="status-dot" aria-hidden="true" />
+              {GEM_STATUS_LABELS[inventory.gem_status]}
+            </p>
+            <button
+              className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
+              type="button"
+              onClick={onRefreshGems}
+              disabled={
+                isRefreshingGems || inventory.gem_priceable_item_count === 0
+              }
+              aria-label={
+                isRefreshingGems
+                  ? "Refreshing gem values"
+                  : "Refresh gem values"
+              }
+              title="Refresh cached gem values"
+            >
+              <span aria-hidden="true">↻</span>
+            </button>
+          </div>
         </div>
         <p className="gem-coverage-copy">{gemCoverageMessage}</p>
         {inventory.gem_message.trim().length > 0 && (
           <p className="gem-message">{inventory.gem_message}</p>
+        )}
+        {refreshMessage !== null && (
+          <p className="gem-message gem-refresh-message">{refreshMessage}</p>
         )}
         {inventory.gem_rate_limited && (
           <p className="gem-message gem-rate-limit-message">
@@ -1535,22 +1756,31 @@ function InventoryResults({ inventory }: { inventory: InventoryCheck }) {
 function SignedInView({
   session,
   isRechecking,
+  isRefreshingGems,
   isSigningOut,
   retryAfterSeconds,
   actionMessage,
+  gemRefreshMessage,
   onRecheck,
+  onRefreshGems,
   onLogout
 }: {
   session: SignedInSession;
   isRechecking: boolean;
+  isRefreshingGems: boolean;
   isSigningOut: boolean;
   retryAfterSeconds: number;
   actionMessage: string | null;
+  gemRefreshMessage: string | null;
   onRecheck: () => void;
+  onRefreshGems: () => void;
   onLogout: () => void;
 }) {
   const isRecheckDisabled =
-    isRechecking || isSigningOut || retryAfterSeconds > 0;
+    isRechecking ||
+    isRefreshingGems ||
+    isSigningOut ||
+    retryAfterSeconds > 0;
 
   return (
     <section className="account-view" aria-labelledby="account-title">
@@ -1572,7 +1802,7 @@ function SignedInView({
             className="text-action"
             type="button"
             onClick={onLogout}
-            disabled={isSigningOut || isRechecking}
+            disabled={isSigningOut || isRechecking || isRefreshingGems}
           >
             {isSigningOut ? "Signing out…" : "Sign out on this device"}
           </button>
@@ -1609,7 +1839,12 @@ function SignedInView({
       </div>
 
       {session.checks.inventory.status === "public" && (
-        <InventoryResults inventory={session.checks.inventory} />
+        <InventoryResults
+          inventory={session.checks.inventory}
+          isRefreshingGems={isRefreshingGems}
+          refreshMessage={gemRefreshMessage}
+          onRefreshGems={onRefreshGems}
+        />
       )}
     </section>
   );
@@ -1618,13 +1853,16 @@ function SignedInView({
 export function App() {
   const [viewState, setViewState] = useState<ViewState>({ kind: "loading" });
   const [isRechecking, setIsRechecking] = useState(false);
+  const [isRefreshingGems, setIsRefreshingGems] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [retryDeadlineMs, setRetryDeadlineMs] = useState<number | null>(null);
   const [countdownNowMs, setCountdownNowMs] = useState(() => performance.now());
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [gemRefreshMessage, setGemRefreshMessage] = useState<string | null>(null);
   const [statusAnnouncement, setStatusAnnouncement] = useState("Checking session…");
   const retryDeadlineRef = useRef<number | null>(null);
   const recheckInFlightRef = useRef(false);
+  const gemRefreshInFlightRef = useRef(false);
   const retryAfterSeconds = secondsUntilDeadline(
     retryDeadlineMs,
     countdownNowMs
@@ -1707,6 +1945,7 @@ export function App() {
   async function handleRecheck() {
     if (
       recheckInFlightRef.current ||
+      gemRefreshInFlightRef.current ||
       isSigningOut ||
       secondsUntilDeadline(retryDeadlineRef.current, performance.now()) > 0
     ) {
@@ -1716,6 +1955,7 @@ export function App() {
     recheckInFlightRef.current = true;
     setIsRechecking(true);
     setActionMessage(null);
+    setGemRefreshMessage(null);
     setStatusAnnouncement("Rechecking profile and inventory access…");
 
     try {
@@ -1736,10 +1976,69 @@ export function App() {
       setIsRechecking(false);
     }
   }
+  async function handleGemRefresh() {
+    if (
+      gemRefreshInFlightRef.current ||
+      recheckInFlightRef.current ||
+      isSigningOut ||
+      viewState.kind !== "signed-in" ||
+      viewState.session.checks.inventory.status !== "public"
+    ) {
+      return;
+    }
+    const inventory = viewState.session.checks.inventory;
+    if (gemRefreshGroups(inventory.items).length === 0) {
+      return;
+    }
+
+    gemRefreshInFlightRef.current = true;
+    setIsRefreshingGems(true);
+    setGemRefreshMessage(null);
+    setStatusAnnouncement("Refreshing cached gem values…");
+
+    try {
+      const refresh = await requestGemRefresh(inventory);
+      const mergedInventory = mergeGemRefresh(inventory, refresh);
+      setViewState((current) =>
+        current.kind === "signed-in"
+          ? {
+            kind: "signed-in",
+            session: {
+              ...current.session,
+              checks: {
+                ...current.session.checks,
+                inventory: mergeGemRefresh(
+                  current.session.checks.inventory,
+                  refresh
+                )
+              }
+            }
+          }
+          : current
+      );
+      setGemRefreshMessage("Gem values refreshed from the background cache.");
+      setStatusAnnouncement(
+        `Gem refresh complete. ${mergedInventory.gem_priced_item_count} of ${mergedInventory.gem_priceable_item_count} trading-card item types have gem values.`
+      );
+    } catch {
+      const message =
+        "We could not refresh cached gem values. Your inventory results have not changed.";
+      setGemRefreshMessage(message);
+      setStatusAnnouncement(message);
+    } finally {
+      gemRefreshInFlightRef.current = false;
+      setIsRefreshingGems(false);
+    }
+  }
+
 
   async function handleLogout() {
+    if (gemRefreshInFlightRef.current) {
+      return;
+    }
     setIsSigningOut(true);
     setActionMessage(null);
+    setGemRefreshMessage(null);
     setStatusAnnouncement("Signing out…");
 
     try {
@@ -1830,10 +2129,13 @@ export function App() {
           <SignedInView
             session={viewState.session}
             isRechecking={isRechecking}
+            isRefreshingGems={isRefreshingGems}
             isSigningOut={isSigningOut}
             retryAfterSeconds={retryAfterSeconds}
             actionMessage={actionMessage}
+            gemRefreshMessage={gemRefreshMessage}
             onRecheck={() => void handleRecheck()}
+            onRefreshGems={() => void handleGemRefresh()}
             onLogout={() => void handleLogout()}
           />
         )}

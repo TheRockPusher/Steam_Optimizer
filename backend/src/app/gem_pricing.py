@@ -1448,6 +1448,40 @@ class GemPricingService:
             return False, None
         return True, max(1, math.ceil(remaining))
 
+    def read_cached(
+        self,
+        keys: Iterable[tuple[str, CardRarity]],
+    ) -> GemScanResult:
+        """Read completed warmer results without scheduling provider work."""
+        unique_keys = tuple(dict.fromkeys(keys))
+        cached_entries = self.cache.get_many(unique_keys)
+        values: dict[tuple[str, CardRarity], GemResolution] = {}
+        used_stale_cache = False
+        for key in unique_keys:
+            cached = cached_entries.get(key)
+            if cached is None:
+                continue
+            resolution = cached.resolution()
+            if resolution is None:
+                continue
+            values[key] = resolution
+            used_stale_cache = used_stale_cache or cached.expired
+        rate_limited, retry_after_seconds = self._rate_limit_status()
+        _LOGGER.info(
+            "gem cache refresh requested=%d cached=%d missing=%d rate_limited=%s",
+            len(unique_keys),
+            len(values),
+            len(unique_keys) - len(values),
+            rate_limited,
+        )
+        return GemScanResult(
+            values=values,
+            pending_count=len(unique_keys) - len(values),
+            rate_limited=rate_limited,
+            retry_after_seconds=retry_after_seconds,
+            used_stale_cache=used_stale_cache,
+        )
+
     async def resolve(
         self,
         groups: Mapping[tuple[str, CardRarity], str | None],

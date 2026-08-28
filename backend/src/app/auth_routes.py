@@ -12,9 +12,9 @@ if TYPE_CHECKING:
     from app.steam_gateway import SteamGatewayProtocol
     from app.steam_openid import SteamOpenIDVerifier
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
 from app.steam_gateway import InventoryCheck, ProfileCheck
@@ -29,6 +29,10 @@ from app.steam_openid import (
 
 STATE_PURPOSE = "login-state"
 SESSION_PURPOSE = "session"
+MAX_GEM_REFRESH_GROUPS = 10_000
+_DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
+_AUTHENTICATION_REQUIRED_MESSAGE = "Steam authentication is required."
+_GEM_REFRESH_UNAVAILABLE_MESSAGE = "Gem value refresh is unavailable."
 
 Clock = Callable[[], datetime]
 
@@ -67,6 +71,37 @@ SessionResponse = Annotated[
     AuthenticatedSessionResponse | UnauthenticatedSessionResponse,
     Field(discriminator="authenticated"),
 ]
+
+
+class GemRefreshGroup(BaseModel):
+    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
+    card_rarity: Literal["normal", "foil"]
+
+
+class GemRefreshRequest(BaseModel):
+    groups: list[GemRefreshGroup] = Field(max_length=MAX_GEM_REFRESH_GROUPS)
+
+    @model_validator(mode="after")
+    def require_unique_groups(self) -> GemRefreshRequest:
+        keys = {(group.game_app_id, group.card_rarity) for group in self.groups}
+        if len(keys) != len(self.groups):
+            raise ValueError(_DUPLICATE_GEM_REFRESH_GROUP_ERROR)
+        return self
+
+
+class GemRefreshValue(GemRefreshGroup):
+    gem_yield: int = Field(ge=0)
+
+
+class GemRefreshResponse(BaseModel):
+    values: list[GemRefreshValue]
+    pending_group_count: int = Field(ge=0)
+    gem_rate_limited: bool
+    gem_retry_after_seconds: int | None = Field(
+        default=None,
+        ge=0,
+        le=900,
+    )
 
 
 def _utc_now() -> datetime:
@@ -357,6 +392,70 @@ def create_auth_router(
             else _unavailable_inventory()
         )
         return _session_response(steam_id, profile, inventory)
+
+    @router.post(
+        "/api/auth/gems",
+        response_model=GemRefreshResponse,
+        responses={
+            401: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    async def refresh_gems(
+        payload: GemRefreshRequest,
+        request: Request,
+        response: Response,
+    ) -> GemRefreshResponse:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+            )
+        try:
+            _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+            ) from error
+        groups = {
+            (group.game_app_id, group.card_rarity): None for group in payload.groups
+        }
+        try:
+            scan = await steam_gateway.refresh_gems(groups)
+        except (
+            AttributeError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+            ArithmeticError,
+            RuntimeError,
+        ) as error:
+            raise HTTPException(
+                status_code=503,
+                detail=_GEM_REFRESH_UNAVAILABLE_MESSAGE,
+            ) from error
+        return GemRefreshResponse(
+            values=[
+                GemRefreshValue(
+                    game_app_id=key[0],
+                    card_rarity=key[1],
+                    gem_yield=resolution.gem_yield,
+                )
+                for key, resolution in sorted(scan.values.items())
+            ],
+            pending_group_count=scan.pending_count,
+            gem_rate_limited=scan.rate_limited,
+            gem_retry_after_seconds=scan.retry_after_seconds,
+        )
 
     @router.post("/api/auth/logout", status_code=204)
     async def auth_logout() -> Response:
