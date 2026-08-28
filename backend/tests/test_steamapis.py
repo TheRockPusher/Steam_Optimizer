@@ -168,9 +168,7 @@ class FixedGemPricing:
         self.values = values
         self.groups: dict[GemKey, str | None] | None = None
 
-    async def resolve(
-        self, groups: Mapping[GemKey, str | None]
-    ) -> GemScanResult:
+    async def resolve(self, groups: Mapping[GemKey, str | None]) -> GemScanResult:
         self.groups = dict(groups)
         return GemScanResult(values=self.values)
 
@@ -242,6 +240,7 @@ def item_description(
     tags: list[dict[str, object]] | None = None,
     owner_actions: list[dict[str, object]] | None = None,
     actions: list[dict[str, object]] | None = None,
+    market_bucket_id: object = None,
 ) -> dict[str, object]:
     description: dict[str, object] = {
         "classid": class_id,
@@ -258,11 +257,15 @@ def item_description(
         description["owner_actions"] = owner_actions
     if actions is not None:
         description["actions"] = actions
+    if market_bucket_id is not None:
+        description["market_bucket_id"] = market_bucket_id
     return description
 
 
 def trading_card_tags(
-    app_id: str = "440", game_name: str = "Team Fortress 2"
+    app_id: str = "440",
+    game_name: str = "Team Fortress 2",
+    border_color: int = 0,
 ) -> list[dict[str, object]]:
     return [
         {"category": "item_class", "internal_name": "item_class_2"},
@@ -271,7 +274,7 @@ def trading_card_tags(
             "internal_name": f"app_{app_id}",
             "localized_tag_name": game_name,
         },
-        {"category": "cardborder", "internal_name": "cardborder_0"},
+        {"category": "cardborder", "internal_name": f"cardborder_{border_color}"},
     ]
 
 
@@ -428,62 +431,96 @@ def test_keyed_backgrounds_and_emoticons_use_exact_gem_keys() -> None:
     assert parsed.descriptions[1].gem_key == emoticon_key
 
 
-def test_provider_actions_alias_resolves_exact_keys_through_gem_values() -> None:
-    card_key = GemKey(app_id="440", item_type=2, border_color=0)
-    background_key = GemKey(app_id="440", item_type=501, border_color=0)
-    emoticon_key = GemKey(app_id="440", item_type=502, border_color=1)
-    descriptions = [
-        item_description(
+def test_live_provider_market_buckets_resolve_exact_gem_values() -> None:
+    cases: list[
+        tuple[
+            str,
+            str,
+            list[dict[str, object]],
+            str,
+            GemKey,
+            int,
+            int,
+            str,
+        ]
+    ] = [
+        (
             "1",
-            "Trading Card",
-            market_hash_name="440-Trading Card",
-            tags=trading_card_tags(),
-            actions=goo_owner_actions(
-                app_id="440", item_type=2, border_color=0
-            ),
+            "Normal Card",
+            trading_card_tags(app_id="620", game_name="Portal 2"),
+            "B620-5",
+            GemKey(app_id="620", item_type=5, border_color=0),
+            100,
+            2,
+            "0.02",
         ),
-        item_description(
+        (
             "2",
-            "Background",
-            market_hash_name="440-Background",
-            tags=[
-                {"category": "item_class", "internal_name": "item_class_3"},
-            ],
-            actions=goo_owner_actions(
-                app_id="440", item_type=501, border_color=0
+            "Foil Card",
+            trading_card_tags(
+                app_id="278100",
+                game_name="RIVE",
+                border_color=1,
             ),
+            "B278100-5-1",
+            GemKey(app_id="278100", item_type=5, border_color=1),
+            150,
+            1,
+            "0.03",
         ),
-        item_description(
+        (
             "3",
-            "Emoticon",
-            market_hash_name="440-Emoticon",
-            tags=[
-                {"category": "item_class", "internal_name": "item_class_4"},
+            "Background",
+            [
+                {"category": "item_class", "internal_name": "item_class_3"},
+                {"category": "Game", "internal_name": "app_730"},
             ],
-            actions=goo_owner_actions(
-                app_id="440", item_type=502, border_color=1
-            ),
+            "B730-18",
+            GemKey(app_id="730", item_type=18, border_color=0),
+            200,
+            3,
+            "0.04",
+        ),
+        (
+            "4",
+            "Emoticon",
+            [
+                {"category": "item_class", "internal_name": "item_class_4"},
+                {"category": "Game", "internal_name": "app_730"},
+            ],
+            "B730-14",
+            GemKey(app_id="730", item_type=14, border_color=0),
+            300,
+            4,
+            "0.06",
         ),
     ]
+    descriptions = [
+        item_description(
+            class_id,
+            name,
+            market_hash_name=f"{key.app_id}-{name}",
+            tags=tags,
+            actions=[
+                {
+                    "name": "View Full Size",
+                    "link": "https://shared.steamstatic.com/background.jpg",
+                }
+            ]
+            if name == "Background"
+            else None,
+            market_bucket_id=market_bucket_id,
+        )
+        for class_id, name, tags, market_bucket_id, key, _, _, _ in cases
+    ]
     resolutions = {
-        card_key: GemResolution(
-            key=card_key,
-            representative_hash="440-Trading Card",
-            gem_yield=100,
+        key: GemResolution(
+            key=key,
+            representative_hash=f"{key.app_id}-{name}",
+            gem_yield=gem_yield,
             observed_at="2026-08-28T00:00:00Z",
-        ),
-        background_key: GemResolution(
-            key=background_key,
-            representative_hash="440-Background",
-            gem_yield=200,
-            observed_at="2026-08-28T00:00:00Z",
-        ),
-        emoticon_key: GemResolution(
-            key=emoticon_key,
-            representative_hash="440-Emoticon",
-            gem_yield=300,
-            observed_at="2026-08-28T00:00:00Z",
-        ),
+        )
+        for _, name, _, _, key, gem_yield, _, _ in cases
     }
     gem_pricing = FixedGemPricing(resolutions)
     client = FakeHTTPClient(
@@ -491,12 +528,9 @@ def test_provider_actions_alias_resolves_exact_keys_through_gem_values() -> None
             FakeResponse(
                 200,
                 page(
-                    wrapped=True,
-                    success=True,
                     assets=[
-                        item_asset("1", amount="2"),
-                        item_asset("2", amount="3"),
-                        item_asset("3", amount="4"),
+                        item_asset(class_id, amount=str(quantity))
+                        for class_id, _, _, _, _, _, quantity, _ in cases
                     ],
                     descriptions=descriptions,
                 ),
@@ -518,39 +552,25 @@ def test_provider_actions_alias_resolves_exact_keys_through_gem_values() -> None
     result = run(steamapis.fetch_inventory("42"))
 
     assert gem_pricing.groups == {
-        card_key: "440-Trading Card",
-        background_key: "440-Background",
-        emoticon_key: "440-Emoticon",
+        key: f"{key.app_id}-{name}" for _, name, _, _, key, _, _, _ in cases
     }
-    assert result.total_asset_count == 9
-    assert result.unique_item_count == 3
+    assert result.total_asset_count == 10
+    assert result.unique_item_count == 4
     assert result.gem_status == "complete"
-    assert result.gem_priceable_item_count == 3
-    assert result.gem_priced_item_count == 3
+    assert result.gem_priceable_item_count == 4
+    assert result.gem_priced_item_count == 4
     by_name = {item.name: item for item in result.items}
-    assert by_name["Trading Card"].gem_key == card_key
-    assert by_name["Trading Card"].gem_yield == 100
-    assert by_name["Trading Card"].gem_cash_value == "0.02"
-    assert by_name["Background"].gem_key == background_key
-    assert by_name["Background"].gem_yield == 200
-    assert by_name["Background"].gem_cash_value == "0.04"
-    assert by_name["Emoticon"].gem_key == emoticon_key
-    assert by_name["Emoticon"].gem_yield == 300
-    assert by_name["Emoticon"].gem_cash_value == "0.06"
+    for _, name, _, _, key, gem_yield, _, gem_cash_value in cases:
+        assert by_name[name].gem_key == key
+        assert by_name[name].gem_yield == gem_yield
+        assert by_name[name].gem_cash_value == gem_cash_value
 
 
 @pytest.mark.parametrize(
     "actions",
     [
         goo_owner_actions(app_id="440", item_type=502, border_color=1),
-        [
-            {
-                "link": (
-                    "javascript:GetGooValue('%contextid%', '%assetid%', "
-                    "440, 501)"
-                )
-            }
-        ],
+        [{"link": ("javascript:GetGooValue('%contextid%', '%assetid%', 440, 501)")}],
         {"link": "javascript:GetGooValue('%contextid%', '%assetid%', 440, 501)"},
     ],
     ids=("conflicting-keys", "malformed-goo-tuple", "malformed-alias"),
@@ -562,9 +582,8 @@ def test_inventory_dual_action_aliases_fail_closed(actions: object) -> None:
         tags=[
             {"category": "item_class", "internal_name": "item_class_3"},
         ],
-        owner_actions=goo_owner_actions(
-            app_id="440", item_type=501, border_color=0
-        ),
+        owner_actions=goo_owner_actions(app_id="440", item_type=501, border_color=0),
+        market_bucket_id="B440-501",
     )
     description["actions"] = actions
 

@@ -134,6 +134,16 @@ _ITEM_CLASS_TYPES: dict[int, ItemType] = {
     16: "steam_deck_keyboard_skin",
     17: "steam_deck_startup_movie",
 }
+# SteamApis v2 omits owner_actions but exposes the same exact Goo identity as
+# B{app_id}-{item_type} for normal items and B{app_id}-{item_type}-1 for foils.
+_GEM_CONVERTIBLE_ITEM_TYPES: frozenset[ItemType] = frozenset(
+    ("trading_card", "profile_background", "emoticon")
+)
+_MARKET_BUCKET_ID = re.compile(
+    r"B([0-9]+)-([0-9]+)(?:-([01]))?",
+    re.IGNORECASE,
+)
+
 
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 _APP_TAG = re.compile(r"app_([0-9]+)")
@@ -193,6 +203,12 @@ class GemKey:
             or self.border_color not in (0, 1)
         ):
             raise ValueError(_GEM_KEY_BORDER_COLOR_ERROR)
+
+
+@dataclass(frozen=True, slots=True)
+class _GemKeyParse:
+    key: GemKey | None = None
+    valid: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,9 +454,11 @@ def parse_get_goo_value_action(action: object) -> GemKey | None:
         return None
 
 
-def _parse_owner_actions(owner_actions: object) -> GemKey | None:
+def _parse_owner_actions(owner_actions: object) -> _GemKeyParse:
+    if owner_actions is None:
+        return _GemKeyParse()
     if not isinstance(owner_actions, list):
-        return None
+        return _GemKeyParse(valid=False)
     candidates: list[GemKey] = []
     malformed = False
     for raw_action in owner_actions:
@@ -455,20 +473,84 @@ def _parse_owner_actions(owner_actions: object) -> GemKey | None:
             malformed = True
         else:
             candidates.append(key)
-    if malformed:
-        return None
     unique = tuple(dict.fromkeys(candidates))
-    return unique[0] if len(unique) == 1 else None
+    if malformed or len(unique) > 1:
+        return _GemKeyParse(valid=False)
+    return _GemKeyParse(key=unique[0] if unique else None)
 
 
-def parse_item_metadata(tags: object, owner_actions: object) -> ItemMetadata:
+def _parse_market_bucket_id(value: object) -> _GemKeyParse:
+    if value is None:
+        return _GemKeyParse()
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_GEM_LISTING_SCALAR_LENGTH
+    ):
+        return _GemKeyParse(valid=False)
+    match = _MARKET_BUCKET_ID.fullmatch(value)
+    if match is None:
+        return _GemKeyParse(valid=False)
+    app_text, item_text, border_text = match.groups()
+    if len(app_text) > MAX_GEM_APP_ID_LENGTH or len(item_text) > len(
+        str(MAX_GEM_ITEM_TYPE)
+    ):
+        return _GemKeyParse(valid=False)
+    app_id = _canonical_app_id(app_text)
+    if (
+        app_id is None
+        or app_id != app_text
+        or (len(item_text) > 1 and item_text.startswith("0"))
+    ):
+        return _GemKeyParse(valid=False)
+    try:
+        return _GemKeyParse(
+            key=GemKey(
+                app_id=app_id,
+                item_type=int(item_text),
+                border_color=1 if border_text == "1" else 0,
+            )
+        )
+    except (TypeError, ValueError):
+        return _GemKeyParse(valid=False)
+
+
+def _gem_key_from_metadata(
+    item_type: ItemType,
+    owner_actions: object,
+    market_bucket_id: object,
+) -> GemKey | None:
+    parsed_actions = _parse_owner_actions(owner_actions)
+    parsed_bucket = (
+        _parse_market_bucket_id(market_bucket_id)
+        if item_type in _GEM_CONVERTIBLE_ITEM_TYPES
+        else _GemKeyParse()
+    )
+    if not parsed_actions.valid or not parsed_bucket.valid:
+        return None
+    if parsed_actions.key is None:
+        return parsed_bucket.key
+    if parsed_bucket.key is None or parsed_bucket.key == parsed_actions.key:
+        return parsed_actions.key
+    return None
+
+
+def parse_item_metadata(
+    tags: object,
+    owner_actions: object,
+    market_bucket_id: object,
+) -> ItemMetadata:
     """Parse inventory metadata and an independently validated gem key."""
 
     item_type = _item_type_from_tags(tags)
     if not isinstance(tags, list):
         return ItemMetadata(
             item_type=item_type,
-            gem_key=_parse_owner_actions(owner_actions),
+            gem_key=_gem_key_from_metadata(
+                item_type,
+                owner_actions,
+                market_bucket_id,
+            ),
         )
 
     app_candidates: list[str] = []
@@ -541,7 +623,11 @@ def parse_item_metadata(tags: object, owner_actions: object) -> ItemMetadata:
         game_name=game_name,
         rarity=rarity,
         card_border=card_border,
-        gem_key=_parse_owner_actions(owner_actions),
+        gem_key=_gem_key_from_metadata(
+            item_type,
+            owner_actions,
+            market_bucket_id,
+        ),
     )
 
 
