@@ -78,9 +78,14 @@ but not all priceable rows are priced, and `unavailable` when zero priceable row
 the provider is unavailable. Unavailable prices remain unpriced. SteamApis omits currency metadata from
 its bulk feed. Order-book values are preserved exactly as provider-denominated decimals and displayed
 without a currency symbol. Optimization must not treat them as monetary values until an authoritative
-currency contract or explicit configuration exists. Inventory and prices are fetched on request; the
-current deployment has no inventory/price cache or database. Railway services run in
-EU-West (`europe-west4-drams3a`).
+currency contract or explicit configuration exists.
+Inventory and market payloads are fetched on request and never persisted. Only validated semantic
+gem-yield cache rows persist in a versioned SQLite database on the attached `backend-data` Railway
+volume, mounted at `/data` with `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Uncached or expired
+gem-yield entries warm in one background worker while cached positive values return immediately.
+Ordinary restarts and redeploys preserve cache rows; only an explicit `CACHE_SCHEMA_VERSION` change or
+an incompatible/corrupt database resets them. Railway services run in exact EU-West region
+`europe-west4-drams3a`.
 
 Steam handles passwords and Steam Guard. Steam Optimizer receives only the verified SteamID64,
 creates its own local session, and sends that identifier to upstream providers for requested data.
@@ -119,7 +124,11 @@ For separate Railway frontend and backend services in EU-West (`europe-west4-dra
   enables SteamApis v2 inventory retrieval and current bulk AppID 753 prices.
 
 Each service has its own Dockerfile. Infrastructure is managed separately with the current
-`.railway/railway.ts`; the release workflow deploys source code but does not apply infrastructure.
+`.railway/railway.ts`, which retains one backend replica and attaches the `backend-data` volume in
+exact EU-West region `europe-west4-drams3a` at `/data`; it intentionally leaves volume size
+unspecified so an existing manually-created volume is not resized or replaced. The release workflow
+deploys source code with `railway up` and does not apply infrastructure or create, delete, or replace
+the attached volume.
 
 ### Production release deployment
 
@@ -231,9 +240,11 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   100,000-call daily term in
   [Valve's API terms](https://steamcommunity.com/dev/apiterms) describes the Web API, not a
   documented quota for SteamApis.
-- Deployment caveat: both Railway services run in EU-West (`europe-west4-drams3a`), and all future
-  Railway processes must use that same region. The current implementation has no inventory/price
-  cache or database.
+- Deployment caveat: both Railway services run in exact EU-West region `europe-west4-drams3a`. The
+  backend attaches the `backend-data` volume at `/data` and uses the literal
+  `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`; source-only `railway up` releases preserve that
+  volume rather than creating, deleting, or replacing it. Inventory and market payloads remain
+  request-only; only validated semantic gem-yield cache rows persist.
 
 ### Privacy and Steam Data Policy
 
@@ -246,10 +257,12 @@ was last updated on 2026-08-27.
   Steam Guard code is received or stored. The signed, HTTP-only session cookie contains the
   SteamID64 on the user's device for up to 24 hours by default; it is sent to the Railway-hosted
   backend on session requests and cleared by logout or expiry.
-- SteamApis inventory and price state: each requested check retrieves the complete public AppID
+  Each requested check retrieves the complete public AppID
   753/context 6 inventory through provider pagination and reads a current bulk AppID 753 price
-  snapshot. Results are joined in process memory for the response; no inventory or price payload is
-  cached or persisted in a database. Price coverage is `complete` when all priceable rows are
+  snapshot. Results are joined in process memory for the response; inventory and market price payloads
+  are not cached or persisted. Only validated semantic gem-yield cache rows persist in the versioned
+  SQLite cache; ordinary restarts and redeploys preserve rows, with reset limited to an explicit
+  `CACHE_SCHEMA_VERSION` change or an incompatible/corrupt database. Price coverage is `complete` when
   priced, `partial` when some but not all priceable rows are priced, and `unavailable` when zero
   priceable rows are priced or the provider is unavailable. Null prices remain visible as such. The
   SteamApis omits currency metadata from its bulk feed. Order-book values are preserved exactly as

@@ -1,6 +1,44 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
+
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app import main as main_module
+from app.main import app, create_app
+from app.settings import Settings
+from app.steam_gateway import InventoryCheck, ProfileCheck
+
+
+class LifecycleGateway:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def start(self) -> None:
+        self.events.append("gateway-start")
+
+    async def stop(self) -> None:
+        self.events.append("gateway-stop")
+
+    async def check_profile(self, steam_id: str) -> ProfileCheck:
+        del steam_id
+        return ProfileCheck(status="unavailable", message="unused")
+
+    async def check_inventory(self, steam_id: str) -> InventoryCheck:
+        del steam_id
+        return InventoryCheck(status="unavailable", message="unused")
+
+
+class LifecycleHttpClient:
+    def __init__(self, events: list[str], **kwargs: object) -> None:
+        del kwargs
+        self.events = events
+
+    async def aclose(self) -> None:
+        self.events.append("client-close")
 
 
 def test_health_endpoint_returns_ok() -> None:
@@ -8,3 +46,26 @@ def test_health_endpoint_returns_ok() -> None:
         response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_lifespan_stops_gateway_before_clients_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    gateway = LifecycleGateway(events)
+    monkeypatch.setattr(
+        main_module.httpx2,
+        "AsyncClient",
+        lambda **kwargs: LifecycleHttpClient(events, **kwargs),
+    )
+    development_signing_value = "test-signing-secret"
+    settings = Settings(
+        environment="development",
+        signing_secret=development_signing_value,
+    )
+    application = create_app(settings, steam_gateway=gateway)
+
+    with TestClient(application) as client:
+        assert client.get("/api/health").json() == {"status": "ok"}
+
+    assert events == ["gateway-start", "gateway-stop", "client-close"]

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 
 import app.steam_gateway as steam_gateway
+from app.gem_pricing import GemPriceCache, GemPricingService
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -929,6 +930,64 @@ def test_inventory_single_flight_does_not_retain_completed_results() -> None:
     assert first_result == second_result == third_result
     assert calls == 2
     assert client._inventory_inflight == {}
+
+
+def test_steamapis_stop_cancels_shielded_inventory_before_gem_warmer() -> None:
+    async def exercise() -> None:
+        allow_resolution = asyncio.Event()
+        fetch_started = asyncio.Event()
+        fetch_cancelled = asyncio.Event()
+
+        class BlockingProvider:
+            started = asyncio.Event()
+
+            async def lookup(self, *_args: object, **_kwargs: object) -> object:
+                self.started.set()
+                await asyncio.Event().wait()
+
+        provider = BlockingProvider()
+        gem_pricing = GemPricingService(
+            settings(),
+            cache=GemPriceCache(":memory:"),
+            provider=provider,  # type: ignore[arg-type]
+        )
+        client = SteamApisClient(
+            settings(),
+            http_client=FakeHTTPClient([]),
+            gem_pricing=gem_pricing,
+        )
+
+        async def fake_fetch(_: str) -> InventoryCheck:
+            fetch_started.set()
+            try:
+                await allow_resolution.wait()
+                await gem_pricing.resolve({("10", "normal"): "Card"})
+            except asyncio.CancelledError:
+                fetch_cancelled.set()
+                raise
+            return InventoryCheck(status="public", message="ok")
+
+        client._fetch_inventory_uncached = fake_fetch  # type: ignore[method-assign]
+        request = asyncio.create_task(client.fetch_inventory("42"))
+        await fetch_started.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert "42" in client._inventory_inflight
+
+        await client.stop()
+        assert fetch_cancelled.is_set()
+        assert client._inventory_inflight == {}
+        assert gem_pricing._worker_task is None
+
+        try:
+            allow_resolution.set()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(provider.started.wait(), timeout=0.05)
+        finally:
+            await gem_pricing.stop()
+
+    run(exercise())
 
 
 def test_bulk_stream_semaphore_limits_concurrent_streams(

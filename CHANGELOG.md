@@ -15,12 +15,18 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   data-source caveats, and explicit partial price coverage. SteamApis omits currency metadata from its
   bulk feed; its order-book values are preserved and displayed as provider-denominated decimals without
   a currency symbol. Optimization must not treat these values as monetary until an authoritative
-  currency contract or explicit configuration exists. Market order-book snapshots are not persisted.
-  Gem yields use the persistent cache described below.
-- Add rate-limited, read-only gem-yield lookups once per game and normal/foil card rarity,
-  persist validated results in a Railway-backed SQLite cache, and derive per-card gem cash
-  estimates from the lowest-sell `753-Sack of Gems` price. Let users switch game grouping on
-  or off, and expose sortable gem and provider-denominated cash-value columns.
+  currency contract or explicit configuration exists. Market order-book snapshots remain request-only;
+  only validated semantic gem-yield cache rows persist.
+- Add rate-limited, read-only gem-yield lookups once per game and normal/foil card rarity. Uncached or
+  expired groups warm asynchronously in one background worker, while cached positive values return
+  immediately. Persist validated results in a versioned Railway-backed SQLite cache on the
+  `backend-data` volume in exact EU-West region `europe-west4-drams3a`, mounted at `/data` with
+  literal `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Ordinary restarts and redeploys preserve
+  cache rows; reset only for explicit `CACHE_SCHEMA_VERSION` changes or incompatible/corrupt databases.
+  Source-only Railway `railway up` releases preserve the attached volume without applying
+  infrastructure or creating, deleting, or replacing it. Derive per-card gem cash estimates from the
+  lowest-sell `753-Sack of Gems` price. Let users switch game grouping on or off, and expose sortable
+  gem and provider-denominated cash-value columns.
 - Keep the optional Steam Web API profile key server-only.
 - Configure all Railway services and future Railway processes in EU-West
   (`europe-west4-drams3a`).

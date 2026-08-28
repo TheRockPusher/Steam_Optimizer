@@ -963,6 +963,19 @@ class SteamApisClient:
             settings, http_client=http_client
         )
 
+    async def start(self) -> None:
+        await self.gem_pricing.start()
+
+    async def stop(self) -> None:
+        inventory_tasks = tuple(self._inventory_inflight.values())
+        for task in inventory_tasks:
+            if not task.done():
+                task.cancel()
+        if inventory_tasks:
+            await asyncio.gather(*inventory_tasks, return_exceptions=True)
+        self._inventory_inflight.clear()
+        await self.gem_pricing.stop()
+
     @property
     def _api_key(self) -> str | None:
         key = self.settings.steamapi_key
@@ -1359,12 +1372,19 @@ class SteamGateway:
     ) -> None:
         self.settings = settings
         self.http_client = http_client
+
         self.steamapis = SteamApisClient(
             settings,
             http_client=http_client,
             bulk_http_client=bulk_http_client,
             bulk_timeout_seconds=bulk_timeout_seconds,
         )
+
+    async def start(self) -> None:
+        await self.steamapis.start()
+
+    async def stop(self) -> None:
+        await self.steamapis.stop()
 
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         api_key = self.settings.steam_web_api_key

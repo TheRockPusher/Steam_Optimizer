@@ -51,9 +51,14 @@ to the Railway-hosted backend on session requests, and is cleared by logout or e
 [privacy policy and Steam Data disclaimer](../README.md#privacy-and-steam-data-policy) disclose
 storage, deletion, warranty, and liability terms.
 
-No inventory or price payload is currently cached or persisted in a database. Results are joined in
-process memory for the requested response only. Railway's backend and frontend services run in
-EU-West, exact region `europe-west4-drams3a`; all future Railway processes must use that region.
+Inventory and market price payloads remain request-only: they are joined in process memory for each
+response and never persisted. Only validated semantic gem-yield cache rows persist in a versioned SQLite
+cache on the attached `backend-data` volume mounted at `/data`, using the literal
+`GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Uncached or expired gem-yield groups are queued to
+one background worker, while cached positive values return immediately. Ordinary restarts and
+redeploys preserve cache rows; reset is limited to an explicit `CACHE_SCHEMA_VERSION` change or an
+incompatible/corrupt database. Railway's backend and frontend services run in exact EU-West region
+`europe-west4-drams3a`; all future Railway processes must use that region.
 
 ## Technical direction
 
@@ -96,7 +101,10 @@ The workflow uses Railway CLI 5.44.1 to upload `./backend` and then `./frontend`
 `--path-as-root`, explicitly selecting the project, `production` environment, and service. It
 does not use Railway native branch autodeploy, `--detach`, or deprecated `railway.toml` or
 `railway.json` configuration. Infrastructure is managed separately with the current
-`.railway/railway.ts`; release automation deploys source code but does not apply infrastructure.
+`.railway/railway.ts`, which
+omits a volume size so an existing manually-created `backend-data` volume is not resized or
+replaced. Release automation uses source-only `railway up` commands and does not apply infrastructure
+or create, delete, or replace the attached volume.
 
 Configure the following before a production release:
 

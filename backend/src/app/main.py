@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import httpx2
 from fastapi import FastAPI
@@ -14,6 +14,15 @@ from app.auth_routes import Clock, create_auth_router
 from app.settings import Settings, get_settings
 from app.steam_gateway import SteamGateway, SteamGatewayProtocol
 from app.steam_openid import SteamOpenIDClient, SteamOpenIDVerifier
+
+
+def _lifecycle_method(
+    gateway: object, name: str
+) -> Callable[[], Awaitable[None]] | None:
+    method = getattr(gateway, name, None)
+    if not callable(method):
+        return None
+    return cast("Callable[[], Awaitable[None]]", method)
 
 
 def create_app(
@@ -58,15 +67,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
+        start = _lifecycle_method(gateway, "start")
+        stop = _lifecycle_method(gateway, "stop")
         try:
+            if start is not None:
+                await start()
             yield
         finally:
             try:
-                if bulk_client is not None:
-                    await bulk_client.aclose()
+                if stop is not None:
+                    await stop()
             finally:
-                if normal_client is not None:
-                    await normal_client.aclose()
+                try:
+                    if bulk_client is not None:
+                        await bulk_client.aclose()
+                finally:
+                    if normal_client is not None:
+                        await normal_client.aclose()
 
     application = FastAPI(title=settings.app, lifespan=lifespan)
     application.add_middleware(

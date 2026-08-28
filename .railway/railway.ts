@@ -15,7 +15,6 @@ export default defineRailway(() => {
     },
   });
   const backendData = volume("backend-data", {
-    sizeMB: 1024,
     region: "europe-west4-drams3a",
   });
   const backend = service("backend", {
@@ -31,9 +30,6 @@ export default defineRailway(() => {
       COOKIE_SECURE: preserve(),
       ENVIRONMENT: preserve(),
       FRONTEND_URL: preserve(),
-      GEM_LOOKUP_BUDGET_SECONDS: preserve(),
-      GEM_LOOKUP_MAX_MISSES_PER_SCAN: preserve(),
-      GEM_LOOKUP_TIMEOUT_SECONDS: preserve(),
       GEM_PRICE_CACHE_PATH: "/data/gem_prices.sqlite3",
       PUBLIC_BACKEND_URL: preserve(),
       SIGNING_SECRET: preserve(),
