@@ -163,6 +163,18 @@ class NoopGemPricing:
         return GemScanResult(values={})
 
 
+class FixedGemPricing:
+    def __init__(self, values: Mapping[GemKey, GemResolution]) -> None:
+        self.values = values
+        self.groups: dict[GemKey, str | None] | None = None
+
+    async def resolve(
+        self, groups: Mapping[GemKey, str | None]
+    ) -> GemScanResult:
+        self.groups = dict(groups)
+        return GemScanResult(values=self.values)
+
+
 class NoopBoosterPricing:
     async def resolve(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
         del game_app_ids
@@ -229,6 +241,7 @@ def item_description(
     tradable: object = 1,
     tags: list[dict[str, object]] | None = None,
     owner_actions: list[dict[str, object]] | None = None,
+    actions: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     description: dict[str, object] = {
         "classid": class_id,
@@ -243,6 +256,8 @@ def item_description(
         description["tags"] = tags
     if owner_actions is not None:
         description["owner_actions"] = owner_actions
+    if actions is not None:
+        description["actions"] = actions
     return description
 
 
@@ -411,6 +426,159 @@ def test_keyed_backgrounds_and_emoticons_use_exact_gem_keys() -> None:
     assert parsed.descriptions[0].gem_key == background_key
     assert parsed.descriptions[1].item_type == "emoticon"
     assert parsed.descriptions[1].gem_key == emoticon_key
+
+
+def test_provider_actions_alias_resolves_exact_keys_through_gem_values() -> None:
+    card_key = GemKey(app_id="440", item_type=2, border_color=0)
+    background_key = GemKey(app_id="440", item_type=501, border_color=0)
+    emoticon_key = GemKey(app_id="440", item_type=502, border_color=1)
+    descriptions = [
+        item_description(
+            "1",
+            "Trading Card",
+            market_hash_name="440-Trading Card",
+            tags=trading_card_tags(),
+            actions=goo_owner_actions(
+                app_id="440", item_type=2, border_color=0
+            ),
+        ),
+        item_description(
+            "2",
+            "Background",
+            market_hash_name="440-Background",
+            tags=[
+                {"category": "item_class", "internal_name": "item_class_3"},
+            ],
+            actions=goo_owner_actions(
+                app_id="440", item_type=501, border_color=0
+            ),
+        ),
+        item_description(
+            "3",
+            "Emoticon",
+            market_hash_name="440-Emoticon",
+            tags=[
+                {"category": "item_class", "internal_name": "item_class_4"},
+            ],
+            actions=goo_owner_actions(
+                app_id="440", item_type=502, border_color=1
+            ),
+        ),
+    ]
+    resolutions = {
+        card_key: GemResolution(
+            key=card_key,
+            representative_hash="440-Trading Card",
+            gem_yield=100,
+            observed_at="2026-08-28T00:00:00Z",
+        ),
+        background_key: GemResolution(
+            key=background_key,
+            representative_hash="440-Background",
+            gem_yield=200,
+            observed_at="2026-08-28T00:00:00Z",
+        ),
+        emoticon_key: GemResolution(
+            key=emoticon_key,
+            representative_hash="440-Emoticon",
+            gem_yield=300,
+            observed_at="2026-08-28T00:00:00Z",
+        ),
+    }
+    gem_pricing = FixedGemPricing(resolutions)
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                page(
+                    wrapped=True,
+                    success=True,
+                    assets=[
+                        item_asset("1", amount="2"),
+                        item_asset("2", amount="3"),
+                        item_asset("3", amount="4"),
+                    ],
+                    descriptions=descriptions,
+                ),
+            ),
+            price_redirect(),
+        ],
+        stream_response=price_stream(
+            name="753-Sack of Gems",
+            lowest_sell="0.20",
+        ),
+    )
+    steamapis = SteamApisClient(
+        settings(),
+        http_client=client,
+        gem_pricing=gem_pricing,  # type: ignore[arg-type]
+        booster_pricing=NoopBoosterPricing(),  # type: ignore[arg-type]
+    )
+
+    result = run(steamapis.fetch_inventory("42"))
+
+    assert gem_pricing.groups == {
+        card_key: "440-Trading Card",
+        background_key: "440-Background",
+        emoticon_key: "440-Emoticon",
+    }
+    assert result.total_asset_count == 9
+    assert result.unique_item_count == 3
+    assert result.gem_status == "complete"
+    assert result.gem_priceable_item_count == 3
+    assert result.gem_priced_item_count == 3
+    by_name = {item.name: item for item in result.items}
+    assert by_name["Trading Card"].gem_key == card_key
+    assert by_name["Trading Card"].gem_yield == 100
+    assert by_name["Trading Card"].gem_cash_value == "0.02"
+    assert by_name["Background"].gem_key == background_key
+    assert by_name["Background"].gem_yield == 200
+    assert by_name["Background"].gem_cash_value == "0.04"
+    assert by_name["Emoticon"].gem_key == emoticon_key
+    assert by_name["Emoticon"].gem_yield == 300
+    assert by_name["Emoticon"].gem_cash_value == "0.06"
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        goo_owner_actions(app_id="440", item_type=502, border_color=1),
+        [
+            {
+                "link": (
+                    "javascript:GetGooValue('%contextid%', '%assetid%', "
+                    "440, 501)"
+                )
+            }
+        ],
+        {"link": "javascript:GetGooValue('%contextid%', '%assetid%', 440, 501)"},
+    ],
+    ids=("conflicting-keys", "malformed-goo-tuple", "malformed-alias"),
+)
+def test_inventory_dual_action_aliases_fail_closed(actions: object) -> None:
+    description = item_description(
+        "1",
+        "Background",
+        tags=[
+            {"category": "item_class", "internal_name": "item_class_3"},
+        ],
+        owner_actions=goo_owner_actions(
+            app_id="440", item_type=501, border_color=0
+        ),
+    )
+    description["actions"] = actions
+
+    parsed = steam_gateway._parse_inventory_page(
+        page(
+            wrapped=True,
+            success=True,
+            assets=[item_asset("1")],
+            descriptions=[description],
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.descriptions[0].gem_key is None
 
 
 def test_malformed_owner_action_keeps_inventory_available_and_keyless() -> None:
