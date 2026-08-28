@@ -732,6 +732,8 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -775,6 +777,8 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -882,7 +886,7 @@ describe("App", () => {
     ).toBeNull();
   });
 
-  it("renders a game's booster price and cards per booster", async () => {
+  it("renders a game's booster prices, gem cost, and card counts", async () => {
     const inventory = publicInventory([tradingCardItem(1)], {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
@@ -894,6 +898,8 @@ describe("App", () => {
           game_name: "Team Fortress 2",
           market_hash_name: "440-Team Fortress 2 Booster Pack",
           card_count: 3,
+          card_set_size: 8,
+          gem_cost: 750,
           price: {
             currency: null,
             highest_buy: "0.11",
@@ -919,6 +925,10 @@ describe("App", () => {
     });
     expect(within(boosterCard).getByText("0.13")).toBeInTheDocument();
     expect(within(boosterCard).getByText("0.11")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("750", { selector: "dd" })).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("8", { selector: "dd" })).toBeInTheDocument();
     expect(within(boosterCard).getByText("Cards per booster")).toBeInTheDocument();
     expect(within(boosterCard).getByText("3 cards")).toBeInTheDocument();
     expect(
@@ -928,6 +938,39 @@ describe("App", () => {
     expect(
       within(boosterCard).getByText(/Aug 27, 2026/)
     ).toHaveAttribute("datetime", "2026-08-27T00:00:00Z");
+  });
+  it("renders unavailable derived booster values without changing market prices", async () => {
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: validInventoryPrice
+        }
+      ]
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Boosters" }));
+
+    const boosterCard = within(
+      await screen.findByRole("region", { name: "Booster details by game" })
+    ).getByRole("article", { name: "Team Fortress 2" });
+    expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
+    expect(within(boosterCard).getAllByText("Unavailable")).toHaveLength(2);
+    expect(within(boosterCard).getByText("0.20")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("0.10")).toBeInTheDocument();
   });
   it("switches between item and booster result panels with manual keyboard activation", async () => {
     const inventory = publicInventory([tradingCardItem(10)], {
@@ -941,6 +984,8 @@ describe("App", () => {
           game_name: "Team Fortress 2",
           market_hash_name: "440-Team Fortress 2 Booster Pack",
           card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
           price: validInventoryPrice
         }
       ]
@@ -2148,7 +2193,18 @@ describe("App", () => {
       gem_status: "partial",
       gem_message: "Background gem pricing is still processing card groups.",
       gem_priceable_item_count: 2,
-      gem_priced_item_count: 1
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: validInventoryPrice
+        }
+      ],
     });
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -2168,6 +2224,14 @@ describe("App", () => {
             }
           ],
           pending_group_count: 0,
+          boosters: [
+            {
+              game_app_id: "440",
+              card_set_size: 8,
+              gem_cost: 750
+            }
+          ],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })
@@ -2193,6 +2257,12 @@ describe("App", () => {
       within(screen.getByText("Card 0002").closest("tr") as HTMLElement)
         .getByText("100")
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Boosters" }));
+    const boosterCard = within(
+      await screen.findByRole("region", { name: "Booster details by game" })
+    ).getByRole("article", { name: "Team Fortress 2" });
+    expect(within(boosterCard).getByText("750", { selector: "dd" })).toBeInTheDocument();
+    expect(within(boosterCard).getByText("8", { selector: "dd" })).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -2211,6 +2281,112 @@ describe("App", () => {
     });
   });
 
+
+  it.each([
+    { card_set_size: 5, gem_cost: null },
+    { card_set_size: null, gem_cost: 1200 },
+    { card_set_size: 4, gem_cost: 1500 },
+    { card_set_size: 16, gem_cost: 375 },
+    { card_set_size: 5, gem_cost: 1199 },
+    { card_set_size: 5.5, gem_cost: 1091 }
+  ])("rejects malformed booster derivation values %j", async (derivedValues) => {
+    const malformedBooster = {
+      game_app_id: "440",
+      game_name: "Team Fortress 2",
+      market_hash_name: "440-Team Fortress 2 Booster Pack",
+      card_count: 3,
+      ...derivedValues,
+      price: null
+    };
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [malformedBooster]
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Steam connection is unavailable."
+      })
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      boosters: [{ game_app_id: "440", card_set_size: 8, gem_cost: 749 }],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [
+        { game_app_id: "440", card_set_size: null, gem_cost: null },
+        { game_app_id: "440", card_set_size: null, gem_cost: null }
+      ],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [{ game_app_id: "999", card_set_size: null, gem_cost: null }],
+      pending_booster_count: 0
+    },
+    {
+      boosters: [{ game_app_id: "440", card_set_size: null, gem_cost: null }],
+      pending_booster_count: -1
+    },
+    {
+      boosters: [{ game_app_id: "440", card_set_size: null, gem_cost: null }],
+      pending_booster_count: undefined
+    }
+  ])("rejects malformed booster refresh envelopes %j", async (refreshFields) => {
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          card_set_size: null,
+          gem_cost: null,
+          price: null
+        }
+      ]
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            {
+              game_app_id: "440",
+              card_rarity: "normal",
+              gem_yield: 10
+            }
+          ],
+          pending_group_count: 0,
+          ...refreshFields,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh gem values" })
+    );
+    expect(
+      await screen.findAllByText(
+        "We could not refresh cached gem values. Your inventory results have not changed."
+      )
+    ).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 
   it("rejects card metadata that violates the item-type invariants", async () => {
     const malformedItem = {

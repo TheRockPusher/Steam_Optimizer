@@ -34,6 +34,8 @@ type BoosterInfo = {
   game_name: string | null;
   market_hash_name: string | null;
   card_count: 3;
+  card_set_size: number | null;
+  gem_cost: number | null;
   price: InventoryPrice | null;
 };
 
@@ -148,9 +150,17 @@ type GemRefreshValue = GemRefreshGroup & {
   gem_yield: number;
 };
 
+type BoosterRefreshValue = {
+  game_app_id: string;
+  card_set_size: number | null;
+  gem_cost: number | null;
+};
+
 type GemRefreshResponse = {
   values: GemRefreshValue[];
   pending_group_count: number;
+  boosters: BoosterRefreshValue[];
+  pending_booster_count: number;
   gem_rate_limited: boolean;
   gem_retry_after_seconds: number | null;
 };
@@ -337,6 +347,27 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
   );
 }
 
+function gemCostForCardSetSize(cardSetSize: number): number {
+  return Math.floor((12000 + cardSetSize) / (2 * cardSetSize));
+}
+
+function isBoosterDerivation(
+  cardSetSize: unknown,
+  gemCost: unknown
+): boolean {
+  if (cardSetSize === null || gemCost === null) {
+    return cardSetSize === null && gemCost === null;
+  }
+
+  return (
+    isSafeInteger(cardSetSize, 5) &&
+    cardSetSize <= 15 &&
+    isSafeInteger(gemCost, 0) &&
+    gemCost === gemCostForCardSetSize(cardSetSize)
+  );
+}
+
+
 function isBoosterInfo(value: unknown): value is BoosterInfo {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -356,6 +387,7 @@ function isBoosterInfo(value: unknown): value is BoosterInfo {
         booster.market_hash_name.length > 0)
     ) ||
     booster.card_count !== 3 ||
+    !isBoosterDerivation(booster.card_set_size, booster.gem_cost) ||
     (booster.price !== null && !isInventoryPrice(booster.price))
   ) {
     return false;
@@ -687,6 +719,8 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
   if (
     !Array.isArray(refresh.values) ||
     !isSafeInteger(refresh.pending_group_count, 0) ||
+    !Array.isArray(refresh.boosters) ||
+    !isSafeInteger(refresh.pending_booster_count, 0) ||
     typeof refresh.gem_rate_limited !== "boolean" ||
     typeof refresh.gem_retry_after_seconds === "undefined" ||
     (refresh.gem_retry_after_seconds !== null &&
@@ -696,6 +730,7 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
   ) {
     return false;
   }
+
   const keys = new Set<string>();
   for (const entry of refresh.values) {
     if (typeof entry !== "object" || entry === null) {
@@ -716,6 +751,25 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
     }
     keys.add(key);
   }
+
+  const boosterKeys = new Set<string>();
+  for (const entry of refresh.boosters) {
+    if (typeof entry !== "object" || entry === null) {
+      return false;
+    }
+    const candidate = entry as Partial<BoosterRefreshValue>;
+    if (
+      !isDecimalString(candidate.game_app_id) ||
+      !isBoosterDerivation(candidate.card_set_size, candidate.gem_cost)
+    ) {
+      return false;
+    }
+    if (boosterKeys.has(candidate.game_app_id)) {
+      return false;
+    }
+    boosterKeys.add(candidate.game_app_id);
+  }
+
   return true;
 }
 
@@ -769,11 +823,18 @@ async function requestGemRefresh(
   const requestedKeys = new Set(
     groups.map((group) => `${group.game_app_id}:${group.card_rarity}`)
   );
+  const requestedBoosterIds = new Set(
+    groups.map((group) => group.game_app_id)
+  );
   if (
     payload.values.length > groups.length ||
     payload.values.some(
       (entry) =>
         !requestedKeys.has(`${entry.game_app_id}:${entry.card_rarity}`)
+    ) ||
+    payload.boosters.length > requestedBoosterIds.size ||
+    payload.boosters.some(
+      (entry) => !requestedBoosterIds.has(entry.game_app_id)
     )
   ) {
     throw new Error("The gem refresh service returned unrequested values.");
@@ -789,6 +850,11 @@ function mergeGemRefresh(
     refresh.values.map(
       (entry) =>
         [`${entry.game_app_id}:${entry.card_rarity}`, entry.gem_yield] as const
+    )
+  );
+  const boosterValues = new Map<string, BoosterRefreshValue>(
+    refresh.boosters.map(
+      (entry) => [entry.game_app_id, entry] as const
     )
   );
   const items = inventory.items.map((item) => {
@@ -819,6 +885,17 @@ function mergeGemRefresh(
           )
     };
   });
+  const boosters = inventory.boosters.map((booster) => {
+    const refreshedBooster = boosterValues.get(booster.game_app_id);
+    if (typeof refreshedBooster === "undefined") {
+      return booster;
+    }
+    return {
+      ...booster,
+      card_set_size: refreshedBooster.card_set_size,
+      gem_cost: refreshedBooster.gem_cost
+    };
+  });
   const gemPriceableCount = items.filter(
     (item) => item.item_type === "trading_card"
   ).length;
@@ -843,6 +920,7 @@ function mergeGemRefresh(
   return {
     ...inventory,
     items,
+    boosters,
     gem_status: gemStatus,
     gem_message: gemMessage,
     gem_priceable_item_count: gemPriceableCount,
@@ -1890,9 +1968,9 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
         </p>
       </div>
       <p className="booster-coverage-copy">
-        Every Steam booster pack contains three trading cards. Prices are
-        read-only SteamApis order-book values, and this feed does not identify
-        the currency.
+        Gem cost is derived from the public normal-card set size. Every Steam
+        booster pack contains three cards. Market prices are read-only SteamApis
+        order-book values, and this feed does not identify the currency.
       </p>
       <div className="booster-grid">
         {boosters.map((booster) => {
@@ -1926,6 +2004,22 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
                 <div>
                   <dt>Highest buy</dt>
                   <dd>{highestBuy ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Gem cost</dt>
+                  <dd>
+                    {booster.gem_cost === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.gem_cost)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Cards in set</dt>
+                  <dd>
+                    {booster.card_set_size === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.card_set_size)}
+                  </dd>
                 </div>
                 <div>
                   <dt>Cards per booster</dt>
