@@ -11,8 +11,10 @@ The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an
 signed session, backend profile checks, and server-only SteamApis v2 access through `STEAMAPI_KEY`.
 For a public inventory, it retrieves the complete AppID 753/context 6 inventory through provider
 pagination, joins current bulk AppID 753 prices to marketable items, and reports explicit price
-coverage (`complete`, `partial`, or `unavailable`). The React interface exposes all retrieved items
-and the separate price coverage result.
+coverage (`complete`, `partial`, or `unavailable`). For each identified trading-card game, it also
+looks up the canonical booster market item and reports its provider-denominated order-book values
+plus Steam's fixed three-card booster-pack size. The React interface exposes all retrieved items,
+booster details, and the separate price coverage result.
 
 ## Safety and identity boundary
 

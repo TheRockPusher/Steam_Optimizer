@@ -29,7 +29,9 @@ const privateInventory = {
   gem_rate_limited: false,
   gem_retry_after_seconds: null,
   gem_cash_context: null,
+  boosters: [],
   items: []
+
 };
 
 const signedInSession = {
@@ -123,6 +125,7 @@ function publicInventory(
     gem_rate_limited: false,
     gem_retry_after_seconds: null,
     gem_cash_context: null,
+    boosters: [],
     items,
     ...overrides
   };
@@ -349,6 +352,10 @@ describe("App", () => {
       .getByText("Prismatic Trading Card")
       .closest("tr");
     expect(pricedRow).not.toBeNull();
+    expect(pricedRow?.querySelector("img")).toHaveAttribute(
+      "src",
+      "https://cdn.example.test/items/prismatic.png/64fx64f"
+    );
     expect(within(pricedRow as HTMLElement).getByText("3")).toBeInTheDocument();
     expect(
       within(pricedRow as HTMLElement).getByText("Marketable")
@@ -847,6 +854,50 @@ describe("App", () => {
     ).toBeNull();
   });
 
+  it("renders a game's booster price and cards per booster", async () => {
+    const inventory = publicInventory([tradingCardItem(1)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_status: "complete",
+      gem_message: "Gem values are current for all trading cards.",
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          price: {
+            currency: null,
+            highest_buy: "0.11",
+            lowest_sell: "0.13",
+            observed_at: "2026-08-27T00:00:00Z"
+          }
+        }
+      ]
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const section = await screen.findByRole("region", {
+      name: "Booster details by game"
+    });
+    const boosterCard = within(section).getByRole("article", {
+      name: "Team Fortress 2"
+    });
+    expect(within(boosterCard).getByText("0.13")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("0.11")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("Cards per booster")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("3 cards")).toBeInTheDocument();
+    expect(
+      within(boosterCard).getByText("3", { selector: "dd" })
+    ).toBeInTheDocument();
+    expect(
+      within(boosterCard).getByText(/Aug 27, 2026/)
+    ).toHaveAttribute("datetime", "2026-08-27T00:00:00Z");
+  });
   it("sorts every inventory field in both directions and keeps unavailable values last", async () => {
     const charlie = {
       ...inventoryItem(1),

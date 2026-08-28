@@ -17,6 +17,9 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   a currency symbol. Optimization must not treat these values as monetary until an authoritative
   currency contract or explicit configuration exists. Market order-book snapshots remain request-only;
   only validated semantic gem-yield cache rows persist.
+- Add per-game booster summaries for identified trading-card games. The existing SteamApis bulk
+  feed supplies provider-denominated lowest-sell and highest-buy values for each canonical booster
+  market name, while the UI reports that every booster contains three cards.
 - Add rate-limited, read-only gem-yield lookups once per game and normal/foil card rarity. Uncached or
   expired groups warm asynchronously in one background worker, while cached positive values return
   immediately. Persist validated results in a versioned Railway-backed SQLite cache on the

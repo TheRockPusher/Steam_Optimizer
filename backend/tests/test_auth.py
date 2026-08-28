@@ -319,6 +319,7 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
                 "gem_retry_after_seconds": None,
                 "gem_cash_context": None,
                 "items": [],
+                "boosters": [],
             },
         },
     }
