@@ -165,10 +165,42 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  window.history.replaceState({}, "", "/");
+});
+
+describe("FAQ", () => {
+  it("renders the dedicated FAQ route without loading a Steam session", () => {
+    window.history.replaceState({}, "", "/faq");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    render(<App />);
+    expect(document.title).toBe("FAQ | Steam Optimizer");
+
+    expect(
+      screen.getByRole("heading", {
+        level: 1,
+        name: "Steam inventory questions, answered."
+      })
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("navigation", { name: "Primary navigation" }))
+        .getByRole("link", { name: "FAQ" })
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("link", { name: "Steam Optimizer home" })
+    ).toHaveAttribute("href", "/");
+    expect(
+      screen.getByRole("heading", { name: "Can Steam Optimizer change my account?" })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "How are gem values calculated?" })
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("App", () => {
-  it("loads the session before offering normal navigation through both official Steam images", async () => {
+  it("loads the session before offering the compact Steam sign-in", async () => {
     let resolveSession!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(
       () =>
@@ -177,11 +209,11 @@ describe("App", () => {
         })
     );
 
-    const { container } = render(<App />);
+    render(<App />);
 
     expect(
-      screen.getByRole("heading", { name: "Checking your connection" })
-    ).toBeInTheDocument();
+      screen.getByRole("region", { name: "Steam session" })
+    ).toHaveTextContent("Checking your Steam session");
     const statusRegion = screen.getByRole("status");
     expect(statusRegion).toHaveTextContent("Checking session");
     expect(
@@ -192,14 +224,10 @@ describe("App", () => {
       resolveSession(jsonResponse({ authenticated: false }));
     });
 
-    expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
-    ).toBeInTheDocument();
+    const loginLink = await screen.findByRole("link", {
+      name: /steam sign-in/i
+    });
     expect(screen.getByRole("status")).toBe(statusRegion);
-
-    const loginLink = screen.getByRole("link", { name: /steam sign-in/i });
     expect(loginLink.closest("header")).toHaveClass("site-header");
     expect(loginLink).toHaveAccessibleName(
       "Steam sign-in; Steam Optimizer is not affiliated with Valve"
@@ -210,13 +238,13 @@ describe("App", () => {
     expect(signInImage.getAttribute("src")).toContain("sits_01.png");
     expect(signInImage).toHaveAttribute("width", "180");
     expect(signInImage).toHaveAttribute("height", "35");
-    const compactSource = container.querySelector("picture source");
-    expect(compactSource?.getAttribute("srcset")).toContain("sits_02.png");
-    expect(compactSource).toHaveAttribute("media", "(max-width: 40rem)");
-    expect(compactSource).toHaveAttribute("width", "109");
-    expect(compactSource).toHaveAttribute("height", "66");
-    expect(screen.getByText(/your password never comes here/i)).toBeInTheDocument();
-    expect(screen.getByText(/cannot trade, sell, craft, or change/i)).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("banner")).getByRole("link", { name: "FAQ" })
+    ).toHaveAttribute("href", "/faq");
+    expect(screen.queryByText("Read-only workspace")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/cannot trade, sell, craft, or change/i)
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /privacy & steam data terms/i })
     ).toHaveAttribute(
@@ -262,7 +290,7 @@ describe("App", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "Alyx" })
+      await screen.findByLabelText("Connected Steam account: Alyx")
     ).toBeInTheDocument();
     expect(screen.getByText("Steam ID 76561198000000001")).toBeInTheDocument();
 
@@ -325,8 +353,11 @@ describe("App", () => {
 
     render(<App />);
 
+    const inventoryRegion = await screen.findByRole("region", {
+      name: "Your items"
+    });
     expect(
-      await screen.findByRole("heading", { name: "What is in your inventory" })
+      within(inventoryRegion).getByText(/4 assets.*2 item types/)
     ).toBeInTheDocument();
     const coverage = screen.getByRole("region", {
       name: "Current market snapshot"
@@ -339,13 +370,10 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(
       within(coverage).getByText(
-        "SteamApis does not specify the currency for this feed. Values are shown exactly as received, without a currency symbol."
+        "SteamApis does not identify the currency; values are shown as received."
       )
     ).toBeInTheDocument();
     expect(coverage).not.toHaveTextContent("USD");
-    expect(within(coverage).getByText("Total assets").parentElement).toHaveTextContent(
-      "4"
-    );
 
     const inventoryTable = screen.getByRole("table", { name: "Inventory items" });
     const pricedRow = within(inventoryTable)
@@ -1131,7 +1159,7 @@ describe("App", () => {
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
 
@@ -1215,7 +1243,7 @@ describe("App", () => {
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
 
@@ -1333,7 +1361,7 @@ describe("App", () => {
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
 
@@ -1651,7 +1679,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const profileCard = screen.getByRole("article", { name: "Steam profile" });
 
     expect(within(profileCard).getByText("Unavailable")).toBeInTheDocument();
@@ -1683,7 +1711,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const inventoryCard = screen.getByRole("article", {
       name: "Steam inventory"
     });
@@ -1691,9 +1719,9 @@ describe("App", () => {
     expect(within(inventoryCard).getByText("Try later")).toBeInTheDocument();
     expect(
       within(inventoryCard).getByText(
-        /Steam is temporarily limiting automated checks/i
+        "Steam is temporarily limiting checks. This is not a privacy result."
       )
-    ).toHaveTextContent(/does not mean your inventory is private/i);
+    ).toBeInTheDocument();
     expect(
       within(inventoryCard).queryByRole("link", {
         name: /open Steam privacy settings/i
@@ -1716,7 +1744,9 @@ describe("App", () => {
     render(<App />);
     await act(async () => { });
 
-    expect(screen.getByRole("heading", { name: "Alyx" })).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Connected Steam account: Alyx")
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
         "Repeated immediate recheck requests are disabled. Try again in 3s."
@@ -1837,9 +1867,10 @@ describe("App", () => {
     expect(
       screen.getByRole("button", { name: "Recheck Steam access" })
     ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "Sign out on this device" })
-    ).toBeEnabled();
+    fireEvent.click(
+      screen.getByLabelText("Connected Steam account: Alyx")
+    );
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
   });
 
   it("rechecks both access results with credentials and announces both current labels", async () => {
@@ -1866,7 +1897,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam access" })
@@ -1899,7 +1930,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
+    await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam access" })
@@ -1987,10 +2018,10 @@ describe("App", () => {
       "Other inventory items"
     ]);
     expect(
-      screen.getByRole("region", { name: "Trading-card gem values" })
-    ).toHaveTextContent(
-      "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-card replacement-cost estimate."
-    );
+      within(
+        screen.getByRole("region", { name: "Trading-card gem values" })
+      ).getByRole("link", { name: "How gem values work" })
+    ).toHaveAttribute("href", "/faq#gem-values");
     expect(
       within(screen.getByText("Unknown card").closest("tr") as HTMLElement)
         .getAllByText("Unavailable")
@@ -2092,8 +2123,8 @@ describe("App", () => {
       within(coverage).getByText(/rate-limiting gem lookups/i)
     ).toHaveTextContent("try again in 30s");
     expect(
-      within(coverage).getByText(/lowest-sell basis/i)
-    ).toHaveTextContent(/unknown currency/i);
+      within(coverage).getByRole("link", { name: "How gem values work" })
+    ).toHaveAttribute("href", "/faq#gem-values");
     const pricedRow = screen.getByText("Card 0001").closest("tr");
     expect(pricedRow).not.toBeNull();
     expect(within(pricedRow as HTMLElement).getByText("0")).toBeInTheDocument();
@@ -2201,7 +2232,7 @@ describe("App", () => {
       })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
+      screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
   it("rejects partially populated trading-card metadata", async () => {
@@ -2238,16 +2269,14 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Alyx" });
-    const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Sign out on this device" })
+      await screen.findByLabelText("Connected Steam account: Alyx")
     );
+    const statusRegion = screen.getByRole("status");
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
+      await screen.findByRole("link", { name: /steam sign-in/i })
     ).toBeInTheDocument();
     expect(screen.getByRole("status")).toBe(statusRegion);
     expect(statusRegion).toHaveTextContent("Signed out successfully.");
