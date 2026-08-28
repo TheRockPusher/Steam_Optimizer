@@ -435,6 +435,13 @@ h3 {
   background: var(--color-unavailable-soft);
   font-variant-numeric: tabular-nums;
 }
+.inventory-cache-status {
+  margin: 0;
+  padding: 0 var(--panel-padding) var(--space-4);
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
 
 .access-intro {
   display: grid;

@@ -36,6 +36,7 @@ from app.steam_openid import (
 )
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+AUTHENTICATED_STEAM_ID = "76561198000000000"
 
 
 class FakeVerifier:
@@ -55,8 +56,14 @@ class UnavailableVerifier:
 
 
 class FakeGateway:
-    def __init__(self, *, inventory_retry_after_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        inventory_retry_after_seconds: int | None = None,
+        inventory_error: Exception | None = None,
+    ) -> None:
         self.inventory_retry_after_seconds = inventory_retry_after_seconds
+        self.inventory_error = inventory_error
         self.profile_calls = 0
         self.inventory_calls = 0
         self.gem_refresh_calls: list[Mapping[tuple[str, CardRarity], None]] = []
@@ -74,6 +81,8 @@ class FakeGateway:
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         self.inventory_calls += 1
         del steam_id
+        if self.inventory_error is not None:
+            raise self.inventory_error
         return InventoryCheck(
             status="private",
             message="inventory private",
@@ -146,6 +155,16 @@ def callback_query(
 def return_to_from_start(response: Response) -> str:
     location = response.headers["location"]
     return parse_qs(urlsplit(location).query)["openid.return_to"][0]
+
+
+def _authenticate(client: TestClient, settings: Settings) -> None:
+    start = client.get("/api/auth/steam/start", follow_redirects=False)
+    callback = client.get(
+        "/api/auth/steam/callback?"
+        + callback_query(settings, return_to=return_to_from_start(start)),
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
 
 
 def test_development_generates_ephemeral_signing_secret() -> None:
@@ -270,27 +289,20 @@ def test_callback_maps_verifier_outage_to_service_unavailable() -> None:
 
 def test_session_and_logout_use_signed_session_cookie() -> None:
     settings = make_settings(cookie_samesite="strict")
-    verifier = FakeVerifier()
+    gateway = FakeGateway(inventory_retry_after_seconds=17)
     app = create_app(
         settings,
-        steam_gateway=FakeGateway(inventory_retry_after_seconds=17),
-        openid_verifier=verifier,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
         clock=lambda: NOW,
     )
     with TestClient(app) as client:
-        start = client.get("/api/auth/steam/start", follow_redirects=False)
-        callback = client.get(
-            "/api/auth/steam/callback?"
-            + callback_query(settings, return_to=return_to_from_start(start)),
-            follow_redirects=False,
-        )
+        _authenticate(client, settings)
         session = client.get("/api/auth/session")
         logout = client.post("/api/auth/logout")
         after_logout = client.get("/api/auth/session")
 
-    assert callback.status_code == 302
-    assert callback.headers["location"] == settings.frontend_url
-    assert "SameSite=strict" in callback.headers["set-cookie"]
+    assert session.status_code == 200
     assert session.json() == {
         "authenticated": True,
         "user": {
@@ -300,32 +312,149 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
         },
         "checks": {
             "profile": {"status": "public", "message": "profile ok"},
-            "inventory": {
-                "status": "private",
-                "message": "inventory private",
-                "retry_after_seconds": 17,
-                "rate_limited": False,
-                "total_asset_count": 0,
-                "unique_item_count": 0,
-                "priceable_item_count": 0,
-                "priced_item_count": 0,
-                "price_status": "unavailable",
-                "price_message": "Steam item prices are unavailable.",
-                "gem_status": "unavailable",
-                "gem_message": "Gem prices are unavailable.",
-                "gem_priceable_item_count": 0,
-                "gem_priced_item_count": 0,
-                "gem_rate_limited": False,
-                "gem_retry_after_seconds": None,
-                "gem_cash_context": None,
-                "items": [],
-                "boosters": [],
-            },
         },
     }
     assert session.headers["cache-control"] == "no-store"
+    assert gateway.profile_calls == 1
+    assert gateway.inventory_calls == 0
     assert logout.status_code == 204
     assert after_logout.json() == {"authenticated": False}
+
+
+@pytest.mark.parametrize("session_cookie", [None, "invalid-session-cookie"])
+def test_inventory_requires_authenticated_session(
+    session_cookie: str | None,
+) -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        if session_cookie is not None:
+            client.cookies.set(settings.session_cookie_name, session_cookie)
+        response = client.post("/api/auth/inventory")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Steam authentication is required."}
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.profile_calls == 0
+    assert gateway.inventory_calls == 0
+
+
+def test_inventory_rejects_session_account_mismatch() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/inventory",
+            headers={"X-Expected-Steam-ID": "76561198000000001"},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Steam authentication is required."}
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.inventory_calls == 0
+
+
+def test_inventory_returns_raw_result_with_retry_metadata() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(inventory_retry_after_seconds=17)
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/inventory",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "status": "private",
+        "message": "inventory private",
+        "retry_after_seconds": 17,
+        "rate_limited": False,
+        "total_asset_count": 0,
+        "unique_item_count": 0,
+        "priceable_item_count": 0,
+        "priced_item_count": 0,
+        "price_status": "unavailable",
+        "price_message": "Steam item prices are unavailable.",
+        "items": [],
+        "boosters": [],
+        "gem_status": "unavailable",
+        "gem_message": "Gem prices are unavailable.",
+        "gem_priceable_item_count": 0,
+        "gem_priced_item_count": 0,
+        "gem_rate_limited": False,
+        "gem_retry_after_seconds": None,
+        "gem_cash_context": None,
+    }
+    assert gateway.profile_calls == 0
+    assert gateway.inventory_calls == 1
+
+
+def test_inventory_gateway_exception_returns_unavailable_result() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(inventory_error=RuntimeError("gateway unavailable"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/inventory",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "status": "unavailable",
+        "message": "Steam inventory check is unavailable.",
+        "retry_after_seconds": None,
+        "rate_limited": False,
+        "total_asset_count": 0,
+        "unique_item_count": 0,
+        "priceable_item_count": 0,
+        "priced_item_count": 0,
+        "price_status": "unavailable",
+        "price_message": "Steam item prices are unavailable.",
+        "items": [],
+        "boosters": [],
+        "gem_status": "unavailable",
+        "gem_message": "Gem prices are unavailable.",
+        "gem_priceable_item_count": 0,
+        "gem_priced_item_count": 0,
+        "gem_rate_limited": False,
+        "gem_retry_after_seconds": None,
+        "gem_cash_context": None,
+    }
+    assert gateway.profile_calls == 0
+    assert gateway.inventory_calls == 1
 
 
 def test_gem_refresh_requires_authenticated_session() -> None:

@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { clearInventoryCache } from "./inventoryCache";
 
 const privateInventory = {
   status: "private",
@@ -45,8 +46,7 @@ const signedInSession = {
     profile: {
       status: "public",
       message: "Your Steam profile is publicly visible."
-    },
-    inventory: privateInventory
+    }
   }
 };
 
@@ -131,15 +131,6 @@ function publicInventory(
   };
 }
 
-function publicInventorySession(inventory: Record<string, unknown>) {
-  return {
-    ...signedInSession,
-    checks: {
-      ...signedInSession.checks,
-      inventory
-    }
-  };
-}
 
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -148,20 +139,14 @@ function jsonResponse(payload: unknown, status = 200) {
   });
 }
 
-function sessionWithRetry(retryAfterSeconds: number | null) {
+function inventoryWithRetry(retryAfterSeconds: number | null) {
   return {
-    ...signedInSession,
-    checks: {
-      ...signedInSession.checks,
-      inventory: {
-        ...signedInSession.checks.inventory,
-        retry_after_seconds: retryAfterSeconds
-      }
-    }
+    ...privateInventory,
+    retry_after_seconds: retryAfterSeconds
   };
 }
-
-afterEach(() => {
+afterEach(async () => {
+  await clearInventoryCache();
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -255,10 +240,10 @@ describe("App", () => {
   });
 
   it("renders Steam identity and independent public and private results", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(signedInSession)
-    );
-
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory));
     render(<App />);
 
     expect(
@@ -286,6 +271,22 @@ describe("App", () => {
         name: /open Steam privacy settings/i
       })
     ).toHaveAttribute("href", "https://steamcommunity.com/my/edit/settings");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/auth/session",
+      expect.objectContaining({
+        credentials: "include",
+        headers: { Accept: "application/json" }
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/auth/inventory",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST"
+      })
+    );
   });
 
   it("accepts the complete inventory contract and renders exact provider price strings", async () => {
@@ -319,9 +320,9 @@ describe("App", () => {
         price_message: "Current prices were found for every marketable type."
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -499,9 +500,9 @@ describe("App", () => {
         gem_cash_context: validGemCashContext
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -584,9 +585,9 @@ describe("App", () => {
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -692,7 +693,8 @@ describe("App", () => {
       resolveShrink = resolve;
     });
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockImplementationOnce(() => shrinkResponse)
       .mockResolvedValueOnce(
         jsonResponse({
@@ -807,9 +809,9 @@ describe("App", () => {
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -875,9 +877,9 @@ describe("App", () => {
         }
       ]
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -917,9 +919,9 @@ describe("App", () => {
         }
       ]
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -982,9 +984,9 @@ describe("App", () => {
   });
 
   it("keeps an empty booster view selectable and explains the missing data", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(publicInventory([])))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
 
@@ -1039,17 +1041,14 @@ describe("App", () => {
         observed_at: "2026-08-26T12:00:00Z"
       }
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
-          publicInventory([charlie, alpha, bravo], {
-            total_asset_count: 13,
-            priceable_item_count: 2,
-            priced_item_count: 2
-          })
-        )
-      )
-    );
+    const inventory = publicInventory([charlie, alpha, bravo], {
+      total_asset_count: 13,
+      priceable_item_count: 2,
+      priced_item_count: 2
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -1115,24 +1114,20 @@ describe("App", () => {
   });
 
   it("rejects a malformed nested item", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
-          publicInventory([{ ...inventoryItem(1), quantity: 0 }])
-        )
-      )
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventory([{ ...inventoryItem(1), quantity: 0 }]))
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
-      })
+      await screen.findByRole("heading", { name: "Alyx" })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
-    ).not.toBeInTheDocument();
+      await screen.findByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent(/could not load|checking/i);
   });
 
   it.each([
@@ -1196,29 +1191,26 @@ describe("App", () => {
       marketable: true,
       price
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(
           publicInventory([item], {
             priceable_item_count: 1,
             priced_item_count: 1
           })
         )
-      )
-    );
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
-      })
+      await screen.findByRole("heading", { name: "Alyx" })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
-    ).not.toBeInTheDocument();
+      await screen.findByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent(/could not load|checking/i);
   });
-
   it.each([
     {
       label: "duplicate class and instance rows",
@@ -1321,20 +1313,18 @@ describe("App", () => {
       )
     }
   ])("rejects $label", async ({ inventory }) => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
-      })
+      await screen.findByRole("heading", { name: "Alyx" })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
-    ).not.toBeInTheDocument();
+      await screen.findByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent(/could not load|checking/i);
   });
 
   it("shows partial price coverage and marks a marketable unpriced item unavailable", async () => {
@@ -1361,9 +1351,9 @@ describe("App", () => {
       price_status: "partial",
       price_message: "One marketable type did not have a current order book."
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -1397,9 +1387,9 @@ describe("App", () => {
       price_message:
         "The inventory is public, but current Steam market prices are unavailable."
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -1424,9 +1414,9 @@ describe("App", () => {
     const items = Array.from({ length: 2001 }, (_, index) =>
       inventoryItem(index + 1)
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(publicInventory(items)))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
 
     render(<App />);
 
@@ -1478,7 +1468,7 @@ describe("App", () => {
     expect(previousButton).toBeEnabled();
   });
 
-  it("clamps the stored inventory page after a recheck shrinks the result", async () => {
+  it("clamps the stored inventory page after an explicit refresh shrinks the result", async () => {
     const initialItems = Array.from({ length: 101 }, (_, index) =>
       inventoryItem(index + 1)
     );
@@ -1490,15 +1480,10 @@ describe("App", () => {
     );
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(initialItems)))
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(shrunkenItems)))
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(publicInventorySession(publicInventory(grownItems)))
-      );
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(initialItems)))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(shrunkenItems)))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(grownItems)));
 
     render(<App />);
 
@@ -1511,7 +1496,7 @@ describe("App", () => {
     expect(within(inventoryTable).getByText("Item 0101")).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     );
 
     await waitFor(() => {
@@ -1529,7 +1514,7 @@ describe("App", () => {
     ).not.toBeInTheDocument();
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Recheck Steam access" })
+      await screen.findByRole("button", { name: "Refresh inventory" })
     );
 
     await waitFor(() => {
@@ -1546,6 +1531,37 @@ describe("App", () => {
     expect(
       within(refreshedInventoryTable).queryByText("Item 0351")
     ).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("preserves good inventory data and announces an unavailable refresh", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    const failureMessage =
+      "Steam could not provide the inventory right now.";
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...privateInventory,
+          status: "unavailable",
+          message: failureMessage
+        })
+      );
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "What is in your inventory" });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh inventory" })
+    );
+
+    const message =
+      "We could not refresh inventory right now. Your previous inventory results have not changed.";
+    expect(await screen.findByText(message, { selector: ".action-status" }))
+      .toBeInTheDocument();
+    expect(screen.getByText("Item 0001")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
@@ -1575,79 +1591,62 @@ describe("App", () => {
   it.each([undefined, "30", -1, 1.5, Number.MAX_SAFE_INTEGER])(
     "rejects an invalid inventory retry envelope (%j)",
     async (retryAfterSeconds) => {
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        jsonResponse({
-          ...signedInSession,
-          checks: {
-            ...signedInSession.checks,
-            inventory: {
-              ...signedInSession.checks.inventory,
-              retry_after_seconds: retryAfterSeconds
-            }
-          }
-        })
-      );
+      vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse(signedInSession))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...privateInventory,
+            retry_after_seconds: retryAfterSeconds
+          })
+        );
 
       render(<App />);
 
       expect(
-        await screen.findByRole("heading", {
-          name: "Steam connection is unavailable."
-        })
+        await screen.findByRole("heading", { name: "Alyx" })
       ).toBeInTheDocument();
       expect(
-        screen.queryByRole("heading", { name: signedInSession.user.display_name })
-      ).not.toBeInTheDocument();
+        await screen.findByRole("article", { name: "Steam inventory" })
+      ).toHaveTextContent(/could not load|checking/i);
     }
   );
 
   it.each([undefined, null, 0, "true"])(
     "rejects an invalid inventory rate-limit marker (%j)",
     async (rateLimited) => {
-      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-        jsonResponse({
-          ...signedInSession,
-          checks: {
-            ...signedInSession.checks,
-            inventory: {
-              ...signedInSession.checks.inventory,
-              rate_limited: rateLimited
-            }
-          }
-        })
-      );
+      vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse(signedInSession))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            ...privateInventory,
+            rate_limited: rateLimited
+          })
+        );
 
       render(<App />);
 
       expect(
-        await screen.findByRole("heading", {
-          name: "Steam connection is unavailable."
-        })
+        await screen.findByRole("heading", { name: "Alyx" })
       ).toBeInTheDocument();
+      expect(
+        await screen.findByRole("article", { name: "Steam inventory" })
+      ).toHaveTextContent(/could not load|checking/i);
     }
   );
-
   it("labels an unavailable upstream check separately from privacy", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse({
-        ...signedInSession,
-        checks: {
-          profile: {
-            status: "unavailable",
-            message: "The Steam Web API is not configured."
-          },
-          inventory: {
-            ...signedInSession.checks.inventory,
-            status: "public",
-            message: "Your Steam inventory is publicly accessible.",
-            retry_after_seconds: null,
-            rate_limited: false,
-            gem_status: "complete",
-            gem_message: "No trading cards require gem prices."
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...signedInSession,
+          checks: {
+            profile: {
+              status: "unavailable",
+              message: "The Steam Web API is not configured."
+            }
           }
-        }
-      })
-    );
+        })
+      )
+      .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
 
@@ -1665,21 +1664,17 @@ describe("App", () => {
   it("shows the backend 429 copy and rate-limit guidance instead of privacy guidance", async () => {
     const rateLimitMessage =
       "Steam is temporarily limiting inventory checks. Try again in 30 seconds.";
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse({
-        ...sessionWithRetry(30),
-        checks: {
-          ...sessionWithRetry(30).checks,
-          inventory: {
-            ...signedInSession.checks.inventory,
-            status: "unavailable",
-            message: rateLimitMessage,
-            retry_after_seconds: 30,
-            rate_limited: true
-          }
-        }
-      })
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...privateInventory,
+          status: "unavailable",
+          message: rateLimitMessage,
+          retry_after_seconds: 30,
+          rate_limited: true
+        })
+      );
 
     render(<App />);
 
@@ -1709,9 +1704,9 @@ describe("App", () => {
   it("applies an authoritative initial cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(3))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(3)));
 
     render(<App />);
     await act(async () => { });
@@ -1719,93 +1714,94 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Alyx" })).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Repeated immediate recheck requests are disabled. Try again in 3s."
+        "Repeated immediate inventory refreshes are disabled. Try again in 3s."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
   });
 
-  it("updates the authoritative cooldown from a recheck response", async () => {
+  it("updates the authoritative cooldown from an inventory refresh response", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(sessionWithRetry(4)));
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(4)));
 
     render(<App />);
     await act(async () => { });
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     );
     await act(async () => { });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(
       screen.getByText(
-        "Repeated immediate recheck requests are disabled. Try again in 4s."
+        "Repeated immediate inventory refreshes are disabled. Try again in 4s."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
   });
-
-  it("guards recheck without fetching during cooldown", async () => {
+  it("guards inventory refresh without fetching during cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(5))
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(5)));
 
     render(<App />);
     await act(async () => { });
 
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
-    expect(recheckButton).toBeDisabled();
+    expect(refreshButton).toBeDisabled();
 
-    recheckButton.removeAttribute("disabled");
-    fireEvent.click(recheckButton);
+    refreshButton.removeAttribute("disabled");
+    fireEvent.click(refreshButton);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("ignores wall-clock jumps while enforcing cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(5))
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(5)));
 
     render(<App />);
     await act(async () => { });
 
     vi.setSystemTime(new Date("2026-08-27T12:00:00Z"));
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
-    recheckButton.removeAttribute("disabled");
-    fireEvent.click(recheckButton);
+    refreshButton.removeAttribute("disabled");
+    fireEvent.click(refreshButton);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
-
-  it("counts down with ceil and enables recheck at the deadline", async () => {
+  it("counts down with ceil and enables refresh at the deadline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(2))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(2)));
 
     render(<App />);
     await act(async () => { });
 
-    const recheckButton = screen.getByRole("button", {
-      name: "Recheck Steam access"
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh inventory"
     });
     expect(screen.getByText(/Try again in 2s\./i)).toBeInTheDocument();
 
@@ -1813,55 +1809,48 @@ describe("App", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(screen.getByText(/Try again in 1s\./i)).toBeInTheDocument();
-    expect(recheckButton).toBeDisabled();
+    expect(refreshButton).toBeDisabled();
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
     expect(
-      screen.queryByText(/Repeated immediate recheck requests are disabled/i)
+      screen.queryByText(/Repeated immediate inventory refreshes are disabled/i)
     ).not.toBeInTheDocument();
-    expect(recheckButton).toBeEnabled();
+    expect(refreshButton).toBeEnabled();
   });
-
   it("keeps logout available throughout an inventory cooldown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-26T12:00:00Z"));
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(sessionWithRetry(30))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventoryWithRetry(30)));
 
     render(<App />);
     await act(async () => { });
 
     expect(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Refresh inventory" })
     ).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Sign out on this device" })
     ).toBeEnabled();
   });
 
-  it("rechecks both access results with credentials and announces both current labels", async () => {
+  it("rechecks profile access separately from cached inventory", async () => {
     const refreshedSession = {
       ...signedInSession,
       checks: {
         profile: {
           status: "private",
           message: "Profile access was checked again."
-        },
-        inventory: {
-          ...signedInSession.checks.inventory,
-          status: "unavailable",
-          message: "Inventory access was checked again.",
-          retry_after_seconds: null,
-          rate_limited: false
         }
       }
     };
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(jsonResponse(refreshedSession));
 
     render(<App />);
@@ -1869,32 +1858,38 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Alyx" });
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Recheck Steam profile" })
     );
 
     await waitFor(() => {
-      expect(screen.getByText("Inventory access was checked again.")).toBeInTheDocument();
+      expect(screen.getByText("Profile access was checked again.")).toBeInTheDocument();
     });
+    expect(
+      within(screen.getByRole("article", { name: "Steam profile" })).getByText(
+        "Private"
+      )
+    ).toBeInTheDocument();
     expect(
       within(
         screen.getByRole("article", { name: "Steam inventory" })
-      ).getByText("Unavailable")
+      ).getByText("Private")
     ).toBeInTheDocument();
     expect(statusRegion).toHaveTextContent(
-      "Recheck complete. Steam profile: Private. Steam inventory: Unavailable."
+      "Profile recheck complete. Steam profile: Private."
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       "/api/auth/session",
       expect.objectContaining({ credentials: "include" })
     );
   });
 
-  it("keeps recheck failures visible and announced without replacing prior results", async () => {
+  it("keeps profile recheck failures visible and announced without replacing prior results", async () => {
     const message =
-      "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
+      "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(new Response(null, { status: 503 }));
 
     render(<App />);
@@ -1902,7 +1897,7 @@ describe("App", () => {
     await screen.findByRole("heading", { name: "Alyx" });
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
+      screen.getByRole("button", { name: "Recheck Steam profile" })
     );
 
     await waitFor(() => {
@@ -1917,6 +1912,7 @@ describe("App", () => {
       ).getByText("Private")
     ).toBeInTheDocument();
   });
+
 
   it("groups trading cards by game, keeps fallback and Other groups, and sorts within groups", async () => {
     const alphaCard = tradingCardItem(1, {
@@ -1967,9 +1963,9 @@ describe("App", () => {
         }
       }
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -2070,9 +2066,9 @@ describe("App", () => {
       gem_retry_after_seconds: 30,
       gem_cash_context: null
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
@@ -2121,7 +2117,8 @@ describe("App", () => {
     });
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
       .mockResolvedValueOnce(
         jsonResponse({
           values: [
@@ -2162,16 +2159,16 @@ describe("App", () => {
       within(screen.getByText("Card 0002").closest("tr") as HTMLElement)
         .getByText("100")
     ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
+      3,
       "/api/auth/gems",
       expect.objectContaining({
         credentials: "include",
         method: "POST"
       })
     );
-    const request = fetchMock.mock.calls[1][1] as RequestInit;
+    const request = fetchMock.mock.calls[2][1] as RequestInit;
     expect(JSON.parse(request.body as string)).toEqual({
       groups: [
         { game_app_id: "440", card_rarity: "foil" },
@@ -2187,22 +2184,20 @@ describe("App", () => {
       item_type: "other",
       game_app_id: "440"
     };
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(
-        publicInventorySession(publicInventory([malformedItem]))
-      )
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(publicInventory([malformedItem]))
+      );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
-      })
+      await screen.findByRole("heading", { name: "Alyx" })
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "What is in your inventory" })
-    ).not.toBeInTheDocument();
+      await screen.findByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent(/could not load|checking/i);
   });
   it("rejects partially populated trading-card metadata", async () => {
     const malformedCard = tradingCardItem(1, {
@@ -2216,26 +2211,25 @@ describe("App", () => {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 0
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse(publicInventorySession(inventory))
-    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Steam connection is unavailable."
-      })
+      await screen.findByRole("heading", { name: "Alyx" })
     ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("article", { name: "Steam inventory" })
+    ).toHaveTextContent(/could not load|checking/i);
   });
-
-
   it("clears the local session with a credentialed logout POST", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
-
     render(<App />);
 
     await screen.findByRole("heading", { name: "Alyx" });
@@ -2251,7 +2245,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("status")).toBe(statusRegion);
     expect(statusRegion).toHaveTextContent("Signed out successfully.");
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/auth/logout", {
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/auth/logout", {
       credentials: "include",
       method: "POST"
     });

@@ -31,6 +31,7 @@ export default defineRailway(() => {
       ENVIRONMENT: preserve(),
       FRONTEND_URL: preserve(),
       GEM_PRICE_CACHE_PATH: "/data/gem_prices.sqlite3",
+      STEAMAPIS_PRICE_CACHE_PATH: "/data/steamapis_prices.sqlite3",
       PUBLIC_BACKEND_URL: preserve(),
       SIGNING_SECRET: preserve(),
       STEAM_WEB_API_KEY: preserve(),

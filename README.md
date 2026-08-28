@@ -22,7 +22,7 @@ Prerequisites for a fresh Linux, macOS, or Windows development environment:
 - Optional: a server-only [Steam Web API key](https://steamcommunity.com/dev/apikey) for a
   conclusive profile-visibility result.
 - A server-only SteamApis v2 key in `STEAMAPI_KEY` for complete public AppID 753/context 6 inventory
-  retrieval and current bulk AppID 753 prices.
+  retrieval and the lazily refreshed global normalized AppID 753 market-price cache.
 
 Install and run the backend:
 
@@ -31,7 +31,7 @@ cd backend
 uv sync
 cp .env.example .env
 # Set a random SIGNING_SECRET in .env. STEAM_WEB_API_KEY is optional for profile visibility;
-# STEAMAPI_KEY enables SteamApis inventory retrieval and bulk prices.
+# STEAMAPI_KEY enables SteamApis inventory retrieval and the global normalized price cache.
 uv run uvicorn app.main:app --reload
 ```
 
@@ -61,37 +61,55 @@ The current connection and inventory stage provides:
 
 - Browser-based Steam OpenID 2.0 authentication.
 - An application-owned, signed, HTTP-only session.
+- A profile-only server session check: `GET /api/auth/session` checks profile visibility and does
+  not request inventory.
+- Inventory is requested once on an authenticated client cache miss (including an account-change or
+  invalid-schema miss) or when the user explicitly selects **Refresh inventory**; session rechecks
+  do not request inventory. Each request names the expected SteamID64, which the backend verifies
+  against the signed session before fetching data. The authenticated inventory response is
+  `Cache-Control: no-store`; successful public/private data is retained only in the browser cache
+  described below.
 - Server-only SteamApis v2 access through `STEAMAPI_KEY`; this credential never reaches the browser.
 - Complete public AppID 753/context 6 inventory retrieval, following provider pagination and combining
   all pages.
-- Current bulk AppID 753 prices joined to marketable inventory items, with explicit `complete`,
+- Successful public or private inventory results persist in browser IndexedDB records keyed to
+  SteamID64, with a schema version and ISO refresh timestamp. The client renders a valid matching
+  record without an inventory request; inventory is never stored in cookies or `localStorage`.
+  Logout, account change, and invalid or incompatible cache schema clear the affected records.
+  Cache-clearing operations also advance a shared IndexedDB epoch so older in-flight requests cannot
+  repopulate deleted records. Transient `unavailable` inventory results are not persisted and do not
+  replace a prior good result.
+- A global normalized AppID 753 market-price generation persisted in a separate server-side SQLite
+  cache. It is fresh for 24 hours, refreshes lazily when a request finds it stale, has no scheduled
+  refresh job, and serves the last valid generation as a stale fallback when a provider refresh fails.
+- Current cached AppID 753 prices are joined to marketable inventory items, with explicit `complete`,
   `partial`, or `unavailable` price coverage: `complete` when all priceable rows are priced,
   `partial` when some but not all priceable rows are priced, and `unavailable` when zero
-  priceable rows are priced or the provider is unavailable.
+  priceable rows are priced or no usable provider generation exists.
 - A responsive, sortable inventory interface that paginates all retrieved items, lets users switch
   game grouping on or off, and filters marketable trading cards whose exact per-card gem cash value
   exceeds their current lowest-sell market price.
 
 SteamApis is a third-party provider: inventory availability, response fields, and price snapshots
-depend on provider data and availability and may differ from Steam Community at a given time. The
-UI classifies price coverage as `complete` when all priceable rows are priced, `partial` when some
-but not all priceable rows are priced, and `unavailable` when zero priceable rows are priced or
-the provider is unavailable. Unavailable prices remain unpriced. SteamApis omits currency metadata from
-its bulk feed. Order-book values are preserved exactly as provider-denominated decimals and displayed
-without a currency symbol. Optimization must not treat them as monetary values until an authoritative
-currency contract or explicit configuration exists.
-Inventory and market payloads are fetched on request and never persisted. Only validated semantic
-gem-yield cache rows persist in a versioned SQLite database on the attached `backend-data` Railway
-volume, mounted at `/data` with `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Uncached or expired
-gem-yield entries warm in one background worker while cached positive values return immediately.
-Ordinary restarts and redeploys preserve cache rows; only an explicit `CACHE_SCHEMA_VERSION` change or
-an incompatible/corrupt database resets them. Railway services run in exact EU-West region
-`europe-west4-drams3a`.
+depend on provider data and availability and may differ from Steam Community at a given time. A
+market-price generation can therefore be up to 24 hours old, and a previous valid generation can
+remain in use when a lazy refresh fails. The UI classifies price coverage as `complete` when all
+priceable rows are priced, `partial` when some but not all priceable rows are priced, and
+`unavailable` when zero priceable rows are priced or no usable provider generation exists. SteamApis
+omits currency metadata from its bulk feed. Order-book values are preserved exactly as
+provider-denominated decimals and displayed without a currency symbol. Optimization must not treat
+them as monetary values until an authoritative currency contract or explicit configuration exists.
+The provider feed is streamed and discarded after normalization; the raw feed, API key, and redirect
+URL are not persisted.
 
-Steam handles passwords and Steam Guard. Steam Optimizer receives only the verified SteamID64,
-creates its own local session, and sends that identifier to upstream providers for requested data.
-It cannot retrieve a private inventory or buy, sell, trade, craft, or otherwise modify a Steam
-account.
+The browser inventory cache and server market cache have separate retention boundaries. Ordinary
+browser sessions reuse valid matching public/private records until logout, account change, invalid
+schema, or explicit refresh; the displayed timestamp identifies when that record was refreshed.
+Only validated semantic gem-yield rows and normalized global market-price rows persist server-side in
+separate SQLite caches on the attached `backend-data` Railway volume. Ordinary restarts and redeploys
+preserve those rows; incompatible or corrupt cache data is reset according to its cache schema.
+Railway services run in exact EU-West region `europe-west4-drams3a`.
+
 
 ## Why
 
@@ -99,7 +117,8 @@ Owned cards have an opportunity cost: crafting an expensive owned set can be wor
 it and buying a cheaper badge. Steam Optimizer is intended to make those trade-offs explicit,
 showing cash outlay separately from foregone sale or gem value only after an authoritative currency
 contract or explicit configuration exists. The optimizer itself remains deferred; this stage now reads
-the complete public inventory and current bulk order-book values before future optimization work.
+the complete public inventory and normalized cached AppID 753 order-book values (normally no more than
+24 hours old, with stale fallback on refresh failure) before future optimization work.
 
 ## Configuration and Deployment
 
@@ -122,14 +141,16 @@ For separate Railway frontend and backend services in EU-West (`europe-west4-dra
 - `STEAM_WEB_API_KEY` is optional and belongs only in the backend environment. It enables the
   profile-visibility check.
 - `STEAMAPI_KEY` belongs only in the backend environment and is never exposed to the browser. It
-  enables SteamApis v2 inventory retrieval and current bulk AppID 753 prices.
+  enables SteamApis v2 inventory retrieval and the global normalized AppID 753 price cache.
 
 Each service has its own Dockerfile. Infrastructure is managed separately with the current
 `.railway/railway.ts`, which retains one backend replica and attaches the `backend-data` volume in
-exact EU-West region `europe-west4-drams3a` at `/data`; it intentionally leaves volume size
-unspecified so an existing manually-created volume is not resized or replaced. The release workflow
-deploys source code with `railway up` and does not apply infrastructure or create, delete, or replace
-the attached volume.
+exact EU-West region `europe-west4-drams3a` at `/data`. It intentionally leaves volume size
+unspecified so an existing manually-created volume is not resized or replaced. The cache paths are
+`GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3` and
+`STEAMAPIS_PRICE_CACHE_PATH=/data/steamapis_prices.sqlite3`. The release workflow deploys source
+code with `railway up` and does not apply infrastructure or create, delete, or replace the attached
+volume. Market-price refresh is lazy and request-triggered; there is no scheduled refresh job.
 
 ### Production release deployment
 
@@ -228,57 +249,77 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 - Non-free components: Steam is a proprietary external service; no non-free component is bundled
   in this repository.
 - Centralized services and terms: authentication uses Steam Community/OpenID. Inventory retrieval and
-  current AppID 753 bulk pricing use the third-party SteamApis v2 provider. Profile visibility uses
-  Valve's documented [Steam Web API](https://steamcommunity.com/dev) when `STEAM_WEB_API_KEY` is
-  configured. `STEAMAPI_KEY` is server-only; neither credential is sent to the browser. SteamApis
-  response availability, fields, and price snapshots are provider/data-source caveats rather than
-  Valve guarantees. Price coverage is `complete` when all priceable rows are priced, `partial` when
-  some but not all priceable rows are priced, and `unavailable` when zero priceable rows are priced
-  or the provider is unavailable. SteamApis omits currency metadata from its bulk feed: order-book values
-  are preserved exactly as provider-denominated decimals and displayed without a currency symbol.
-  Optimization must not treat them as monetary values until an authoritative currency contract or explicit
-  configuration exists. The
-  100,000-call daily term in
-  [Valve's API terms](https://steamcommunity.com/dev/apiterms) describes the Web API, not a
-  documented quota for SteamApis.
+  lazy global AppID 753 market-price refreshes use the third-party SteamApis v2 provider. Profile
+  visibility uses Valve's documented [Steam Web API](https://steamcommunity.com/dev) when
+  `STEAM_WEB_API_KEY` is configured. `STEAMAPI_KEY` is server-only; neither credential is sent to
+  the browser or persisted in the caches. SteamApis response availability, fields, pagination, and
+  price snapshots are provider/data-source caveats rather than Valve guarantees. Price coverage is
+  `complete` when all priceable rows are priced, `partial` when some but not all priceable rows are
+  priced, and `unavailable` when zero priceable rows are priced or no usable provider generation
+  exists. SteamApis omits currency metadata from its bulk feed: order-book values are preserved
+  exactly as provider-denominated decimals and displayed without a currency symbol. Optimization
+  must not treat them as monetary values until an authoritative currency contract or explicit
+  configuration exists. The 100,000-call daily term in [Valve's API terms](https://steamcommunity.com/dev/apiterms)
+  describes the Web API, not a documented quota for SteamApis.
 - Deployment caveat: both Railway services run in exact EU-West region `europe-west4-drams3a`. The
   backend attaches the `backend-data` volume at `/data` and uses the literal
-  `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`; source-only `railway up` releases preserve that
-  volume rather than creating, deleting, or replacing it. Inventory and market payloads remain
-  request-only; only validated semantic gem-yield cache rows persist.
+  `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3` and
+  `STEAMAPIS_PRICE_CACHE_PATH=/data/steamapis_prices.sqlite3`; source-only `railway up` releases
+  preserve that volume rather than creating, deleting, or replacing it. The global market cache
+  persists only normalized AppID 753 fields in its separate SQLite file, refreshes lazily for a
+  24-hour freshness window, and uses the last valid generation on refresh failure. Raw provider
+  feeds, API keys, and redirect URLs are not persisted. Successful public/private inventory
+  results persist only in browser IndexedDB keyed to SteamID64, never in cookies or `localStorage`;
+  logout, account change, and invalid schema clear them, while transient unavailable results are not
+  persisted. There is no scheduled refresh job.
 
 ### Privacy and Steam Data Policy
 
 This section is Steam Optimizer's published privacy policy. It applies to the deployed service and
-was last updated on 2026-08-27.
+was last updated on 2026-08-28.
 
-- Data handling and privacy policy: the browser redirects to Steam for login, and the backend sends
-  the verified SteamID64 to Steam and SteamApis only for the user's requested checks. Steam data is
-  presented as-is; the app does not automate transactions or degrade Steam. No Steam password or
-  Steam Guard code is received or stored. The signed, HTTP-only session cookie contains the
-  SteamID64 on the user's device for up to 24 hours by default; it is sent to the Railway-hosted
-  backend on session requests and cleared by logout or expiry.
-  Each requested check retrieves the complete public AppID
-  753/context 6 inventory through provider pagination and reads a current bulk AppID 753 price
-  snapshot. Results are joined in process memory for the response; inventory and market price payloads
-  are not cached or persisted. Only validated semantic gem-yield cache rows persist in the versioned
-  SQLite cache; ordinary restarts and redeploys preserve rows, with reset limited to an explicit
-  `CACHE_SCHEMA_VERSION` change or an incompatible/corrupt database. Price coverage is `complete` when
-  priced, `partial` when some but not all priceable rows are priced, and `unavailable` when zero
-  priceable rows are priced or the provider is unavailable. Null prices remain visible as such. The
-  SteamApis omits currency metadata from its bulk feed. Order-book values are preserved exactly as
-  provider-denominated decimals and displayed without a currency symbol. Optimization must not treat
-  them as monetary values until an authoritative currency contract or explicit configuration exists.
-- SteamApis provider caveat: the provider controls upstream availability, pagination behavior,
-  response fields, and the currentness of bulk prices. A public Steam inventory remains required;
-  provider failures can leave the inventory unavailable or price coverage unavailable without
-  implying that the account is private.
+- Data handling and privacy policy: the browser redirects to Steam for login, and the backend
+  receives the verified SteamID64. The signed, HTTP-only session cookie contains that identifier
+  on the user's device for up to 24 hours by default; it is sent to the Railway-hosted backend for
+  authenticated requests and cleared by logout or expiry. The session endpoint checks profile
+  visibility only. It does not request inventory, and inventory data is never placed in a cookie.
+  Steam handles passwords and Steam Guard; Steam Optimizer never receives or stores either.
+- Inventory retention and refresh: after authentication, the client reads one current-user browser
+  IndexedDB record keyed to SteamID64. A valid matching public/private record is rendered without
+  an inventory API call. A missing, mismatched, corrupt, or incompatible-schema record triggers one
+  inventory request; thereafter only an explicit **Refresh inventory** requests it again. Each
+  successful public/private result replaces the record and stores its schema version, SteamID64, and
+  ISO refresh timestamp, which the UI displays. Logout and account change clear old inventory
+  records, and invalid schema data is removed. Transient `unavailable` responses are not persisted
+  and do not overwrite a prior successful record. Inventory is not persisted server-side, in
+  cookies, or in `localStorage`.
+- Market-price retention and provider freshness: market prices are a global AppID 753 generation,
+  not user-specific inventory data. The backend stores normalized fields only in a separate SQLite
+  cache, fresh for 24 hours. It refreshes lazily when a request finds the generation stale, has no
+  scheduled job, and serves the last valid generation as a stale fallback when refresh fails.
+  The provider feed is streamed rather than materialized or retained. The raw feed, `STEAMAPI_KEY`,
+  and redirect URL are not persisted. The separate cache survives ordinary restarts and redeploys
+  on the Railway `backend-data` volume at `/data/steamapis_prices.sqlite3`; it is not cleared by a
+  user's logout because it contains no SteamID linkage. Price coverage is `complete` when all
+  priceable rows are priced, `partial` when some but not all priceable rows are priced, and
+  `unavailable` when zero priceable rows are priced or no usable provider generation exists. Null
+  prices remain visible as such.
+- Currency and upstream caveats: SteamApis omits currency metadata from its bulk feed. Order-book
+  values are preserved exactly as provider-denominated decimals and displayed without a currency
+  symbol. Optimization must not treat them as monetary values until an authoritative currency
+  contract or explicit configuration exists. SteamApis controls upstream availability, pagination,
+  response fields, and price freshness; a cached generation may be stale after a failed refresh.
+  A public Steam inventory remains required, and provider failures can leave inventory or price
+  coverage unavailable without implying that the account is private.
 - Sign-in branding: the local button uses the [Steam-requested sign-in
   artwork](https://steamcommunity.com/dev); it does not imply Valve or Steam endorsement or
   affiliation.
 
-Users can clear the local session through **Sign out on this device** or by deleting the browser
-cookie. Questions or deletion requests can be filed through the repository's
+Users can clear the local session through **Sign out on this device**; signing out also clears the
+browser's IndexedDB inventory records. Deleting browser site data clears the local session and
+inventory cache, and an account change invalidates the prior account's records. The global
+server-side market and gem caches are not keyed to a user's SteamID and therefore are not part of
+logout deletion. Questions or deletion requests can be filed through the repository's
 [GitHub issues](https://github.com/TheRockPusher/Steam_Optimizer/issues).
 
 ### Steam Data Disclaimer
