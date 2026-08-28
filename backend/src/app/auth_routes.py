@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -16,6 +16,11 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
+from app.booster_pricing import (
+    BoosterResolution,
+    BoosterScanResult,
+    derive_booster_gem_cost,
+)
 from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
 from app.steam_gateway import InventoryCheck, ProfileCheck
 from app.steam_openid import (
@@ -33,6 +38,8 @@ MAX_GEM_REFRESH_GROUPS = 10_000
 _DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
 _AUTHENTICATION_REQUIRED_MESSAGE = "Steam authentication is required."
 _GEM_REFRESH_UNAVAILABLE_MESSAGE = "Gem value refresh is unavailable."
+_INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
+_INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 
 Clock = Callable[[], datetime]
 
@@ -93,6 +100,22 @@ class GemRefreshValue(GemRefreshGroup):
     gem_yield: int = Field(ge=0)
 
 
+class BoosterRefreshValue(BaseModel):
+    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
+    card_set_size: int | None = Field(default=None, ge=5, le=15)
+    gem_cost: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_derived_cost(self) -> BoosterRefreshValue:
+        if (self.card_set_size is None) != (self.gem_cost is None):
+            raise ValueError(_INVALID_BOOSTER_PAIR_ERROR)
+        if self.card_set_size is not None and self.gem_cost != derive_booster_gem_cost(
+            self.card_set_size
+        ):
+            raise ValueError(_INVALID_BOOSTER_COST_ERROR)
+        return self
+
+
 class GemRefreshResponse(BaseModel):
     values: list[GemRefreshValue]
     pending_group_count: int = Field(ge=0)
@@ -102,6 +125,8 @@ class GemRefreshResponse(BaseModel):
         ge=0,
         le=900,
     )
+    boosters: list[BoosterRefreshValue] = Field(default_factory=list)
+    pending_booster_count: int = Field(default=0, ge=0)
 
 
 def _utc_now() -> datetime:
@@ -428,6 +453,7 @@ def create_auth_router(
         groups = {
             (group.game_app_id, group.card_rarity): None for group in payload.groups
         }
+        requested_groups = tuple(sorted(groups))
         try:
             scan = await steam_gateway.refresh_gems(groups)
         except (
@@ -443,18 +469,100 @@ def create_auth_router(
                 status_code=503,
                 detail=_GEM_REFRESH_UNAVAILABLE_MESSAGE,
             ) from error
-        return GemRefreshResponse(
-            values=[
-                GemRefreshValue(
-                    game_app_id=key[0],
-                    card_rarity=key[1],
-                    gem_yield=resolution.gem_yield,
+
+        requested_booster_ids = tuple(
+            sorted(
+                {group.game_app_id for group in payload.groups},
+                key=lambda value: (len(value), value),
+            )
+        )
+        booster_pending_count = len(requested_booster_ids)
+        booster_scan = BoosterScanResult(
+            values={},
+            pending_count=booster_pending_count,
+        )
+        if requested_booster_ids:
+            try:
+                candidate_booster_scan = await steam_gateway.refresh_boosters(
+                    requested_booster_ids
                 )
-                for key, resolution in sorted(scan.values.items())
-            ],
-            pending_group_count=scan.pending_count,
+                if isinstance(candidate_booster_scan, BoosterScanResult):
+                    booster_scan = candidate_booster_scan
+                    booster_pending_count = min(
+                        len(requested_booster_ids),
+                        max(0, candidate_booster_scan.pending_count),
+                    )
+            except (
+                AttributeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                # Booster refresh is independent; unknown values remain null.
+                booster_scan = BoosterScanResult(
+                    values={},
+                    pending_count=booster_pending_count,
+                )
+
+        gem_values = []
+        for key in requested_groups:
+            resolution = scan.values.get(key)
+            gem_yield = getattr(resolution, "gem_yield", None)
+            if (
+                isinstance(gem_yield, int)
+                and not isinstance(gem_yield, bool)
+                and gem_yield >= 0
+            ):
+                gem_values.append(
+                    GemRefreshValue(
+                        game_app_id=key[0],
+                        card_rarity=key[1],
+                        gem_yield=gem_yield,
+                    )
+                )
+
+        booster_values = []
+        for game_app_id in requested_booster_ids:
+            resolution = (
+                booster_scan.values.get(game_app_id)
+                if isinstance(booster_scan.values, Mapping)
+                else None
+            )
+            if not isinstance(resolution, BoosterResolution):
+                resolution = None
+            try:
+                booster_values.append(
+                    BoosterRefreshValue(
+                        game_app_id=game_app_id,
+                        card_set_size=(
+                            resolution.card_set_size if resolution is not None else None
+                        ),
+                        gem_cost=(
+                            resolution.gem_cost if resolution is not None else None
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                booster_values.append(
+                    BoosterRefreshValue(
+                        game_app_id=game_app_id,
+                        card_set_size=None,
+                        gem_cost=None,
+                    )
+                )
+        return GemRefreshResponse(
+            values=gem_values,
+            pending_group_count=min(
+                len(requested_groups),
+                max(0, scan.pending_count),
+            ),
             gem_rate_limited=scan.rate_limited,
             gem_retry_after_seconds=scan.retry_after_seconds,
+            boosters=booster_values,
+            pending_booster_count=booster_pending_count,
         )
 
     @router.post("/api/auth/logout", status_code=204)

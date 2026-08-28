@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -14,11 +14,18 @@ import ijson
 from ijson.common import IncompleteJSONError, JSONError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.booster_pricing import (
+    BoosterPricingService,
+    BoosterResolution,
+    BoosterScanResult,
+    derive_booster_gem_cost,
+)
 from app.gem_pricing import (
     SACK_OF_GEMS_MARKET_HASH_NAME,
     CardRarity,
     GemPricingService,
     GemScanResult,
+    SteamCommunityLimiter,
     canonical_decimal,
     gem_cash_value,
     parse_card_metadata,
@@ -41,6 +48,8 @@ STEAM_OPTIMIZER_USER_AGENT = (
 _CANONICAL_SACK_PRICE_ERROR = "Sack price must be a canonical decimal."
 _CANONICAL_GEM_CASH_VALUE_ERROR = "Gem cash value must be a canonical decimal."
 _INVALID_ITEM_GEM_METADATA_ERROR = "Inventory item gem metadata is inconsistent."
+_INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
+_INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 
 CheckStatus = Literal["public", "private", "unavailable"]
 PriceStatus = Literal["complete", "partial", "unavailable"]
@@ -118,13 +127,25 @@ class InventoryPrice(BaseModel):
 
 
 class BoosterInfo(BaseModel):
-    game_app_id: str = Field(pattern=r"^[0-9]+$")
+    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
     game_name: str | None = Field(default=None, max_length=MAX_INVENTORY_TEXT_LENGTH)
     market_hash_name: str | None = Field(
         default=None, max_length=MAX_PRICE_STREAM_SCALAR_LENGTH
     )
     card_count: Literal[3] = BOOSTER_CARD_COUNT
+    card_set_size: int | None = Field(default=None, ge=5, le=15)
+    gem_cost: int | None = Field(default=None, ge=0)
     price: InventoryPrice | None = None
+
+    @model_validator(mode="after")
+    def validate_derived_cost(self) -> BoosterInfo:
+        if (self.card_set_size is None) != (self.gem_cost is None):
+            raise ValueError(_INVALID_BOOSTER_PAIR_ERROR)
+        if self.card_set_size is not None and self.gem_cost != derive_booster_gem_cost(
+            self.card_set_size
+        ):
+            raise ValueError(_INVALID_BOOSTER_COST_ERROR)
+        return self
 
 
 class GemCashContext(BaseModel):
@@ -251,6 +272,13 @@ class SteamGatewayProtocol(Protocol):
         groups: Mapping[tuple[str, CardRarity], None],
     ) -> GemScanResult:
         """Read cached gem values without fetching a Steam inventory."""
+        ...
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        """Read cached booster card-set sizes without fetching an inventory."""
         ...
 
 
@@ -687,7 +715,9 @@ def _booster_games(items: list[InventoryItem]) -> list[tuple[str, str | None]]:
 def _booster_infos(
     games: list[tuple[str, str | None]],
     prices: Mapping[str, InventoryPrice],
+    resolutions: Mapping[str, BoosterResolution] | None = None,
 ) -> list[BoosterInfo]:
+    resolved = resolutions or {}
     boosters: list[BoosterInfo] = []
     for game_app_id, game_name in games:
         market_hash_name = (
@@ -695,12 +725,25 @@ def _booster_infos(
             if game_name is not None
             else None
         )
+        resolution = resolved.get(game_app_id)
+        try:
+            is_valid_resolution = isinstance(
+                resolution, BoosterResolution
+            ) and resolution.gem_cost == derive_booster_gem_cost(
+                resolution.card_set_size
+            )
+        except (TypeError, ValueError):
+            is_valid_resolution = False
+        if not is_valid_resolution:
+            resolution = None
         boosters.append(
             BoosterInfo(
                 game_app_id=game_app_id,
                 game_name=game_name,
                 market_hash_name=market_hash_name,
                 card_count=BOOSTER_CARD_COUNT,
+                card_set_size=resolution.card_set_size if resolution else None,
+                gem_cost=resolution.gem_cost if resolution else None,
                 price=prices.get(market_hash_name)
                 if market_hash_name is not None
                 else None,
@@ -1025,6 +1068,8 @@ class SteamApisClient:
         bulk_http_client: AsyncHTTPClient | None = None,
         bulk_timeout_seconds: float | None = None,
         gem_pricing: GemPricingService | None = None,
+        booster_pricing: BoosterPricingService | None = None,
+        limiter: SteamCommunityLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -1035,12 +1080,30 @@ class SteamApisClient:
             else settings.steam_bulk_timeout_seconds
         )
         self._inventory_inflight: dict[str, asyncio.Task[InventoryCheck]] = {}
+        shared_limiter = limiter
+        if shared_limiter is None and gem_pricing is not None:
+            candidate_limiter = getattr(gem_pricing, "limiter", None)
+            if isinstance(candidate_limiter, SteamCommunityLimiter):
+                shared_limiter = candidate_limiter
+        if shared_limiter is None and booster_pricing is not None:
+            candidate_limiter = getattr(booster_pricing, "limiter", None)
+            if isinstance(candidate_limiter, SteamCommunityLimiter):
+                shared_limiter = candidate_limiter
+        self.community_limiter = shared_limiter or SteamCommunityLimiter()
         self.gem_pricing = gem_pricing or GemPricingService(
-            settings, http_client=http_client
+            settings,
+            http_client=http_client,
+            limiter=self.community_limiter,
+        )
+        self.booster_pricing = booster_pricing or BoosterPricingService(
+            settings,
+            http_client=http_client,
+            limiter=self.community_limiter,
         )
 
     async def start(self) -> None:
         await self.gem_pricing.start()
+        await self.booster_pricing.start()
 
     async def stop(self) -> None:
         inventory_tasks = tuple(self._inventory_inflight.values())
@@ -1050,6 +1113,7 @@ class SteamApisClient:
         if inventory_tasks:
             await asyncio.gather(*inventory_tasks, return_exceptions=True)
         self._inventory_inflight.clear()
+        await self.booster_pricing.stop()
         await self.gem_pricing.stop()
 
     @property
@@ -1263,7 +1327,31 @@ class SteamApisClient:
             RuntimeError,
         ):
             price_lookup = _unavailable_price_lookup()
-        boosters = _booster_infos(booster_games, price_lookup.prices)
+
+        booster_scan = BoosterScanResult(values={})
+        if booster_games:
+            try:
+                candidate_booster_scan = await self.booster_pricing.resolve(
+                    game_app_id for game_app_id, _ in booster_games
+                )
+                if isinstance(candidate_booster_scan, BoosterScanResult):
+                    booster_scan = candidate_booster_scan
+            except (
+                AttributeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                # Booster lookup failures must never affect inventory or gem data.
+                booster_scan = BoosterScanResult(values={})
+        boosters = _booster_infos(
+            booster_games,
+            price_lookup.prices,
+            booster_scan.values,
+        )
         for index, item in enumerate(items):
             if not item.marketable or item.market_hash_name is None:
                 continue
@@ -1455,6 +1543,9 @@ class SteamGateway:
         http_client: AsyncHTTPClient,
         bulk_http_client: AsyncHTTPClient | None = None,
         bulk_timeout_seconds: float | None = None,
+        gem_pricing: GemPricingService | None = None,
+        booster_pricing: BoosterPricingService | None = None,
+        limiter: SteamCommunityLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -1464,6 +1555,9 @@ class SteamGateway:
             http_client=http_client,
             bulk_http_client=bulk_http_client,
             bulk_timeout_seconds=bulk_timeout_seconds,
+            gem_pricing=gem_pricing,
+            booster_pricing=booster_pricing,
+            limiter=limiter,
         )
 
     async def start(self) -> None:
@@ -1555,3 +1649,9 @@ class SteamGateway:
         groups: Mapping[tuple[str, CardRarity], None],
     ) -> GemScanResult:
         return self.steamapis.gem_pricing.read_cached(groups)
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        return self.steamapis.booster_pricing.read_cached(game_app_ids)
