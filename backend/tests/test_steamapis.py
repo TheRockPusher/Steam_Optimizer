@@ -14,7 +14,13 @@ if TYPE_CHECKING:
 
 
 import app.steam_gateway as steam_gateway
-from app.gem_pricing import CardRarity, GemPriceCache, GemPricingService, GemScanResult
+from app.gem_pricing import (
+    GemKey,
+    GemPriceCache,
+    GemPricingService,
+    GemResolution,
+    GemScanResult,
+)
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -141,10 +147,8 @@ class FakeHTTPClient:
 
 
 class NoopGemPricing:
-    async def resolve(
-        self, groups: Mapping[tuple[str, CardRarity], str | None]
-    ) -> GemScanResult:
-        del groups
+    async def resolve(self, keys: Mapping[GemKey, str | None]) -> GemScanResult:
+        del keys
         return GemScanResult(values={})
 
 
@@ -206,6 +210,7 @@ def item_description(
     marketable: object = 0,
     tradable: object = 1,
     tags: list[dict[str, object]] | None = None,
+    owner_actions: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     description: dict[str, object] = {
         "classid": class_id,
@@ -218,6 +223,8 @@ def item_description(
     }
     if tags is not None:
         description["tags"] = tags
+    if owner_actions is not None:
+        description["owner_actions"] = owner_actions
     return description
 
 
@@ -235,10 +242,267 @@ def trading_card_tags(
     ]
 
 
+def goo_owner_actions(
+    *,
+    app_id: str = "753",
+    item_type: int = 5,
+    border_color: int = 0,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "link": (
+                "javascript:GetGooValue('%contextid%', '%assetid%', "
+                f"{app_id}, {item_type}, {border_color});"
+            )
+        }
+    ]
+
+
 def item_asset(
     class_id: str, *, instance_id: str = "0", amount: str = "1"
 ) -> dict[str, object]:
     return {"classid": class_id, "instanceid": instance_id, "amount": amount}
+
+
+def test_inventory_item_class_mapping_covers_full_item_type_union() -> None:
+    expected = [
+        "badge",
+        "trading_card",
+        "profile_background",
+        "emoticon",
+        "booster_pack",
+        "consumable",
+        "game_goo",
+        "profile_modifier",
+        "scene",
+        "sale_item",
+        "sticker",
+        "chat_effect",
+        "mini_profile_background",
+        "avatar_frame",
+        "animated_avatar",
+        "steam_deck_keyboard_skin",
+        "steam_deck_startup_movie",
+        "other",
+    ]
+    descriptions = [
+        item_description(
+            str(index),
+            item_type,
+            tags=[
+                {
+                    "category": "item_class",
+                    "internal_name": (
+                        f"item_class_{index}" if index < 18 else "item_class_999"
+                    ),
+                }
+            ],
+        )
+        for index, item_type in enumerate(expected, start=1)
+    ]
+    parsed = steam_gateway._parse_inventory_page(
+        page(
+            assets=[item_asset(str(index)) for index in range(1, len(expected) + 1)],
+            descriptions=descriptions,
+        )
+    )
+    assert parsed is not None
+    assert [description.item_type for description in parsed.descriptions] == expected
+    assert all(description.gem_key is None for description in parsed.descriptions)
+
+
+def test_inventory_gem_key_schema_publishes_canonical_bounds() -> None:
+    schema = steam_gateway.InventoryItem.model_json_schema()
+    gem_key_schema = schema["$defs"]["GemKey"]["properties"]
+
+    assert gem_key_schema["app_id"]["pattern"] == r"^(?:0|[1-9][0-9]*)$"
+    assert gem_key_schema["app_id"]["maxLength"] == 20
+    assert gem_key_schema["item_type"]["minimum"] == 0
+    assert gem_key_schema["item_type"]["maximum"] == 1_000_000_000
+
+
+def test_inventory_metadata_is_independent_of_item_class() -> None:
+    tags = [
+        {"category": "item_class", "internal_name": "item_class_3"},
+        {
+            "category": "Game",
+            "internal_name": "app_440",
+            "localized_tag_name": "Team Fortress 2",
+        },
+        {
+            "category": "droprate",
+            "internal_name": "Rarity_Rare",
+            "localized_tag_name": "Rare",
+        },
+        {"category": "cardborder", "internal_name": "cardborder_1"},
+    ]
+    parsed = steam_gateway._parse_inventory_page(
+        page(
+            assets=[item_asset("1")],
+            descriptions=[item_description("1", "Background", tags=tags)],
+        )
+    )
+    assert parsed is not None
+    description = parsed.descriptions[0]
+    assert description.item_type == "profile_background"
+    assert description.game_app_id == "440"
+    assert description.game_name == "Team Fortress 2"
+    assert description.rarity == "Rare"
+    assert description.card_border == "foil"
+    assert description.gem_key is None
+
+
+def test_keyed_backgrounds_and_emoticons_use_exact_gem_keys() -> None:
+    background_key = GemKey(app_id="440", item_type=501, border_color=0)
+    emoticon_key = GemKey(app_id="440", item_type=502, border_color=1)
+    parsed = steam_gateway._parse_inventory_page(
+        page(
+            assets=[item_asset("1"), item_asset("2")],
+            descriptions=[
+                item_description(
+                    "1",
+                    "Background",
+                    tags=[
+                        {
+                            "category": "item_class",
+                            "internal_name": "item_class_3",
+                        }
+                    ],
+                    owner_actions=goo_owner_actions(
+                        app_id="440", item_type=501, border_color=0
+                    ),
+                ),
+                item_description(
+                    "2",
+                    "Emoticon",
+                    tags=[
+                        {
+                            "category": "item_class",
+                            "internal_name": "item_class_4",
+                        }
+                    ],
+                    owner_actions=goo_owner_actions(
+                        app_id="440", item_type=502, border_color=1
+                    ),
+                ),
+            ],
+        )
+    )
+    assert parsed is not None
+    assert parsed.descriptions[0].item_type == "profile_background"
+    assert parsed.descriptions[0].gem_key == background_key
+    assert parsed.descriptions[1].item_type == "emoticon"
+    assert parsed.descriptions[1].gem_key == emoticon_key
+
+
+def test_malformed_owner_action_keeps_inventory_available_and_keyless() -> None:
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset("1")],
+                    descriptions=[
+                        item_description(
+                            "1",
+                            "Background",
+                            tags=[
+                                {
+                                    "category": "item_class",
+                                    "internal_name": "item_class_3",
+                                }
+                            ],
+                            owner_actions=[{"link": "javascript:alert(1)"}],
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+    result = run(SteamGateway(settings(), http_client=client).check_inventory("42"))
+    assert result.status == "public"
+    assert result.items[0].item_type == "profile_background"
+    assert result.items[0].gem_key is None
+    assert result.gem_priceable_item_count == 0
+
+
+def test_gem_groups_and_status_are_driven_only_by_exact_keys() -> None:
+    first_key = GemKey(app_id="440", item_type=501, border_color=0)
+    second_key = GemKey(app_id="440", item_type=502, border_color=1)
+    items = [
+        steam_gateway.InventoryItem(
+            class_id="1",
+            instance_id="0",
+            name="Background",
+            market_hash_name="z-background",
+            quantity=1,
+            marketable=False,
+            tradable=True,
+            item_type="profile_background",
+            gem_key=first_key,
+            gem_yield=13,
+        ),
+        steam_gateway.InventoryItem(
+            class_id="2",
+            instance_id="0",
+            name="Emoticon",
+            market_hash_name="a-emoticon",
+            quantity=1,
+            marketable=False,
+            tradable=True,
+            item_type="emoticon",
+            gem_key=second_key,
+        ),
+        steam_gateway.InventoryItem(
+            class_id="3",
+            instance_id="0",
+            name="Named keyless item",
+            quantity=1,
+            marketable=False,
+            tradable=True,
+            item_type="profile_background",
+        ),
+    ]
+    assert steam_gateway._gem_group_representatives(items) == {
+        first_key: "z-background",
+        second_key: "a-emoticon",
+    }
+    scan = GemScanResult(
+        values={
+            first_key: GemResolution(
+                key=first_key,
+                representative_hash="z-background",
+                gem_yield=13,
+                observed_at="2026-08-28T00:00:00Z",
+            )
+        }
+    )
+    status = steam_gateway._gem_status_for_items(items, scan)
+    assert status == (
+        "partial",
+        "Gem prices are unavailable for some gem-convertible items.",
+        2,
+        1,
+    )
+
+
+def test_inventory_gem_metadata_requires_key_and_cash_requires_yield() -> None:
+    base = {
+        "class_id": "1",
+        "instance_id": "0",
+        "name": "Item",
+        "quantity": 1,
+        "marketable": False,
+        "tradable": True,
+    }
+    with pytest.raises(ValidationError):
+        steam_gateway.InventoryItem(**base, gem_yield=1)
+    with pytest.raises(ValidationError):
+        steam_gateway.InventoryItem(
+            **base,
+            gem_key=GemKey(app_id="440", item_type=501, border_color=0),
+            gem_cash_value="1",
+        )
 
 
 @pytest.mark.parametrize(("wrapped", "success"), [(False, 1), (True, True)])
@@ -1049,7 +1313,9 @@ def test_steamapis_stop_cancels_shielded_inventory_before_gem_warmer() -> None:
             fetch_started.set()
             try:
                 await allow_resolution.wait()
-                await gem_pricing.resolve({("10", "normal"): "Card"})
+                await gem_pricing.resolve(
+                    {GemKey(app_id="10", item_type=5, border_color=0): "Card"}
+                )
             except asyncio.CancelledError:
                 fetch_cancelled.set()
                 raise

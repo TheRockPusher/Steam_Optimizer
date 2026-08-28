@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator, Iterable, Mapping
 
     from httpx2 import Response
 
@@ -21,7 +21,7 @@ from app.cookies import (
     InvalidCookiePurposeError,
     SignedCookieCodec,
 )
-from app.gem_pricing import CardRarity, GemResolution, GemScanResult
+from app.gem_pricing import GemKey, GemResolution, GemScanResult
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -59,7 +59,7 @@ class FakeGateway:
         self.inventory_retry_after_seconds = inventory_retry_after_seconds
         self.profile_calls = 0
         self.inventory_calls = 0
-        self.gem_refresh_calls: list[Mapping[tuple[str, CardRarity], None]] = []
+        self.gem_refresh_calls: list[list[GemKey]] = []
 
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         self.profile_calls += 1
@@ -82,19 +82,19 @@ class FakeGateway:
 
     async def refresh_gems(
         self,
-        groups: Mapping[tuple[str, CardRarity], None],
+        keys: Iterable[GemKey],
     ) -> GemScanResult:
-        self.gem_refresh_calls.append(groups)
+        requested = list(keys)
+        self.gem_refresh_calls.append(requested)
         return GemScanResult(
             values={
                 key: GemResolution(
-                    item_type=5,
-                    border_color=0 if key[1] == "normal" else 1,
+                    key=key,
                     representative_hash="cached",
                     gem_yield=42,
                     observed_at="2026-08-28T00:00:00Z",
                 )
-                for key in groups
+                for key in requested
             }
         )
 
@@ -341,7 +341,7 @@ def test_gem_refresh_requires_authenticated_session() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/api/auth/gems",
-            json={"groups": [{"game_app_id": "440", "card_rarity": "normal"}]},
+            json={"groups": [{"app_id": "440", "item_type": 5, "border_color": 0}]},
         )
 
     assert response.status_code == 401
@@ -370,8 +370,8 @@ def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
             "/api/auth/gems",
             json={
                 "groups": [
-                    {"game_app_id": "440", "card_rarity": "normal"},
-                    {"game_app_id": "440", "card_rarity": "foil"},
+                    {"app_id": "440", "item_type": 5, "border_color": 0},
+                    {"app_id": "440", "item_type": 5, "border_color": 1},
                 ]
             },
         )
@@ -382,13 +382,15 @@ def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
     assert response.json() == {
         "values": [
             {
-                "game_app_id": "440",
-                "card_rarity": "foil",
+                "app_id": "440",
+                "item_type": 5,
+                "border_color": 0,
                 "gem_yield": 42,
             },
             {
-                "game_app_id": "440",
-                "card_rarity": "normal",
+                "app_id": "440",
+                "item_type": 5,
+                "border_color": 1,
                 "gem_yield": 42,
             },
         ],
@@ -399,11 +401,91 @@ def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
     assert gateway.profile_calls == 0
     assert gateway.inventory_calls == 0
     assert gateway.gem_refresh_calls == [
-        {
-            ("440", "normal"): None,
-            ("440", "foil"): None,
-        }
+        [
+            GemKey(app_id="440", item_type=5, border_color=0),
+            GemKey(app_id="440", item_type=5, border_color=1),
+        ]
     ]
+
+
+def test_gem_refresh_deduplicates_and_sorts_full_gem_keys() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+    groups = [
+        {"app_id": "44", "item_type": 7, "border_color": 1},
+        {"app_id": "2", "item_type": 99, "border_color": 0},
+        {"app_id": "10", "item_type": 9, "border_color": 0},
+        {"app_id": "10", "item_type": 5, "border_color": 1},
+        {"app_id": "10", "item_type": 5, "border_color": 1},
+    ]
+
+    with TestClient(app) as client:
+        start = client.get("/api/auth/steam/start", follow_redirects=False)
+        callback = client.get(
+            "/api/auth/steam/callback?"
+            + callback_query(settings, return_to=return_to_from_start(start)),
+            follow_redirects=False,
+        )
+        response = client.post("/api/auth/gems", json={"groups": groups})
+
+    assert callback.status_code == 302
+    assert response.status_code == 200
+    assert [
+        (value["app_id"], value["item_type"], value["border_color"])
+        for value in response.json()["values"]
+    ] == [("2", 99, 0), ("10", 5, 1), ("10", 9, 0), ("44", 7, 1)]
+    assert gateway.gem_refresh_calls == [
+        [
+            GemKey(app_id="2", item_type=99, border_color=0),
+            GemKey(app_id="10", item_type=5, border_color=1),
+            GemKey(app_id="10", item_type=9, border_color=0),
+            GemKey(app_id="44", item_type=7, border_color=1),
+        ]
+    ]
+
+
+def test_gem_refresh_rejects_non_integer_border_colors() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        start = client.get("/api/auth/steam/start", follow_redirects=False)
+        callback = client.get(
+            "/api/auth/steam/callback?"
+            + callback_query(settings, return_to=return_to_from_start(start)),
+            follow_redirects=False,
+        )
+        responses = [
+            client.post(
+                "/api/auth/gems",
+                json={
+                    "groups": [
+                        {
+                            "app_id": "440",
+                            "item_type": 5,
+                            "border_color": invalid_border_color,
+                        }
+                    ]
+                },
+            )
+            for invalid_border_color in (True, False, 0.0, 1.0)
+        ]
+
+    assert callback.status_code == 302
+    assert all(response.status_code == 422 for response in responses)
+    assert gateway.gem_refresh_calls == []
 
 
 class FakeResponse:

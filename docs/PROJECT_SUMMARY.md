@@ -11,10 +11,13 @@ The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an
 signed session, backend profile checks, and server-only SteamApis v2 access through `STEAMAPI_KEY`.
 For a public inventory, it retrieves the complete AppID 753/context 6 inventory through provider
 pagination, joins current bulk AppID 753 prices to marketable items, and reports explicit price
-coverage (`complete`, `partial`, or `unavailable`). For each identified trading-card game, it also
-looks up the canonical booster market item and reports its provider-denominated order-book values
-plus Steam's fixed three-card booster-pack size. The React interface exposes all retrieved items,
-booster details, and the separate price coverage result.
+coverage (`complete`, `partial`, or `unavailable`). It names every defined Steam Community item
+class, preserves independent game, rarity, and card-border metadata, and values any item carrying
+Steam's validated gem-conversion action. Gem cache and refresh identity uses the exact application
+ID, numeric item type, and border color from that action. For each identified trading-card game, it
+also looks up the canonical booster market item and reports its provider-denominated order-book
+values plus Steam's fixed three-card booster-pack size. The React interface exposes all retrieved
+items, booster details, and the separate price and gem coverage results.
 
 ## Safety and identity boundary
 
@@ -54,10 +57,11 @@ to the Railway-hosted backend on session requests, and is cleared by logout or e
 storage, deletion, warranty, and liability terms.
 
 Inventory and market price payloads remain request-only: they are joined in process memory for each
-response and never persisted. Only validated semantic gem-yield cache rows persist in a versioned SQLite
+response and never persisted. Only validated gem-yield cache rows persist in a versioned SQLite
 cache on the attached `backend-data` volume mounted at `/data`, using the literal
-`GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Uncached or expired gem-yield groups are queued to
-one background worker, while cached positive values return immediately. Ordinary restarts and
+`GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Rows are keyed by Steam's exact gem-conversion
+identity rather than a card-only game/rarity approximation. Uncached or expired groups are queued
+to one background worker, while cached positive values return immediately. Ordinary restarts and
 redeploys preserve cache rows; reset is limited to an explicit `CACHE_SCHEMA_VERSION` change or an
 incompatible/corrupt database. Railway's backend and frontend services run in exact EU-West region
 `europe-west4-drams3a`; all future Railway processes must use that region.

@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 from urllib.parse import quote
 
 import httpx2
 from ijson.common import IncompleteJSONError, JSONError
+from pydantic import Field
 
 if TYPE_CHECKING:
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
@@ -49,7 +50,7 @@ MAX_GEM_LISTING_NESTING = 32
 MAX_GEM_LISTING_SCALAR_LENGTH = 16 * 1024
 MAX_RETRY_AFTER_SECONDS = 900
 MIN_CIRCUIT_OPEN_SECONDS = 60
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 _GEM_HTTP_CLIENT_ERROR = "http_client is required without a gem provider."
 _CACHE_SCHEMA_VERSION_TYPE_ERROR = "schema_version must be an integer."
 _CACHE_SCHEMA_VERSION_VALUE_ERROR = "schema_version must be positive."
@@ -57,28 +58,31 @@ _CACHE_USER_VERSION_UNAVAILABLE_ERROR = "SQLite user_version is unavailable."
 _CACHE_USER_VERSION_INVALID_ERROR = "SQLite user_version is invalid."
 _CACHE_READ_ONLY_REPLACE_ERROR = "Cannot replace a read-only or missing SQLite cache."
 _CACHE_CONNECTION_ERROR = "SQLite connection was not created."
+_GEM_KEY_APP_ID_ERROR = "GemKey app_id must be a bounded digit string."
+_GEM_KEY_CANONICAL_APP_ID_ERROR = "GemKey app_id must be canonical."
+_GEM_KEY_ITEM_TYPE_ERROR = "GemKey item_type must be an integer."
+_GEM_KEY_ITEM_TYPE_BOUNDS_ERROR = "GemKey item_type is out of bounds."
+_GEM_KEY_BORDER_COLOR_ERROR = "GemKey border_color must be 0 or 1."
 _GEM_CACHE_TABLE_NAME = "gem_price_cache"
 _GEM_CACHE_TABLE_SQL = """
 CREATE TABLE gem_price_cache (
-    game_app_id TEXT NOT NULL,
-    card_rarity TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    item_type INTEGER NOT NULL,
+    border_color INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('positive', 'negative')),
-    item_type INTEGER,
-    border_color INTEGER,
     representative_hash TEXT,
     gem_yield INTEGER,
     observed_at TEXT,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
-    PRIMARY KEY (game_app_id, card_rarity)
+    PRIMARY KEY (app_id, item_type, border_color)
 )
 """
 _GEM_CACHE_TABLE_INFO = (
-    ("game_app_id", "TEXT", 1, None, 1),
-    ("card_rarity", "TEXT", 1, None, 2),
+    ("app_id", "TEXT", 1, None, 1),
+    ("item_type", "INTEGER", 1, None, 2),
+    ("border_color", "INTEGER", 1, None, 3),
     ("status", "TEXT", 1, None, 0),
-    ("item_type", "INTEGER", 0, None, 0),
-    ("border_color", "INTEGER", 0, None, 0),
     ("representative_hash", "TEXT", 0, None, 0),
     ("gem_yield", "INTEGER", 0, None, 0),
     ("observed_at", "TEXT", 0, None, 0),
@@ -88,10 +92,62 @@ _GEM_CACHE_TABLE_INFO = (
 _LOGGER = logging.getLogger(__name__)
 
 
-CardRarity = Literal["normal", "foil"]
+ItemType = Literal[
+    "badge",
+    "trading_card",
+    "profile_background",
+    "emoticon",
+    "booster_pack",
+    "consumable",
+    "game_goo",
+    "profile_modifier",
+    "scene",
+    "sale_item",
+    "sticker",
+    "chat_effect",
+    "mini_profile_background",
+    "avatar_frame",
+    "animated_avatar",
+    "steam_deck_keyboard_skin",
+    "steam_deck_startup_movie",
+    "other",
+]
+CardBorder = Literal["normal", "foil"]
+GemBorderColor = Literal[0, 1]
+
+_ITEM_CLASS_TYPES: dict[int, ItemType] = {
+    1: "badge",
+    2: "trading_card",
+    3: "profile_background",
+    4: "emoticon",
+    5: "booster_pack",
+    6: "consumable",
+    7: "game_goo",
+    8: "profile_modifier",
+    9: "scene",
+    10: "sale_item",
+    11: "sticker",
+    12: "chat_effect",
+    13: "mini_profile_background",
+    14: "avatar_frame",
+    15: "animated_avatar",
+    16: "steam_deck_keyboard_skin",
+    17: "steam_deck_startup_movie",
+}
 
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 _APP_TAG = re.compile(r"app_([0-9]+)")
+
+
+def _canonical_app_id(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or _ASCII_DIGITS.fullmatch(value) is None
+        or len(value) > MAX_GEM_APP_ID_LENGTH
+    ):
+        return None
+    return value.lstrip("0") or "0"
+
 
 _GOO_VALUE_ACTION = re.compile(
     r"^\s*javascript\s*:\s*GetGooValue\s*\(\s*"
@@ -102,24 +158,60 @@ _GOO_VALUE_ACTION = re.compile(
     r"\)\s*;?\s*$",
     re.IGNORECASE,
 )
+_GOO_VALUE_ACTION_PREFIX = re.compile(
+    r"^\s*javascript\s*:\s*GetGooValue\b",
+    re.IGNORECASE,
+)
+GemAppId = Annotated[
+    str,
+    Field(pattern=r"^(?:0|[1-9][0-9]*)$", max_length=MAX_GEM_APP_ID_LENGTH),
+]
+GemItemType = Annotated[int, Field(ge=0, le=MAX_GEM_ITEM_TYPE)]
 
 
 @dataclass(frozen=True, slots=True)
-class CardMetadata:
-    """Strict metadata extracted from an inventory trading-card description."""
+class GemKey:
+    """The exact Steam item identity used for gem valuation."""
 
-    item_type: Literal["trading_card", "other"]
+    app_id: GemAppId
+    item_type: GemItemType
+    border_color: GemBorderColor
+
+    def __post_init__(self) -> None:
+        canonical = _canonical_app_id(self.app_id)
+        if canonical is None:
+            raise ValueError(_GEM_KEY_APP_ID_ERROR)
+        if canonical != self.app_id:
+            raise ValueError(_GEM_KEY_CANONICAL_APP_ID_ERROR)
+        if isinstance(self.item_type, bool) or not isinstance(self.item_type, int):
+            raise TypeError(_GEM_KEY_ITEM_TYPE_ERROR)
+        if not 0 <= self.item_type <= MAX_GEM_ITEM_TYPE:
+            raise ValueError(_GEM_KEY_ITEM_TYPE_BOUNDS_ERROR)
+        if (
+            isinstance(self.border_color, bool)
+            or not isinstance(self.border_color, int)
+            or self.border_color not in (0, 1)
+        ):
+            raise ValueError(_GEM_KEY_BORDER_COLOR_ERROR)
+
+
+@dataclass(frozen=True, slots=True)
+class ItemMetadata:
+    """Metadata independently extracted from a Steam inventory description."""
+
+    item_type: ItemType
     game_app_id: str | None = None
     game_name: str | None = None
-    card_rarity: CardRarity | None = None
+    rarity: str | None = None
+    card_border: CardBorder | None = None
+    gem_key: GemKey | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class GemResolution:
-    """A validated value for one semantic game/rarity group."""
+    """A validated value for one exact semantic gem key."""
 
-    item_type: int
-    border_color: int
+    key: GemKey
     representative_hash: str
     gem_yield: int
     observed_at: str
@@ -127,11 +219,8 @@ class GemResolution:
 
 @dataclass(frozen=True, slots=True)
 class GemCacheEntry:
-    game_app_id: str
-    card_rarity: CardRarity
+    key: GemKey
     status: Literal["positive", "negative"]
-    item_type: int | None
-    border_color: int | None
     representative_hash: str | None
     gem_yield: int | None
     observed_at: str | None
@@ -145,16 +234,13 @@ class GemCacheEntry:
     def resolution(self) -> GemResolution | None:
         if (
             self.status != "positive"
-            or self.item_type is None
-            or self.border_color is None
             or self.representative_hash is None
             or self.gem_yield is None
             or self.observed_at is None
         ):
             return None
         return GemResolution(
-            item_type=self.item_type,
-            border_color=self.border_color,
+            key=self.key,
             representative_hash=self.representative_hash,
             gem_yield=self.gem_yield,
             observed_at=self.observed_at,
@@ -171,7 +257,7 @@ class CommunityLookup:
 
 @dataclass(frozen=True, slots=True)
 class GemScanResult:
-    values: Mapping[tuple[str, CardRarity], GemResolution]
+    values: Mapping[GemKey, GemResolution]
     pending_count: int = 0
     rate_limited: bool = False
     retry_after_seconds: int | None = None
@@ -183,8 +269,7 @@ class GemProviderProtocol(Protocol):
         self,
         market_hash_name: str,
         *,
-        game_app_id: str,
-        card_rarity: CardRarity,
+        gem_key: GemKey,
     ) -> CommunityLookup:
         """Resolve one market representative into a gem value."""
         ...
@@ -267,106 +352,197 @@ def _response_content_length_within(response: HTTPResponse, maximum: int) -> boo
 def _valid_text(
     value: object, *, maximum: int = MAX_GEM_LISTING_SCALAR_LENGTH
 ) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > maximum:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         return None
     return value
 
 
-def parse_card_metadata(tags: object) -> CardMetadata:
-    """Parse only the canonical Steam tag tuple for a trading card.
+def _unique_value(values: Iterable[str]) -> str | None:
+    unique = tuple(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else None
 
-    A valid ``item_class/item_class_2`` tag is the sole card discriminator.  We
-    never infer a card from its name, app tag, or market hash name.
-    """
 
+def _item_type_from_tags(tags: object) -> ItemType:
     if not isinstance(tags, list):
-        return CardMetadata(item_type="other")
-
-    is_card = False
-    malformed = False
-    app_candidates: list[tuple[str, str | None]] = []
-    rarity_candidates: list[CardRarity] = []
+        return "other"
+    class_values: list[int] = []
+    malformed_class = False
     for raw_tag in tags:
-        if not isinstance(raw_tag, Mapping):
-            malformed = True
+        if not isinstance(raw_tag, Mapping) or raw_tag.get("category") != "item_class":
             continue
-        category = raw_tag.get("category")
         internal_name = raw_tag.get("internal_name")
-        if not isinstance(category, str) or not isinstance(internal_name, str):
-            malformed = True
+        if not isinstance(internal_name, str):
+            malformed_class = True
             continue
-        if category == "item_class" and internal_name == "item_class_2":
-            is_card = True
+        match = re.fullmatch(r"item_class_([0-9]+)", internal_name)
+        if match is None:
+            malformed_class = True
             continue
-        if category == "Game":
-            match = _APP_TAG.fullmatch(internal_name)
-            if match is not None:
-                app_id = match.group(1)
-                if len(app_id) <= MAX_GEM_APP_ID_LENGTH:
-                    game_name_value = raw_tag.get("localized_tag_name")
-                    game_name = _valid_text(game_name_value, maximum=8192)
-                    if game_name_value is not None and game_name is None:
-                        malformed = True
-                    app_candidates.append((app_id, game_name))
-                else:
-                    malformed = True
-            else:
-                malformed = True
+        class_value = match.group(1)
+        if len(class_value) > 10 or (
+            len(class_value) > 1 and class_value.startswith("0")
+        ):
+            malformed_class = True
             continue
-        if category == "cardborder":
-            if internal_name == "cardborder_0":
-                rarity_candidates.append("normal")
-            elif internal_name == "cardborder_1":
-                rarity_candidates.append("foil")
-            else:
-                malformed = True
-    if not is_card:
-        return CardMetadata(item_type="other")
-    if malformed:
-        return CardMetadata(item_type="trading_card")
-
-    if len(app_candidates) != 1 or len(rarity_candidates) != 1:
-        return CardMetadata(item_type="trading_card")
-
-    game_app_id, game_name = app_candidates[0]
-    card_rarity: CardRarity = rarity_candidates[0]
-
-    return CardMetadata(
-        item_type="trading_card",
-        game_app_id=game_app_id,
-        game_name=game_name,
-        card_rarity=card_rarity,
-    )
+        try:
+            class_values.append(int(class_value))
+        except ValueError:
+            malformed_class = True
+    unique_classes = tuple(dict.fromkeys(class_values))
+    if malformed_class or len(unique_classes) != 1:
+        return "other"
+    return _ITEM_CLASS_TYPES.get(unique_classes[0], "other")
 
 
-def parse_get_goo_value_action(action: object) -> tuple[int, int, int] | None:
-    """Parse Steam's static action tuple without executing JavaScript."""
+def parse_get_goo_value_action(action: object) -> GemKey | None:
+    """Parse Steam's static GetGooValue tuple without executing JavaScript."""
 
-    if not isinstance(action, str):
+    if (
+        not isinstance(action, str)
+        or not action
+        or len(action) > MAX_GEM_LISTING_SCALAR_LENGTH
+    ):
         return None
     match = _GOO_VALUE_ACTION.fullmatch(action)
     if match is None:
         return None
-    # The first two tuple members are context/asset placeholders.  Requiring
+    # The first two tuple members are context/asset placeholders. Requiring
     # non-empty bounded tokens keeps this a parser, never a JS evaluator.
     if not match.group(1).strip() or not match.group(2).strip():
         return None
-    try:
-        app_id = int(match.group(3))
-        item_type = int(match.group(4))
-        border_color = int(match.group(5))
-    except ValueError:
-        return None
+    app_text, item_text, border_text = (
+        match.group(3),
+        match.group(4),
+        match.group(5),
+    )
     if (
-        app_id < 0
-        or item_type < 0
-        or border_color < 0
-        or item_type > MAX_GEM_ITEM_TYPE
-        or app_id > 10**MAX_GEM_APP_ID_LENGTH - 1
-        or border_color > 1
+        len(app_text) > MAX_GEM_APP_ID_LENGTH
+        or len(item_text) > len(str(MAX_GEM_ITEM_TYPE))
+        or len(border_text) > len(str(MAX_GEM_ITEM_TYPE))
     ):
         return None
-    return app_id, item_type, border_color
+    canonical_app_id = _canonical_app_id(app_text)
+    if canonical_app_id is None:
+        return None
+    try:
+        item_type = int(item_text)
+        border_color = int(border_text)
+        if border_color not in (0, 1):
+            return None
+        return GemKey(
+            app_id=canonical_app_id,
+            item_type=item_type,
+            border_color=0 if border_color == 0 else 1,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_owner_actions(owner_actions: object) -> GemKey | None:
+    if not isinstance(owner_actions, list):
+        return None
+    candidates: list[GemKey] = []
+    malformed = False
+    for raw_action in owner_actions:
+        if not isinstance(raw_action, Mapping):
+            malformed = True
+            continue
+        link = raw_action.get("link")
+        if not isinstance(link, str) or _GOO_VALUE_ACTION_PREFIX.match(link) is None:
+            continue
+        key = parse_get_goo_value_action(link)
+        if key is None:
+            malformed = True
+        else:
+            candidates.append(key)
+    if malformed:
+        return None
+    unique = tuple(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else None
+
+
+def parse_item_metadata(tags: object, owner_actions: object) -> ItemMetadata:
+    """Parse inventory metadata and an independently validated gem key."""
+
+    item_type = _item_type_from_tags(tags)
+    if not isinstance(tags, list):
+        return ItemMetadata(
+            item_type=item_type,
+            gem_key=_parse_owner_actions(owner_actions),
+        )
+
+    app_candidates: list[str] = []
+    game_name_candidates: list[str] = []
+    rarity_candidates: list[str] = []
+    border_candidates: list[CardBorder] = []
+    malformed_app = False
+    malformed_game_name = False
+    malformed_rarity = False
+    malformed_border = False
+
+    for raw_tag in tags:
+        if not isinstance(raw_tag, Mapping):
+            continue
+        category = raw_tag.get("category")
+        internal_name = raw_tag.get("internal_name")
+        if category == "Game":
+            if not isinstance(internal_name, str):
+                malformed_app = True
+            else:
+                match = _APP_TAG.fullmatch(internal_name)
+                app_id = None if match is None else match.group(1)
+                if (
+                    app_id is None
+                    or len(app_id) > MAX_GEM_APP_ID_LENGTH
+                    or _ASCII_DIGITS.fullmatch(app_id) is None
+                ):
+                    malformed_app = True
+                else:
+                    app_candidates.append(app_id)
+            if "localized_tag_name" in raw_tag:
+                game_name_value = raw_tag.get("localized_tag_name")
+                game_name = _valid_text(game_name_value, maximum=8192)
+                if game_name is None:
+                    malformed_game_name = True
+                else:
+                    game_name_candidates.append(game_name)
+            continue
+        if category in ("droprate", "Rarity"):
+            if "localized_tag_name" not in raw_tag:
+                continue
+            rarity = _valid_text(raw_tag.get("localized_tag_name"), maximum=8192)
+            if rarity is None:
+                malformed_rarity = True
+            else:
+                rarity_candidates.append(rarity)
+            continue
+        if category == "cardborder":
+            if internal_name == "cardborder_0":
+                border_candidates.append("normal")
+            elif internal_name == "cardborder_1":
+                border_candidates.append("foil")
+            else:
+                malformed_border = True
+
+    game_app_id = None if malformed_app else _unique_value(app_candidates)
+    game_name = None if malformed_game_name else _unique_value(game_name_candidates)
+    rarity = None if malformed_rarity else _unique_value(rarity_candidates)
+    unique_border = None if malformed_border else _unique_value(border_candidates)
+    card_border: CardBorder | None = (
+        "normal"
+        if unique_border == "normal"
+        else "foil"
+        if unique_border == "foil"
+        else None
+    )
+    return ItemMetadata(
+        item_type=item_type,
+        game_app_id=game_app_id,
+        game_name=game_name,
+        rarity=rarity,
+        card_border=card_border,
+        gem_key=_parse_owner_actions(owner_actions),
+    )
 
 
 def canonical_decimal(value: str | Decimal) -> str | None:
@@ -409,7 +585,7 @@ def gem_cash_value(gem_yield: int, sack_price: str | Decimal | None) -> str | No
 
 
 class GemPriceCache:
-    """Small persistent SQLite cache keyed by semantic game and rarity."""
+    """Small persistent SQLite cache keyed by exact GemKey identity."""
 
     def __init__(
         self,
@@ -713,14 +889,6 @@ class GemPriceCache:
         return result if math.isfinite(result) else None
 
     @staticmethod
-    def _cache_rarity(value: object) -> CardRarity | None:
-        if value == "normal":
-            return "normal"
-        if value == "foil":
-            return "foil"
-        return None
-
-    @staticmethod
     def _cache_status(value: object) -> Literal["positive", "negative"] | None:
         if value == "positive":
             return "positive"
@@ -730,58 +898,47 @@ class GemPriceCache:
 
     @classmethod
     def _entry(cls, row: tuple[object, ...]) -> GemCacheEntry | None:
-        if len(row) != 10:
+        if len(row) != 9:
             return None
-        game_app_id = cls._sqlite_text(row[0], maximum=MAX_GEM_APP_ID_LENGTH)
-        if game_app_id is None or _ASCII_DIGITS.fullmatch(game_app_id) is None:
-            return None
-        card_rarity = cls._cache_rarity(row[1])
-        status = cls._cache_status(row[2])
-        if card_rarity is None or status is None:
-            return None
-        item_type = cls._sqlite_integer(row[3])
-        border_color = cls._sqlite_integer(row[4])
+        app_id = cls._sqlite_text(row[0], maximum=MAX_GEM_APP_ID_LENGTH)
+        item_type = cls._sqlite_integer(row[1])
+        border_color = cls._sqlite_integer(row[2])
+        status = cls._cache_status(row[3])
         representative_hash = cls._sqlite_text(
-            row[5], maximum=MAX_GEM_MARKET_HASH_NAME_LENGTH
+            row[4], maximum=MAX_GEM_MARKET_HASH_NAME_LENGTH
         )
-        gem_yield = cls._sqlite_integer(row[6])
-        observed_at = cls._sqlite_text(row[7], maximum=MAX_GEM_LISTING_SCALAR_LENGTH)
-        created_at = cls._sqlite_real(row[8])
-        expires_at = cls._sqlite_real(row[9])
-        if created_at is None or expires_at is None:
+        gem_yield = cls._sqlite_integer(row[5])
+        observed_at = cls._sqlite_text(row[6], maximum=MAX_GEM_LISTING_SCALAR_LENGTH)
+        created_at = cls._sqlite_real(row[7])
+        expires_at = cls._sqlite_real(row[8])
+        if (
+            app_id is None
+            or _ASCII_DIGITS.fullmatch(app_id) is None
+            or item_type is None
+            or border_color is None
+            or status is None
+            or created_at is None
+            or expires_at is None
+            or not 0 <= item_type <= MAX_GEM_ITEM_TYPE
+            or border_color not in (0, 1)
+        ):
             return None
-        if item_type is not None and not 0 <= item_type <= MAX_GEM_ITEM_TYPE:
-            return None
-        if border_color is not None and border_color not in (0, 1):
+        try:
+            key = GemKey(app_id, item_type, border_color)
+        except (TypeError, ValueError):
             return None
         if gem_yield is not None and not 0 <= gem_yield <= MAX_GEM_YIELD:
             return None
         if status == "positive":
-            if (
-                item_type is None
-                or border_color is None
-                or representative_hash is None
-                or gem_yield is None
-                or observed_at is None
-            ):
+            if representative_hash is None or gem_yield is None or observed_at is None:
                 return None
         elif any(
-            value is not None
-            for value in (
-                item_type,
-                border_color,
-                representative_hash,
-                gem_yield,
-                observed_at,
-            )
+            value is not None for value in (representative_hash, gem_yield, observed_at)
         ):
             return None
         return GemCacheEntry(
-            game_app_id=game_app_id,
-            card_rarity=card_rarity,
+            key=key,
             status=status,
-            item_type=item_type,
-            border_color=border_color,
             representative_hash=representative_hash,
             gem_yield=gem_yield,
             observed_at=observed_at,
@@ -789,19 +946,21 @@ class GemPriceCache:
             expires_at=expires_at,
         )
 
-    def get(self, game_app_id: str, card_rarity: CardRarity) -> GemCacheEntry | None:
+    def get(self, key: GemKey) -> GemCacheEntry | None:
+        if not isinstance(key, GemKey):
+            return None
         connection: sqlite3.Connection | None = None
         try:
             connection = self._connect()
             row = connection.execute(
                 """
-                SELECT game_app_id, card_rarity, status, item_type, border_color,
-                       representative_hash, gem_yield, observed_at, created_at,
-                       expires_at
+                SELECT app_id, item_type, border_color, status,
+                       representative_hash, gem_yield, observed_at,
+                       created_at, expires_at
                   FROM gem_price_cache
-                 WHERE game_app_id = ? AND card_rarity = ?
+                 WHERE app_id = ? AND item_type = ? AND border_color = ?
                 """,
-                (game_app_id, card_rarity),
+                (key.app_id, key.item_type, key.border_color),
             ).fetchone()
             return None if row is None else self._entry(row)
         except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -812,30 +971,30 @@ class GemPriceCache:
 
     def get_many(
         self,
-        keys: Iterable[tuple[str, CardRarity]],
-    ) -> dict[tuple[str, CardRarity], GemCacheEntry]:
+        keys: Iterable[GemKey],
+    ) -> dict[GemKey, GemCacheEntry]:
         unique_keys = tuple(dict.fromkeys(keys))
-        if not unique_keys:
+        if not unique_keys or any(not isinstance(key, GemKey) for key in unique_keys):
             return {}
         connection: sqlite3.Connection | None = None
-        results: dict[tuple[str, CardRarity], GemCacheEntry] = {}
+        results: dict[GemKey, GemCacheEntry] = {}
         try:
             connection = self._connect()
-            for game_app_id, card_rarity in unique_keys:
+            for key in unique_keys:
                 row = connection.execute(
                     """
-                    SELECT game_app_id, card_rarity, status, item_type,
-                           border_color, representative_hash, gem_yield,
-                           observed_at, created_at, expires_at
+                    SELECT app_id, item_type, border_color, status,
+                           representative_hash, gem_yield, observed_at,
+                           created_at, expires_at
                       FROM gem_price_cache
-                     WHERE game_app_id = ? AND card_rarity = ?
+                     WHERE app_id = ? AND item_type = ? AND border_color = ?
                     """,
-                    (game_app_id, card_rarity),
+                    (key.app_id, key.item_type, key.border_color),
                 ).fetchone()
                 if row is not None:
                     entry = self._entry(row)
-                    if entry is not None:
-                        results[(game_app_id, card_rarity)] = entry
+                    if entry is not None and entry.key == key:
+                        results[key] = entry
         except (OSError, sqlite3.Error, TypeError, ValueError):
             return {}
         finally:
@@ -845,12 +1004,17 @@ class GemPriceCache:
 
     def put_positive(
         self,
-        game_app_id: str,
-        card_rarity: CardRarity,
+        key: GemKey,
         resolution: GemResolution,
         *,
         now: float | None = None,
     ) -> None:
+        if (
+            not isinstance(key, GemKey)
+            or not isinstance(resolution, GemResolution)
+            or resolution.key != key
+        ):
+            return
         timestamp = time.time() if now is None else now
         connection: sqlite3.Connection | None = None
         try:
@@ -858,14 +1022,12 @@ class GemPriceCache:
             connection.execute(
                 """
                 INSERT INTO gem_price_cache (
-                    game_app_id, card_rarity, status, item_type, border_color,
-                    representative_hash, gem_yield, observed_at, created_at,
-                    expires_at
-                ) VALUES (?, ?, 'positive', ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(game_app_id, card_rarity) DO UPDATE SET
+                    app_id, item_type, border_color, status,
+                    representative_hash, gem_yield, observed_at,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, 'positive', ?, ?, ?, ?, ?)
+                ON CONFLICT(app_id, item_type, border_color) DO UPDATE SET
                     status = excluded.status,
-                    item_type = excluded.item_type,
-                    border_color = excluded.border_color,
                     representative_hash = excluded.representative_hash,
                     gem_yield = excluded.gem_yield,
                     observed_at = excluded.observed_at,
@@ -873,10 +1035,9 @@ class GemPriceCache:
                     expires_at = excluded.expires_at
                 """,
                 (
-                    game_app_id,
-                    card_rarity,
-                    resolution.item_type,
-                    resolution.border_color,
+                    key.app_id,
+                    key.item_type,
+                    key.border_color,
                     resolution.representative_hash,
                     resolution.gem_yield,
                     resolution.observed_at,
@@ -893,11 +1054,12 @@ class GemPriceCache:
 
     def put_negative(
         self,
-        game_app_id: str,
-        card_rarity: CardRarity,
+        key: GemKey,
         *,
         now: float | None = None,
     ) -> None:
+        if not isinstance(key, GemKey):
+            return
         timestamp = time.time() if now is None else now
         connection: sqlite3.Connection | None = None
         try:
@@ -905,14 +1067,12 @@ class GemPriceCache:
             connection.execute(
                 """
                 INSERT INTO gem_price_cache (
-                    game_app_id, card_rarity, status, item_type, border_color,
-                    representative_hash, gem_yield, observed_at, created_at,
-                    expires_at
-                ) VALUES (?, ?, 'negative', NULL, NULL, NULL, NULL, NULL, ?, ?)
-                ON CONFLICT(game_app_id, card_rarity) DO UPDATE SET
+                    app_id, item_type, border_color, status,
+                    representative_hash, gem_yield, observed_at,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, 'negative', NULL, NULL, NULL, ?, ?)
+                ON CONFLICT(app_id, item_type, border_color) DO UPDATE SET
                     status = excluded.status,
-                    item_type = NULL,
-                    border_color = NULL,
                     representative_hash = NULL,
                     gem_yield = NULL,
                     observed_at = NULL,
@@ -921,8 +1081,9 @@ class GemPriceCache:
                 WHERE gem_price_cache.status = 'negative'
                 """,
                 (
-                    game_app_id,
-                    card_rarity,
+                    key.app_id,
+                    key.item_type,
+                    key.border_color,
                     timestamp,
                     timestamp + GEM_NEGATIVE_CACHE_TTL_SECONDS,
                 ),
@@ -1022,21 +1183,15 @@ class SteamCommunityGemProvider:
         self,
         market_hash_name: str,
         *,
-        game_app_id: str,
-        card_rarity: CardRarity,
+        gem_key: GemKey,
     ) -> CommunityLookup:
         if (
             not isinstance(market_hash_name, str)
             or not market_hash_name
             or len(market_hash_name) > MAX_GEM_MARKET_HASH_NAME_LENGTH
-            or not isinstance(game_app_id, str)
-            or not _ASCII_DIGITS.fullmatch(game_app_id)
-            or len(game_app_id) > MAX_GEM_APP_ID_LENGTH
-            or card_rarity not in ("normal", "foil")
+            or not isinstance(gem_key, GemKey)
         ):
             return CommunityLookup(failure="Invalid gem lookup metadata.")
-        expected_app_id = int(game_app_id)
-        expected_border = 0 if card_rarity == "normal" else 1
 
         async def limited_get(url: str, *, params: Mapping[str, str]) -> HTTPResponse:
             async def operation() -> HTTPResponse:
@@ -1095,14 +1250,8 @@ class SteamCommunityGemProvider:
                 return CommunityLookup(
                     failure="Steam Community gem data is unavailable."
                 )
-            action = _first_listing_action(payload)
-            parsed = parse_get_goo_value_action(action)
-            if parsed is None:
-                return CommunityLookup(
-                    failure="Steam Community gem data is unavailable."
-                )
-            app_id, item_type, border_color = parsed
-            if app_id != expected_app_id or border_color != expected_border:
+            parsed = _listing_gem_key(payload)
+            if parsed is None or parsed != gem_key:
                 return CommunityLookup(
                     failure="Steam Community gem data is unavailable."
                 )
@@ -1110,9 +1259,9 @@ class SteamCommunityGemProvider:
             value_response = await limited_get(
                 STEAM_GOO_VALUE_ENDPOINT,
                 params={
-                    "appid": str(app_id),
-                    "item_type": str(item_type),
-                    "border_color": str(border_color),
+                    "appid": gem_key.app_id,
+                    "item_type": str(gem_key.item_type),
+                    "border_color": str(gem_key.border_color),
                 },
             )
             if not 200 <= value_response.status_code < 300:
@@ -1147,12 +1296,12 @@ class SteamCommunityGemProvider:
                     failure="Steam Community gem data is unavailable."
                 )
             resolution = GemResolution(
-                item_type=item_type,
-                border_color=border_color,
+                key=gem_key,
                 representative_hash=market_hash_name,
                 gem_yield=gem_yield,
                 observed_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             )
+
         except _CircuitOpenError as error:
             return CommunityLookup(
                 rate_limited=True,
@@ -1198,7 +1347,7 @@ def _listing_asset_id(value: object) -> str | None:
     return value
 
 
-def _first_listing_action(payload: object) -> object:
+def _listing_owner_actions(payload: object) -> list[object] | None:
     if not isinstance(payload, Mapping) or not _is_success(payload.get("success")):
         return None
     listinginfo = payload.get("listinginfo")
@@ -1226,22 +1375,31 @@ def _first_listing_action(payload: object) -> object:
     if not isinstance(first_asset, Mapping):
         return None
     owner_actions = first_asset.get("owner_actions")
-    if not isinstance(owner_actions, list):
+    return owner_actions if isinstance(owner_actions, list) else None
+
+
+def _listing_gem_key(payload: object) -> GemKey | None:
+    owner_actions = _listing_owner_actions(payload)
+    if owner_actions is None:
         return None
-    # The first listing asset is fixed by listinginfo; do not trust asset-map
-    # insertion order, which may contain another listing's asset first.
+    candidates: list[GemKey] = []
     for raw_action in owner_actions:
         if not isinstance(raw_action, Mapping):
-            continue
+            return None
         link = raw_action.get("link")
-        if isinstance(link, str) and "getgoovalue" in link.casefold():
-            return link
-    return None
+        if not isinstance(link, str) or "getgoovalue" not in link.casefold():
+            continue
+        key = parse_get_goo_value_action(link)
+        if key is None:
+            return None
+        candidates.append(key)
+    unique = tuple(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else None
 
 
 @dataclass(frozen=True, slots=True)
 class _QueuedLookup:
-    key: tuple[str, CardRarity]
+    key: GemKey
     representative_hash: str
 
 
@@ -1269,7 +1427,7 @@ class GemPricingService:
             )
         self.provider = provider
         self._queue: asyncio.Queue[_QueuedLookup] | None = None
-        self._scheduled: set[tuple[str, CardRarity]] = set()
+        self._scheduled: set[GemKey] = set()
         self._worker_task: asyncio.Task[None] | None = None
         self._rate_limited_until = 0.0
 
@@ -1332,15 +1490,15 @@ class GemPricingService:
 
     def _record_lookup(
         self,
-        key: tuple[str, CardRarity],
+        key: GemKey,
         outcome: CommunityLookup,
     ) -> None:
-        if outcome.resolution is not None:
-            self.cache.put_positive(key[0], key[1], outcome.resolution)
+        if outcome.resolution is not None and outcome.resolution.key == key:
+            self.cache.put_positive(key, outcome.resolution)
             return
         if outcome.rate_limited:
             return
-        self.cache.put_negative(key[0], key[1])
+        self.cache.put_negative(key)
 
     @staticmethod
     def _safe_outcome(outcome: object) -> CommunityLookup:
@@ -1368,8 +1526,7 @@ class GemPricingService:
             try:
                 outcome = await self.provider.lookup(
                     item.representative_hash,
-                    game_app_id=item.key[0],
-                    card_rarity=item.key[1],
+                    gem_key=item.key,
                 )
             except Exception:  # noqa: BLE001 - isolate provider failures per key
                 outcome = CommunityLookup(
@@ -1428,7 +1585,7 @@ class GemPricingService:
 
     def _queue_lookup(
         self,
-        key: tuple[str, CardRarity],
+        key: GemKey,
         representative_hash: str,
     ) -> bool:
         self._ensure_started()
@@ -1450,12 +1607,12 @@ class GemPricingService:
 
     def read_cached(
         self,
-        keys: Iterable[tuple[str, CardRarity]],
+        keys: Iterable[GemKey],
     ) -> GemScanResult:
         """Read completed warmer results without scheduling provider work."""
         unique_keys = tuple(dict.fromkeys(keys))
         cached_entries = self.cache.get_many(unique_keys)
-        values: dict[tuple[str, CardRarity], GemResolution] = {}
+        values: dict[GemKey, GemResolution] = {}
         used_stale_cache = False
         pending_count = 0
         terminal_negative_count = 0
@@ -1495,11 +1652,11 @@ class GemPricingService:
 
     async def resolve(
         self,
-        groups: Mapping[tuple[str, CardRarity], str | None],
+        groups: Mapping[GemKey, str | None],
     ) -> GemScanResult:
         if not groups:
             return GemScanResult(values={})
-        values: dict[tuple[str, CardRarity], GemResolution] = {}
+        values: dict[GemKey, GemResolution] = {}
         pending_count = 0
         used_stale_cache = False
         fresh_count = 0
@@ -1509,7 +1666,10 @@ class GemPricingService:
         unresolvable_count = 0
         cached_entries = self.cache.get_many(groups)
 
-        for key in sorted(groups, key=lambda value: (value[0], value[1])):
+        for key in sorted(
+            groups,
+            key=lambda value: (value.app_id, value.item_type, value.border_color),
+        ):
             cached = cached_entries.get(key)
             resolution = cached.resolution() if cached is not None else None
             if cached is not None and not cached.expired:
@@ -1574,18 +1734,21 @@ __all__ = [
     "SACK_OF_GEMS_MARKET_HASH_NAME",
     "STEAM_GOO_VALUE_ENDPOINT",
     "STEAM_MARKET_LISTING_RENDER_ENDPOINT",
-    "CardMetadata",
-    "CardRarity",
+    "CardBorder",
     "CommunityLookup",
+    "GemBorderColor",
     "GemCacheEntry",
+    "GemKey",
     "GemPriceCache",
     "GemPricingService",
     "GemResolution",
     "GemScanResult",
+    "ItemMetadata",
+    "ItemType",
     "SteamCommunityGemProvider",
     "SteamCommunityLimiter",
     "canonical_decimal",
     "gem_cash_value",
-    "parse_card_metadata",
     "parse_get_goo_value_action",
+    "parse_item_metadata",
 ]

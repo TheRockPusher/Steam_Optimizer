@@ -1,6 +1,16 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+
+## Unreleased
+
+### Features
+- Value every Steam Community item carrying a validated gem-conversion action
+- Name all Steam Community item classes and preserve independent item metadata
+
+### Maintenance
+- Key the gem cache and refresh API by Steam's exact conversion identity
+
 ## v0.5.0
 
 

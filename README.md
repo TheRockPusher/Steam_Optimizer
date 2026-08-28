@@ -68,9 +68,12 @@ The current connection and inventory stage provides:
   `partial`, or `unavailable` price coverage: `complete` when all priceable rows are priced,
   `partial` when some but not all priceable rows are priced, and `unavailable` when zero
   priceable rows are priced or the provider is unavailable.
+- Canonical names and independent game, rarity, and card-border metadata for every Steam
+  Community item class, with gem eligibility derived from Steam's validated conversion action
+  rather than inferred from the class.
 - A responsive, sortable inventory interface that paginates all retrieved items, lets users switch
-  game grouping on or off, and filters marketable trading cards whose exact per-card gem cash value
-  exceeds their current lowest-sell market price.
+  game grouping on or off, and filters marketable gem-convertible items whose exact per-item gem
+  cash value exceeds their current lowest-sell market price.
 
 SteamApis is a third-party provider: inventory availability, response fields, and price snapshots
 depend on provider data and availability and may differ from Steam Community at a given time. The
@@ -80,10 +83,12 @@ the provider is unavailable. Unavailable prices remain unpriced. SteamApis omits
 its bulk feed. Order-book values are preserved exactly as provider-denominated decimals and displayed
 without a currency symbol. Optimization must not treat them as monetary values until an authoritative
 currency contract or explicit configuration exists.
-Inventory and market payloads are fetched on request and never persisted. Only validated semantic
-gem-yield cache rows persist in a versioned SQLite database on the attached `backend-data` Railway
-volume, mounted at `/data` with `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Uncached or expired
-gem-yield entries warm in one background worker while cached positive values return immediately.
+Inventory and market payloads are fetched on request and never persisted. Only validated gem-yield
+cache rows persist in a versioned SQLite database on the attached `backend-data` Railway volume,
+mounted at `/data` with `GEM_PRICE_CACHE_PATH=/data/gem_prices.sqlite3`. Cache rows use Steam's exact
+conversion identity—application ID, numeric item type, and border color—so cards, profile
+backgrounds, emoticons, and any other action-bearing class cannot collide. Uncached or expired
+entries warm in one background worker while cached positive values return immediately.
 Ordinary restarts and redeploys preserve cache rows; only an explicit `CACHE_SCHEMA_VERSION` change or
 an incompatible/corrupt database resets them. Railway services run in exact EU-West region
 `europe-west4-drams3a`.
