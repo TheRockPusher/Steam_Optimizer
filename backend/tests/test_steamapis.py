@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -10,10 +11,19 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Awaitable,
+        Callable,
+        Iterable,
+        Mapping,
+        Sequence,
+    )
+    from pathlib import Path
 
 
 import app.steam_gateway as steam_gateway
+import app.steamapis_price_cache as steamapis_price_cache
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import CardRarity, GemPriceCache, GemPricingService, GemScanResult
 from app.main import create_app
@@ -169,6 +179,7 @@ def settings(**overrides: object) -> Settings:
         "signing_secret": "test-signing-secret",
         "steamapi_key": "server-only-key",
         "steam_web_api_key": "profile-key",
+        "steamapis_price_cache_path": ":memory:",
     }
     values.update(overrides)
     return Settings.model_validate(values)
@@ -246,6 +257,43 @@ def item_asset(
     class_id: str, *, instance_id: str = "0", amount: str = "1"
 ) -> dict[str, object]:
     return {"classid": class_id, "instanceid": instance_id, "amount": amount}
+
+
+def price_redirect() -> FakeResponse:
+    return FakeResponse(
+        302,
+        headers={
+            "Location": (
+                "https://prices.steamapis-test.r2.cloudflarestorage.com/items.json"
+            )
+        },
+    )
+
+
+def price_stream(
+    name: str = "Name",
+    *,
+    highest_buy: str = "0.10",
+    lowest_sell: str | None = "0.20",
+    observed_at: int = 1787788800000,
+) -> FakeResponse:
+    order_book = f'"highestBuy":"{highest_buy}"'
+    if lowest_sell is not None:
+        order_book += f',"lowestSell":"{lowest_sell}"'
+    return FakeResponse(
+        200,
+        chunks=[
+            (
+                '{"items":[{"marketHashName":"'
+                + name
+                + '","orderBook":{'
+                + order_book
+                + '},"updatedAt":'
+                + str(observed_at)
+                + "}]}"
+            ).encode()
+        ],
+    )
 
 
 @pytest.mark.parametrize(("wrapped", "success"), [(False, 1), (True, True)])
@@ -856,7 +904,360 @@ def test_price_join_checks_case_sensitive_unquoted_name() -> None:
     assert client.get_calls[0]["follow_redirects"] is False
 
 
-def test_unrequested_price_numbers_are_not_converted_or_allocated(
+def test_price_cache_fresh_hit_avoids_second_provider_refresh() -> None:
+    client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    steamapis = SteamApisClient(settings(), http_client=client)
+
+    first = run(steamapis.fetch_prices(frozenset({"Name"})))
+    second = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert first.status == second.status == "complete"
+    assert second.prices["Name"].lowest_sell == "0.20"
+    assert len(client.get_calls) == 1
+    assert len(client.stream_calls) == 1
+
+
+def test_price_cache_expiry_triggers_one_new_full_refresh(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [price_redirect(), price_redirect()],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+
+    refreshed = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert refreshed.status == "complete"
+    assert len(client.get_calls) == 2
+    assert len(client.stream_calls) == 2
+
+
+def test_price_cache_concurrent_stale_readers_coalesce_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocked_stream_with_price(
+        _response: object,
+        _requested_names: frozenset[str],
+        on_price: Callable[[str, steam_gateway.InventoryPrice], None] | None = None,
+    ) -> tuple[dict[str, object], set[str]]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        assert callable(on_price)
+        on_price(
+            "Name",
+            steam_gateway.InventoryPrice(
+                highest_buy="0.10",
+                lowest_sell="0.20",
+                observed_at="2026-08-27T00:00:00Z",
+            ),
+        )
+        return {}, set()
+
+    monkeypatch.setattr(steam_gateway, "_stream_prices", blocked_stream_with_price)
+    client = FakeHTTPClient([price_redirect()], stream_response=FakeResponse(200))
+    steamapis = SteamApisClient(settings(), http_client=client)
+
+    async def exercise() -> tuple[
+        steam_gateway._PriceLookup, steam_gateway._PriceLookup
+    ]:
+        first = asyncio.create_task(steamapis.fetch_prices(frozenset({"Name"})))
+        await entered.wait()
+        second = asyncio.create_task(steamapis.fetch_prices(frozenset({"Name"})))
+        await asyncio.sleep(0)
+        assert calls == 1
+        release.set()
+        return await asyncio.gather(first, second)
+
+    first, second = run(exercise())
+    assert first.status == second.status == "complete"
+    assert len(client.get_calls) == 1
+    assert len(client.stream_calls) == 1
+
+
+def test_price_cache_survives_client_restart(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    first_client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    first = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=first_client,
+    )
+    run(first.fetch_prices(frozenset({"Name"})))
+
+    second_client = FakeHTTPClient([])
+    second = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=second_client,
+    )
+    result = run(second.fetch_prices(frozenset({"Name"})))
+
+    assert result.status == "complete"
+    assert result.prices["Name"].highest_buy == "0.10"
+    assert second_client.get_calls == []
+    assert second_client.stream_calls == []
+
+
+def test_price_cache_is_read_without_an_api_key_after_restart(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    first = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=FakeHTTPClient(
+            [price_redirect()],
+            stream_response=price_stream(),
+        ),
+    )
+    run(first.fetch_prices(frozenset({"Name"})))
+
+    second_client = FakeHTTPClient([])
+    second = SteamApisClient(
+        settings(
+            steamapi_key="",
+            steamapis_price_cache_path=str(cache_path),
+        ),
+        http_client=second_client,
+    )
+    result = run(second.fetch_prices(frozenset({"Name"})))
+
+    assert result.status == "complete"
+    assert result.prices["Name"].lowest_sell == "0.20"
+    assert second_client.get_calls == []
+
+
+def test_price_cache_uses_stale_generation_when_refresh_fails(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [price_redirect(), OSError("provider unavailable")],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+
+    stale = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert stale.status == "complete"
+    assert stale.used_stale_cache is True
+    assert stale.prices["Name"].lowest_sell == "0.20"
+    assert len(client.get_calls) == 2
+
+
+def test_inventory_discloses_stale_price_fallback(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [
+            price_redirect(),
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset("1")],
+                    descriptions=[
+                        item_description(
+                            "1",
+                            "Name",
+                            market_hash_name="Name",
+                            marketable=1,
+                        )
+                    ],
+                ),
+            ),
+            OSError("provider unavailable"),
+        ],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+        gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+    )
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+
+    result = run(steamapis.fetch_inventory("42"))
+
+    assert result.price_status == "complete"
+    assert result.price_message == "Prices are complete using a cached fallback."
+    assert result.items[0].price is not None
+    assert result.items[0].price.lowest_sell == "0.20"
+
+
+def test_inventory_discloses_stale_auxiliary_market_context(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    sack_name = "753-Sack of Gems"
+    client = FakeHTTPClient(
+        [
+            price_redirect(),
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset("1")],
+                    descriptions=[
+                        item_description(
+                            "1",
+                            "Trading Card",
+                            marketable=0,
+                            tags=trading_card_tags(),
+                        )
+                    ],
+                ),
+            ),
+            OSError("provider unavailable"),
+        ],
+        stream_response=price_stream(name=sack_name),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+        gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+    )
+    run(steamapis.fetch_prices(frozenset({sack_name})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+
+    result = run(steamapis.fetch_inventory("42"))
+
+    assert result.priceable_item_count == 0
+    assert result.gem_cash_context is not None
+    assert (
+        result.price_message
+        == "Displayed booster or gem market context uses a cached fallback."
+    )
+
+
+def test_price_cache_failed_refresh_backoff_prevents_stampede(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    monkeypatch.setattr(steamapis_price_cache.time, "time", lambda: now)
+    client = FakeHTTPClient([OSError("provider unavailable")])
+    steamapis = SteamApisClient(settings(), http_client=client)
+
+    first = run(steamapis.fetch_prices(frozenset({"Name"})))
+    second = run(steamapis.fetch_prices(frozenset({"Name"})))
+    assert first.status == second.status == "unavailable"
+    assert len(client.get_calls) == 1
+
+    now += steamapis_price_cache.PRICE_REFRESH_RETRY_BASE_SECONDS + 1
+    client.responses.append(price_redirect())
+    client.stream_response = price_stream()
+    third = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert third.status == "complete"
+    assert len(client.get_calls) == 2
+
+
+def test_price_cache_malformed_refresh_keeps_previous_generation(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [price_redirect(), price_redirect()],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+    client.stream_response = FakeResponse(
+        200,
+        chunks=[
+            b'{"items":[{"marketHashName":"Name","orderBook":{"lowestSell":"9.99"}'
+        ],
+    )
+
+    stale = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert stale.status == "complete"
+    assert stale.used_stale_cache is True
+    assert stale.prices["Name"].lowest_sell == "0.20"
+    with sqlite3.connect(cache_path) as connection:
+        row = connection.execute(
+            """
+            SELECT highest_buy, lowest_sell
+              FROM steamapis_price_cache
+             WHERE generation = (
+                 SELECT generation FROM steamapis_price_cache_meta WHERE singleton = 1
+             )
+            """
+        ).fetchone()
+    assert row == ("0.10", "0.20")
+
+
+def test_price_cache_empty_json_refresh_keeps_previous_generation(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [price_redirect(), price_redirect()],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+    client.stream_response = FakeResponse(
+        200,
+        chunks=[
+            b'{"items":[],"metadata":{"marketHashName":"Bogus",'
+            b'"orderBook":{"lowestSell":"9.99"}}}'
+        ],
+    )
+
+    stale = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert stale.status == "complete"
+    assert stale.used_stale_cache is True
+    assert stale.prices["Name"].lowest_sell == "0.20"
+
+
+def test_price_cache_recovers_corrupt_database(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    cache_path.write_bytes(b"not a sqlite database")
+    client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+
+    result = run(steamapis.fetch_prices(frozenset({"Name"})))
+
+    assert result.status == "complete"
+    assert any(tmp_path.glob("prices.sqlite3.corrupt-*"))
+
+
+def test_unrequested_price_numbers_are_bounded_during_full_feed_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     converted: list[str | None] = []
@@ -892,7 +1293,7 @@ def test_unrequested_price_numbers_are_not_converted_or_allocated(
         )
     )
     assert lookup.status == "complete"
-    assert converted == ["Requested"]
+    assert converted == ["Unrequested", "Requested"]
 
 
 def test_inventory_rejects_oversized_cursor_before_next_request() -> None:
@@ -1097,7 +1498,12 @@ def test_bulk_stream_semaphore_limits_concurrent_streams(
     release = asyncio.Event()
     calls = 0
 
-    async def blocked_stream(_: object, __: frozenset[str]) -> tuple[dict, set]:
+    async def blocked_stream(
+        _: object,
+        __: frozenset[str],
+        on_price: Callable[[str, steam_gateway.InventoryPrice], None] | None = None,
+    ) -> tuple[dict, set]:
+        del on_price
         nonlocal calls
         calls += 1
         if calls == 1:

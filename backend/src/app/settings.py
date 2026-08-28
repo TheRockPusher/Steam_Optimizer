@@ -35,6 +35,7 @@ _EXPIRY_ERROR = "Expiry settings must be positive."
 _TIMEOUT_ERROR = "Steam request timeout must be positive."
 _BULK_TIMEOUT_ERROR = "Steam bulk request timeout must be positive."
 _GEM_CACHE_PATH_ERROR = "Gem price cache path must not be empty."
+_PRICE_CACHE_PATH_ERROR = "SteamApis price cache path must not be empty."
 _MISSING_SIGNING_MESSAGE = "SIGNING_SECRET must be configured outside development."
 _WEAK_SIGNING_MESSAGE = (
     "SIGNING_SECRET must be a non-placeholder value of at least 32 characters "
@@ -75,6 +76,7 @@ class Settings(BaseSettings):
     steam_request_timeout_seconds: float = 10.0
     steam_bulk_timeout_seconds: float = 120.0
     gem_price_cache_path: str = ".cache/steam-optimizer/gem_prices.sqlite3"
+    steamapis_price_cache_path: str = ".cache/steam-optimizer/steamapis_prices.sqlite3"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -127,6 +129,13 @@ class Settings(BaseSettings):
     def nonempty_gem_cache_path(cls, value: str) -> str:
         if not value.strip():
             raise ValueError(_GEM_CACHE_PATH_ERROR)
+        return value
+
+    @field_validator("steamapis_price_cache_path")
+    @classmethod
+    def nonempty_steamapis_price_cache_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError(_PRICE_CACHE_PATH_ERROR)
         return value
 
     @model_validator(mode="before")

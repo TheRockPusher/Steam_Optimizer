@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hmac
 import secrets
 from collections.abc import Callable, Mapping
@@ -57,7 +56,6 @@ class SessionCheck(BaseModel):
 
 class SessionChecks(BaseModel):
     profile: SessionCheck
-    inventory: InventoryCheck
 
 
 class AuthenticatedSessionResponse(BaseModel):
@@ -203,7 +201,6 @@ def _unavailable_inventory() -> InventoryCheck:
 def _session_response(
     steam_id: str,
     profile: ProfileCheck,
-    inventory: InventoryCheck,
 ) -> AuthenticatedSessionResponse:
     return AuthenticatedSessionResponse(
         user=SessionUser(
@@ -216,7 +213,6 @@ def _session_response(
                 status=profile.status,
                 message=profile.message,
             ),
-            inventory=inventory,
         ),
     )
 
@@ -397,26 +393,55 @@ def create_auth_router(
             )
         except (InvalidCookieError, ValueError):
             return UnauthenticatedSessionResponse()
-        profile_result, inventory_result = await asyncio.gather(
-            steam_gateway.check_profile(steam_id),
-            steam_gateway.check_inventory(steam_id),
-            return_exceptions=True,
-        )
+        try:
+            profile_result = await steam_gateway.check_profile(steam_id)
+        except Exception:  # noqa: BLE001 - preserve unavailable profile status
+            profile_result = _unavailable_profile()
         profile = (
-            _unavailable_profile()
-            if isinstance(profile_result, BaseException)
-            else profile_result
+            profile_result
             if isinstance(profile_result, ProfileCheck)
             else _unavailable_profile()
         )
-        inventory = (
-            _unavailable_inventory()
-            if isinstance(inventory_result, BaseException)
-            else inventory_result
-            if isinstance(inventory_result, InventoryCheck)
-            else _unavailable_inventory()
-        )
-        return _session_response(steam_id, profile, inventory)
+        return _session_response(steam_id, profile)
+
+    @router.post(
+        "/api/auth/inventory",
+        response_model=InventoryCheck,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def auth_inventory(request: Request, response: Response) -> InventoryCheck:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            steam_id = _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        expected_steam_id = request.headers.get("x-expected-steam-id")
+        if expected_steam_id != steam_id:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            return await steam_gateway.check_inventory(steam_id)
+        except Exception:  # noqa: BLE001 - map gateway failures to unavailable
+            return _unavailable_inventory()
 
     @router.post(
         "/api/auth/gems",

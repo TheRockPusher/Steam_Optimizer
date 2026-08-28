@@ -452,6 +452,25 @@ h3 {
   background: var(--color-unavailable-soft);
   font-variant-numeric: tabular-nums;
 }
+.inventory-cache-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--panel-padding);
+  background: var(--color-surface-strong);
+}
+
+.inventory-cache-status {
+  margin: 0;
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.inventory-cache-toolbar .secondary-action {
+  flex: 0 0 auto;
+}
 
 .access-summary {
   display: flex;
@@ -1545,6 +1564,11 @@ h3 {
 
   .inventory-results {
     padding-top: var(--space-4);
+  }
+
+  .inventory-cache-toolbar {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .inventory-browser {

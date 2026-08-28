@@ -7,6 +7,13 @@ import {
   useState
 } from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
+import {
+  clearInventoryCache,
+  clearInventoryCacheExcept,
+  readInventoryCache,
+  readInventoryCacheEpoch,
+  writeInventoryCache
+} from "./inventoryCache";
 import "./App.css";
 
 type VisibilityStatus = "public" | "private" | "unavailable";
@@ -136,7 +143,6 @@ type SignedInSession = {
   user: SteamUser;
   checks: {
     profile: VisibilityCheck;
-    inventory: InventoryCheck;
   };
 };
 
@@ -165,6 +171,20 @@ type GemRefreshResponse = {
   gem_retry_after_seconds: number | null;
 };
 
+type InventoryState = {
+  inventory: InventoryCheck | null;
+  refreshedAt: string | null;
+  source: "cache" | "network" | null;
+  isLoading: boolean;
+  message: string | null;
+};
+
+type InventoryLoadResult = {
+  kind: "cache" | "network" | "error" | "session-changed";
+  inventory?: InventoryCheck;
+  refreshedAt?: string;
+  preserved?: boolean;
+};
 
 type ViewState =
   | { kind: "loading" }
@@ -174,6 +194,7 @@ type ViewState =
 const MILLISECONDS_PER_SECOND = 1000;
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
 const SESSION_URL = `${API_BASE_URL}/api/auth/session`;
+const INVENTORY_URL = `${API_BASE_URL}/api/auth/inventory`;
 const GEM_REFRESH_URL = `${API_BASE_URL}/api/auth/gems`;
 const LOGOUT_URL = `${API_BASE_URL}/api/auth/logout`;
 const STEAM_LOGIN_URL = `${API_BASE_URL}/api/auth/steam/start`;
@@ -667,7 +688,12 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
         (check.gem_priceable_item_count > 0 || check.status !== "public"))
   );
 }
-
+function isCacheableInventory(value: unknown): value is InventoryCheck {
+  return (
+    isInventoryCheck(value) &&
+    (value.status === "public" || value.status === "private")
+  );
+}
 function isSessionResponse(value: unknown): value is SessionResponse {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -685,7 +711,9 @@ function isSessionResponse(value: unknown): value is SessionResponse {
   if (!session.authenticated) {
     return true;
   }
-
+  if ("inventory" in session) {
+    return false;
+  }
   if (
     typeof session.user !== "object" ||
     session.user === null ||
@@ -694,6 +722,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
   ) {
     return false;
   }
+
 
   const user = session.user as Partial<SteamUser>;
   const checks = session.checks as {
@@ -708,7 +737,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
     (typeof user.display_name === "string" || user.display_name === null) &&
     (typeof user.avatar_url === "string" || user.avatar_url === null) &&
     isVisibilityCheck(checks.profile) &&
-    isInventoryCheck(checks.inventory)
+    !("inventory" in checks)
   );
 }
 function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
@@ -930,6 +959,8 @@ function mergeGemRefresh(
   };
 }
 
+class InventorySessionChangedError extends Error { }
+
 
 async function requestSession(signal?: AbortSignal): Promise<SessionResponse> {
   const response = await fetch(SESSION_URL, {
@@ -950,10 +981,33 @@ async function requestSession(signal?: AbortSignal): Promise<SessionResponse> {
   return payload;
 }
 
-function toViewState(session: SessionResponse): ViewState {
-  return session.authenticated
-    ? { kind: "signed-in", session }
-    : { kind: "signed-out" };
+async function requestInventory(
+  steamId: string,
+  signal?: AbortSignal
+): Promise<InventoryCheck> {
+  const response = await fetch(INVENTORY_URL, {
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      "X-Expected-Steam-ID": steamId
+    },
+    method: "POST",
+    signal
+  });
+
+  if (response.status === 401) {
+    throw new InventorySessionChangedError();
+  }
+  if (!response.ok) {
+    throw new Error("The inventory service returned an error.");
+  }
+
+  const payload: unknown = await response.json();
+  if (!isInventoryCheck(payload)) {
+    throw new Error("The inventory service returned an invalid response.");
+  }
+
+  return payload;
 }
 
 function secondsUntilDeadline(deadlineMs: number | null, nowMs: number): number {
@@ -1108,15 +1162,22 @@ function SteamIdentity({
 
 function AccessSummary({
   profile,
-  inventory
+  inventory,
+  isInventoryLoading
 }: {
   profile: VisibilityCheck;
-  inventory: InventoryCheck;
+  inventory: InventoryCheck | null;
+  isInventoryLoading: boolean;
 }) {
+  const inventoryStatus = inventory?.status ?? "unavailable";
   const inventoryStatusLabel =
-    inventory.status === "unavailable" && inventory.rate_limited
-      ? "Try later"
-      : STATUS_LABELS[inventory.status];
+    inventory === null
+      ? isInventoryLoading
+        ? "Checking…"
+        : "Unavailable"
+      : inventory.status === "unavailable" && inventory.rate_limited
+        ? "Try later"
+        : STATUS_LABELS[inventory.status];
 
   return (
     <dl className="access-summary" aria-label="Steam access status">
@@ -1131,11 +1192,11 @@ function AccessSummary({
         </dd>
       </div>
       <div
-        className={`access-summary-item access-summary-${inventory.status}`}
+        className={`access-summary-item access-summary-${inventoryStatus}`}
       >
         <dt>Inventory</dt>
         <dd
-          className={`access-badge access-badge-${inventory.status}`}
+          className={`access-badge access-badge-${inventoryStatus}`}
           aria-label={`Steam inventory: ${inventoryStatusLabel}`}
         >
           <span className="status-dot" aria-hidden="true" />
@@ -2415,94 +2476,453 @@ function InventoryFaq({
 
 function SignedInView({
   session,
+  inventoryState,
   isRechecking,
+  isRefreshingInventory,
   isRefreshingGems,
   retryAfterSeconds,
   actionMessage,
+  inventoryActionMessage,
   gemRefreshMessage,
+  onRefreshInventory,
   onRefreshGems
 }: {
   session: SignedInSession;
+  inventoryState: InventoryState;
   isRechecking: boolean;
+  isRefreshingInventory: boolean;
   isRefreshingGems: boolean;
   retryAfterSeconds: number;
   actionMessage: string | null;
+  inventoryActionMessage: string | null;
   gemRefreshMessage: string | null;
+  onRefreshInventory: () => void;
   onRefreshGems: () => void;
 }) {
+  const isInventoryRefreshDisabled =
+    isRefreshingInventory ||
+    inventoryState.isLoading ||
+    isRechecking ||
+    isRefreshingGems ||
+    retryAfterSeconds > 0;
 
   return (
     <section className="account-view">
-      {(isRechecking || actionMessage) && (
-        <p className={`action-status${actionMessage ? " action-status-error" : ""}`}>
-          {isRechecking ? "Rechecking profile and inventory access…" : actionMessage}
+      {(isRechecking || actionMessage || inventoryActionMessage) && (
+        <p
+          className={`action-status${actionMessage || inventoryActionMessage
+            ? " action-status-error"
+            : ""
+            }`}
+          aria-live="polite"
+        >
+          {isRechecking
+            ? "Rechecking Steam profile access…"
+            : actionMessage ?? inventoryActionMessage}
         </p>
       )}
 
       {retryAfterSeconds > 0 && (
-        <p id="recheck-cooldown" className="action-status cooldown-status">
-          Repeated immediate recheck requests are disabled. Try again in{" "}
+        <p id="inventory-cooldown" className="action-status cooldown-status">
+          Repeated immediate inventory refreshes are disabled. Try again in{" "}
           {retryAfterSeconds}s.
         </p>
       )}
-      {session.checks.inventory.status === "public" && (
+      <div className="inventory-cache-toolbar">
+        <p className="inventory-cache-status" aria-live="polite">
+          {inventoryState.refreshedAt !== null ? (
+            <>
+              Inventory last refreshed{" "}
+              <time dateTime={inventoryState.refreshedAt}>
+                {formatPriceTimestamp(inventoryState.refreshedAt)}
+              </time>
+              {inventoryState.source === "cache" ? " (cached)" : ""}.
+            </>
+          ) : inventoryState.isLoading ? (
+            "Checking your Steam inventory…"
+          ) : (
+            inventoryState.message ?? "Inventory has not been loaded yet."
+          )}
+        </p>
+        <button
+          className="secondary-action"
+          type="button"
+          onClick={onRefreshInventory}
+          disabled={isInventoryRefreshDisabled}
+          aria-describedby={
+            retryAfterSeconds > 0 ? "inventory-cooldown" : undefined
+          }
+        >
+          {isRefreshingInventory
+            ? "Refreshing inventory…"
+            : inventoryState.isLoading
+              ? "Checking inventory…"
+              : "Refresh inventory"}
+        </button>
+      </div>
+
+      {inventoryState.inventory?.status === "public" && (
         <InventoryResults
-          inventory={session.checks.inventory}
+          inventory={inventoryState.inventory}
           isRefreshingGems={isRefreshingGems}
           refreshMessage={gemRefreshMessage}
           onRefreshGems={onRefreshGems}
         />
       )}
-      <InventoryFaq
-        profile={session.checks.profile}
-        inventory={session.checks.inventory}
-      />
+      {inventoryState.inventory !== null && (
+        <InventoryFaq
+          profile={session.checks.profile}
+          inventory={inventoryState.inventory}
+        />
+      )}
     </section>
   );
 }
 
 function HomePage() {
   const [viewState, setViewState] = useState<ViewState>({ kind: "loading" });
+  const [inventoryState, setInventoryState] = useState<InventoryState>({
+    inventory: null,
+    refreshedAt: null,
+    source: null,
+    isLoading: false,
+    message: null
+  });
   const [isRechecking, setIsRechecking] = useState(false);
+  const [isRefreshingInventory, setIsRefreshingInventory] = useState(false);
   const [isRefreshingGems, setIsRefreshingGems] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [retryDeadlineMs, setRetryDeadlineMs] = useState<number | null>(null);
   const [countdownNowMs, setCountdownNowMs] = useState(() => performance.now());
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [inventoryActionMessage, setInventoryActionMessage] = useState<
+    string | null
+  >(null);
   const [gemRefreshMessage, setGemRefreshMessage] = useState<string | null>(null);
   const [statusAnnouncement, setStatusAnnouncement] = useState("Checking session…");
   const retryDeadlineRef = useRef<number | null>(null);
   const recheckInFlightRef = useRef(false);
+  const inventoryRefreshInFlightRef = useRef(false);
   const gemRefreshInFlightRef = useRef(false);
+  const activeSteamIdRef = useRef<string | null>(null);
+  const inventoryStateRef = useRef(inventoryState);
+  const inventoryRequestTokenRef = useRef(0);
+  const inventoryLoadPromiseRef = useRef<{
+    steamId: string;
+    token: number;
+    promise: Promise<InventoryLoadResult>;
+  } | null>(null);
   const retryAfterSeconds = secondsUntilDeadline(
     retryDeadlineMs,
     countdownNowMs
   );
 
-  const applySession = useCallback((session: SessionResponse) => {
-    const nowMs = performance.now();
-    const deadlineMs =
-      session.authenticated &&
-        session.checks.inventory.retry_after_seconds !== null
-        ? nowMs +
-        session.checks.inventory.retry_after_seconds *
-        MILLISECONDS_PER_SECOND
-        : null;
-
-    retryDeadlineRef.current = deadlineMs;
-    setRetryDeadlineMs(deadlineMs);
-    setCountdownNowMs(nowMs);
-    setViewState(toViewState(session));
+  const updateInventoryState = useCallback((nextState: InventoryState) => {
+    inventoryStateRef.current = nextState;
+    setInventoryState(nextState);
   }, []);
+
+  const setInventoryRetryDeadline = useCallback(
+    (inventory: InventoryCheck | null) => {
+      const nowMs = performance.now();
+      const deadlineMs =
+        inventory?.retry_after_seconds !== null &&
+          inventory?.retry_after_seconds !== undefined
+          ? nowMs + inventory.retry_after_seconds * MILLISECONDS_PER_SECOND
+          : null;
+      retryDeadlineRef.current = deadlineMs;
+      setRetryDeadlineMs(deadlineMs);
+      setCountdownNowMs(nowMs);
+    },
+    []
+  );
+
+  const isCurrentInventoryRequest = useCallback(
+    (token: number, steamId: string): boolean =>
+      activeSteamIdRef.current === steamId &&
+      inventoryRequestTokenRef.current === token,
+    []
+  );
+
+  const loadInventoryForUser = useCallback((
+    steamId: string,
+    forceNetwork = false
+  ): Promise<InventoryLoadResult> => {
+    const existingLoad = inventoryLoadPromiseRef.current;
+    if (!forceNetwork && existingLoad?.steamId === steamId) {
+      return existingLoad.promise;
+    }
+
+    const token = inventoryRequestTokenRef.current + 1;
+    inventoryRequestTokenRef.current = token;
+    activeSteamIdRef.current = steamId;
+    const previousState = inventoryStateRef.current;
+    updateInventoryState({
+      ...previousState,
+      isLoading: true,
+      message: null
+    });
+
+    const promise = (async (): Promise<InventoryLoadResult> => {
+      try {
+        if (!forceNetwork) {
+          let cached: {
+            refreshed_at: string;
+            inventory: InventoryCheck;
+          } | null = null;
+          try {
+            await clearInventoryCacheExcept(steamId);
+            if (isCurrentInventoryRequest(token, steamId)) {
+              cached = await readInventoryCache(
+                steamId,
+                isCacheableInventory
+              );
+            }
+          } catch {
+            cached = null;
+          }
+          if (!isCurrentInventoryRequest(token, steamId)) {
+            return { kind: "error" };
+          }
+          if (cached !== null) {
+            setInventoryRetryDeadline(cached.inventory);
+            updateInventoryState({
+              inventory: cached.inventory,
+              refreshedAt: cached.refreshed_at,
+              source: "cache",
+              isLoading: false,
+              message: null
+            });
+            return {
+              kind: "cache",
+              inventory: cached.inventory,
+              refreshedAt: cached.refreshed_at
+            };
+          }
+        }
+
+        const cacheEpoch = await readInventoryCacheEpoch();
+        const inventory = await requestInventory(steamId);
+        if (!isCurrentInventoryRequest(token, steamId)) {
+          return { kind: "error" };
+        }
+        setInventoryRetryDeadline(inventory);
+
+        const currentState = inventoryStateRef.current;
+        if (
+          inventory.status === "unavailable" &&
+          currentState.inventory !== null &&
+          currentState.inventory.status !== "unavailable"
+        ) {
+          updateInventoryState({
+            ...currentState,
+            isLoading: false,
+            message: null
+          });
+          return {
+            kind: "network",
+            inventory,
+            preserved: true
+          };
+        }
+
+        if (
+          inventory.status === "public" ||
+          inventory.status === "private"
+        ) {
+          const fetchedAt = new Date().toISOString();
+          const storedAt =
+            cacheEpoch === null
+              ? undefined
+              : await writeInventoryCache(
+                steamId,
+                inventory,
+                isCacheableInventory,
+                fetchedAt,
+                cacheEpoch
+              );
+          if (!isCurrentInventoryRequest(token, steamId)) {
+            return { kind: "error" };
+          }
+          if (storedAt === null) {
+            updateInventoryState({
+              ...inventoryStateRef.current,
+              isLoading: false
+            });
+            return { kind: "session-changed" };
+          }
+          const refreshedAt = storedAt ?? fetchedAt;
+          updateInventoryState({
+            inventory,
+            refreshedAt,
+            source: "network",
+            isLoading: false,
+            message: null
+          });
+          return {
+            kind: "network",
+            inventory,
+            refreshedAt
+          };
+        }
+
+        updateInventoryState({
+          inventory,
+          refreshedAt: null,
+          source: "network",
+          isLoading: false,
+          message: null
+        });
+        return { kind: "network", inventory };
+      } catch (error) {
+        if (!isCurrentInventoryRequest(token, steamId)) {
+          return { kind: "error" };
+        }
+        if (error instanceof InventorySessionChangedError) {
+          updateInventoryState({
+            ...inventoryStateRef.current,
+            isLoading: false
+          });
+          return { kind: "session-changed" };
+        }
+        const currentState = inventoryStateRef.current;
+        updateInventoryState({
+          ...currentState,
+          isLoading: false,
+          message:
+            currentState.inventory === null
+              ? "We could not load your Steam inventory. Try refreshing when the service is available."
+              : null
+        });
+        return {
+          kind: "error",
+          preserved: currentState.inventory !== null
+        };
+      } finally {
+        if (inventoryLoadPromiseRef.current?.token === token) {
+          inventoryLoadPromiseRef.current = null;
+        }
+      }
+    })();
+
+    inventoryLoadPromiseRef.current = {
+      steamId,
+      token,
+      promise
+    };
+    return promise;
+  }, [
+    isCurrentInventoryRequest,
+    setInventoryRetryDeadline,
+    updateInventoryState
+  ]);
+
+  const presentSession = useCallback(async (
+    session: SessionResponse,
+    shouldLoadInventory: boolean
+  ): Promise<InventoryLoadResult | null> => {
+    if (!session.authenticated) {
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+      inventoryLoadPromiseRef.current = null;
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setRetryDeadlineMs(null);
+      retryDeadlineRef.current = null;
+      setViewState({ kind: "signed-out" });
+      return null;
+    }
+
+    const previousSteamId = activeSteamIdRef.current;
+    const accountChanged =
+      previousSteamId !== null && previousSteamId !== session.user.steam_id;
+    activeSteamIdRef.current = session.user.steam_id;
+    setViewState({ kind: "signed-in", session });
+
+    const needsInventory =
+      shouldLoadInventory ||
+      accountChanged ||
+      previousSteamId === null;
+    if (!needsInventory) {
+      return null;
+    }
+
+    if (accountChanged || shouldLoadInventory) {
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setInventoryRetryDeadline(null);
+    }
+    return loadInventoryForUser(session.user.steam_id);
+  }, [
+    loadInventoryForUser,
+    setInventoryRetryDeadline,
+    updateInventoryState
+  ]);
+
+  const loadCurrentSession = useCallback(
+    async (signal?: AbortSignal) => {
+      let session = await requestSession(signal);
+      let result = await presentSession(session, true);
+      if (result?.kind === "session-changed" && !signal?.aborted) {
+        session = await requestSession(signal);
+        result = await presentSession(session, true);
+      }
+      return { session, result };
+    },
+    [presentSession]
+  );
 
   useEffect(() => {
     const controller = new AbortController();
 
     void requestSession(controller.signal)
-      .then((session) => {
-        if (!controller.signal.aborted) {
-          applySession(session);
-          setStatusAnnouncement("");
+      .then(async (initialSession) => {
+        let session = initialSession;
+        let result = await presentSession(session, true);
+        if (result?.kind === "session-changed" && !controller.signal.aborted) {
+          session = await requestSession(controller.signal);
+          result = await presentSession(session, true);
+        }
+        return { session, result };
+      })
+      .then(({ session, result }) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (!session.authenticated) {
+          setStatusAnnouncement(
+            "Your local session has ended. Sign in again to load saved inventory."
+          );
+        } else if (
+          result?.kind === "cache" &&
+          result.refreshedAt !== undefined
+        ) {
+          setStatusAnnouncement(
+            `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+              result.refreshedAt
+            )}.`
+          );
+        } else if (result?.kind === "network" && result.inventory) {
+          setStatusAnnouncement(
+            `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`
+          );
+        } else if (
+          result?.kind === "error" ||
+          result?.kind === "session-changed"
+        ) {
+          setStatusAnnouncement(
+            "We could not load your Steam inventory. Refresh when the service is available."
+          );
         }
       })
       .catch(() => {
@@ -2512,8 +2932,12 @@ function HomePage() {
         }
       });
 
-    return () => controller.abort();
-  }, [applySession]);
+    return () => {
+      controller.abort();
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+    };
+  }, [presentSession]);
 
   useEffect(() => {
     if (retryDeadlineMs === null) {
@@ -2542,11 +2966,26 @@ function HomePage() {
   async function handleRetry() {
     setViewState({ kind: "loading" });
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setStatusAnnouncement("Checking session…");
 
     try {
-      applySession(await requestSession());
-      setStatusAnnouncement("");
+      const { session, result } = await loadCurrentSession();
+      if (!session.authenticated) {
+        setStatusAnnouncement(
+          "Your local session has ended. Sign in again to load saved inventory."
+        );
+      } else if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+        setStatusAnnouncement(
+          `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`
+        );
+      } else if (result?.kind === "network" && result.inventory) {
+        setStatusAnnouncement(
+          `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`
+        );
+      }
     } catch {
       setViewState({ kind: "api-unavailable" });
       setStatusAnnouncement("Steam connection is unavailable.");
@@ -2556,9 +2995,9 @@ function HomePage() {
   async function handleRecheck() {
     if (
       recheckInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
       gemRefreshInFlightRef.current ||
-      isSigningOut ||
-      secondsUntilDeadline(retryDeadlineRef.current, performance.now()) > 0
+      isSigningOut
     ) {
       return;
     }
@@ -2566,20 +3005,53 @@ function HomePage() {
     recheckInFlightRef.current = true;
     setIsRechecking(true);
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setGemRefreshMessage(null);
-    setStatusAnnouncement("Rechecking profile and inventory access…");
+    setStatusAnnouncement("Rechecking Steam profile access…");
 
     try {
-      const session = await requestSession();
-      applySession(session);
-      setStatusAnnouncement(
-        session.authenticated
-          ? `Recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Steam inventory: ${STATUS_LABELS[session.checks.inventory.status]}.`
-          : "Your local session has ended. Sign in again to recheck Steam access."
-      );
+      let session = await requestSession();
+      const previousSteamId = activeSteamIdRef.current;
+      let result = await presentSession(session, false);
+      if (result?.kind === "session-changed") {
+        const current = await loadCurrentSession();
+        session = current.session;
+        result = current.result;
+      }
+      if (!session.authenticated) {
+        setStatusAnnouncement(
+          "Your local session has ended. Sign in again to recheck Steam profile access."
+        );
+      } else if (
+        previousSteamId !== null &&
+        previousSteamId !== session.user.steam_id
+      ) {
+        let inventoryOutcome = "Inventory could not be loaded.";
+        if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+          inventoryOutcome = `Loaded cached inventory last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`;
+        } else if (result?.kind === "network" && result.inventory) {
+          inventoryOutcome = `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`;
+        }
+        setStatusAnnouncement(
+          `Account changed. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. ${inventoryOutcome}`
+        );
+      } else if (
+        result?.kind === "network" &&
+        result.inventory?.status === "unavailable"
+      ) {
+        setStatusAnnouncement(
+          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Inventory is unavailable.`
+        );
+      } else {
+        setStatusAnnouncement(
+          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}.`
+        );
+      }
     } catch {
       const message =
-        "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
+        "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
       setActionMessage(message);
       setStatusAnnouncement(message);
     } finally {
@@ -2587,17 +3059,106 @@ function HomePage() {
       setIsRechecking(false);
     }
   }
+
+  async function handleInventoryRefresh() {
+    if (
+      inventoryRefreshInFlightRef.current ||
+      recheckInFlightRef.current ||
+      gemRefreshInFlightRef.current ||
+      isSigningOut ||
+      inventoryStateRef.current.isLoading ||
+      viewState.kind !== "signed-in" ||
+      retryAfterSeconds > 0
+    ) {
+      return;
+    }
+
+    const steamId = viewState.session.user.steam_id;
+    inventoryRefreshInFlightRef.current = true;
+    setIsRefreshingInventory(true);
+    setInventoryActionMessage(null);
+    setGemRefreshMessage(null);
+    setStatusAnnouncement("Refreshing inventory…");
+
+    try {
+      let result: InventoryLoadResult | null = await loadInventoryForUser(
+        steamId,
+        true
+      );
+      if (result.kind === "session-changed") {
+        const current = await loadCurrentSession();
+        if (!current.session.authenticated) {
+          setStatusAnnouncement(
+            "Your local session has ended. Sign in again to refresh inventory."
+          );
+          return;
+        }
+        result = current.result;
+        if (current.session.user.steam_id !== steamId) {
+          let inventoryOutcome = "Inventory could not be loaded.";
+          if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+            inventoryOutcome = `Loaded cached inventory last refreshed ${formatPriceTimestamp(
+              result.refreshedAt
+            )}.`;
+          } else if (result?.kind === "network" && result.inventory) {
+            inventoryOutcome = `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`;
+          }
+          setStatusAnnouncement(
+            `Account changed. Steam profile: ${STATUS_LABELS[current.session.checks.profile.status]}. ${inventoryOutcome}`
+          );
+          return;
+        }
+      }
+      if (result?.kind === "network" && result.inventory !== undefined) {
+        if (result.inventory.status === "unavailable") {
+          const message =
+            "We could not refresh inventory right now. Your previous inventory results have not changed.";
+          setInventoryActionMessage(message);
+          setStatusAnnouncement(message);
+        } else {
+          setStatusAnnouncement(
+            `Inventory refresh complete: ${STATUS_LABELS[result.inventory.status]}.`
+          );
+        }
+      } else if (result?.kind === "cache" && result.refreshedAt !== undefined) {
+        setStatusAnnouncement(
+          `Loaded cached inventory. Last refreshed ${formatPriceTimestamp(
+            result.refreshedAt
+          )}.`
+        );
+      } else {
+        const message =
+          "We could not refresh inventory right now. Your previous inventory results have not changed.";
+        setInventoryActionMessage(message);
+        setStatusAnnouncement(message);
+      }
+    } catch {
+      const message =
+        "We could not refresh inventory right now. Your previous inventory results have not changed.";
+      setInventoryActionMessage(message);
+      setStatusAnnouncement(message);
+    } finally {
+      inventoryRefreshInFlightRef.current = false;
+      setIsRefreshingInventory(false);
+    }
+  }
+
   async function handleGemRefresh() {
     if (
       gemRefreshInFlightRef.current ||
       recheckInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
       isSigningOut ||
       viewState.kind !== "signed-in" ||
-      viewState.session.checks.inventory.status !== "public"
+      inventoryStateRef.current.inventory?.status !== "public"
     ) {
       return;
     }
-    const inventory = viewState.session.checks.inventory;
+    const inventory = inventoryStateRef.current.inventory;
+    const steamId = activeSteamIdRef.current;
+    if (inventory === null || steamId === null) {
+      return;
+    }
     if (gemRefreshGroups(inventory.items).length === 0) {
       return;
     }
@@ -2608,25 +3169,36 @@ function HomePage() {
     setStatusAnnouncement("Refreshing cached gem values…");
 
     try {
+      const cacheEpoch = await readInventoryCacheEpoch();
       const refresh = await requestGemRefresh(inventory);
       const mergedInventory = mergeGemRefresh(inventory, refresh);
-      setViewState((current) =>
-        current.kind === "signed-in"
-          ? {
-            kind: "signed-in",
-            session: {
-              ...current.session,
-              checks: {
-                ...current.session.checks,
-                inventory: mergeGemRefresh(
-                  current.session.checks.inventory,
-                  refresh
-                )
-              }
-            }
-          }
-          : current
-      );
+      if (activeSteamIdRef.current !== steamId) {
+        return;
+      }
+      const currentState = inventoryStateRef.current;
+      if (currentState.inventory === null) {
+        return;
+      }
+      const currentRefreshedAt = currentState.refreshedAt;
+      const storedAt =
+        cacheEpoch === null || currentRefreshedAt === null
+          ? undefined
+          : await writeInventoryCache(
+            steamId,
+            mergedInventory,
+            isCacheableInventory,
+            currentRefreshedAt,
+            cacheEpoch,
+            currentRefreshedAt
+          );
+      if (activeSteamIdRef.current !== steamId || storedAt === null) {
+        return;
+      }
+      updateInventoryState({
+        ...currentState,
+        inventory: mergedInventory,
+        message: null
+      });
       setGemRefreshMessage("Gem values refreshed from the background cache.");
       setStatusAnnouncement(
         `Gem refresh complete. ${mergedInventory.gem_priced_item_count} of ${mergedInventory.gem_priceable_item_count} trading-card item types have gem values.`
@@ -2642,13 +3214,17 @@ function HomePage() {
     }
   }
 
-
   async function handleLogout() {
-    if (gemRefreshInFlightRef.current) {
+    if (
+      gemRefreshInFlightRef.current ||
+      inventoryRefreshInFlightRef.current ||
+      recheckInFlightRef.current
+    ) {
       return;
     }
     setIsSigningOut(true);
     setActionMessage(null);
+    setInventoryActionMessage(null);
     setGemRefreshMessage(null);
     setStatusAnnouncement("Signing out…");
 
@@ -2661,8 +3237,24 @@ function HomePage() {
       if (response.status !== 204) {
         throw new Error("The logout service returned an unexpected response.");
       }
-
-      applySession({ authenticated: false });
+      activeSteamIdRef.current = null;
+      inventoryRequestTokenRef.current += 1;
+      inventoryLoadPromiseRef.current = null;
+      try {
+        await clearInventoryCache();
+      } catch {
+        // Cache cleanup must not prevent a successful server sign-out.
+      }
+      updateInventoryState({
+        inventory: null,
+        refreshedAt: null,
+        source: null,
+        isLoading: false,
+        message: null
+      });
+      setRetryDeadlineMs(null);
+      retryDeadlineRef.current = null;
+      setViewState({ kind: "signed-out" });
       setStatusAnnouncement("Signed out successfully.");
     } catch {
       const message =
@@ -2699,21 +3291,19 @@ function HomePage() {
           <div className="site-account">
             <AccessSummary
               profile={viewState.session.checks.profile}
-              inventory={viewState.session.checks.inventory}
+              inventory={inventoryState.inventory}
+              isInventoryLoading={inventoryState.isLoading}
             />
             <button
               className="secondary-action"
               type="button"
-              aria-label="Recheck Steam access"
+              aria-label="Recheck Steam profile"
               onClick={() => void handleRecheck()}
               disabled={
                 isRechecking ||
+                isRefreshingInventory ||
                 isRefreshingGems ||
-                isSigningOut ||
-                retryAfterSeconds > 0
-              }
-              aria-describedby={
-                retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
+                isSigningOut
               }
             >
               {isRechecking ? "Checking…" : "Recheck"}
@@ -2721,7 +3311,9 @@ function HomePage() {
             <SteamIdentity
               user={viewState.session.user}
               isSigningOut={isSigningOut}
-              isBusy={isRechecking || isRefreshingGems}
+              isBusy={
+                isRechecking || isRefreshingInventory || isRefreshingGems
+              }
               onLogout={() => void handleLogout()}
             />
           </div>
@@ -2753,11 +3345,15 @@ function HomePage() {
         {viewState.kind === "signed-in" && (
           <SignedInView
             session={viewState.session}
+            inventoryState={inventoryState}
             isRechecking={isRechecking}
+            isRefreshingInventory={isRefreshingInventory}
             isRefreshingGems={isRefreshingGems}
             retryAfterSeconds={retryAfterSeconds}
             actionMessage={actionMessage}
+            inventoryActionMessage={inventoryActionMessage}
             gemRefreshMessage={gemRefreshMessage}
+            onRefreshInventory={() => void handleInventoryRefresh()}
             onRefreshGems={() => void handleGemRefresh()}
           />
         )}
