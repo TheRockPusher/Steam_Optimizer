@@ -1,15 +1,22 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.7.0
 
-## Unreleased
 
-### Features
-- Value every Steam Community item carrying a validated gem-conversion action
-- Name all Steam Community item classes and preserve independent item metadata
+### Documentation
+- Update changelog for v0.6.0
+
 
 ### Maintenance
-- Key the gem cache and refresh API by Steam's exact conversion identity
+- Resolve main merge conflicts
+- Merge main into cache branch
+- Merge main and preserve item metadata
+- Prepare release v0.7.0
+
+
+### Testing
+- Satisfy merged HTTP client contracts
 
 ## v0.6.0
 
@@ -19,6 +26,9 @@ All notable changes to Steam Optimizer are documented here.
 
 
 ### Features
+- Generalize Steam inventory item metadata
+- Cache Steam inventory and market prices
+- Compact inventory results layout
 - Streamline inventory workspace design
 - Derive booster gem costs
 
