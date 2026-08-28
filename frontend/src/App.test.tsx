@@ -881,6 +881,8 @@ describe("App", () => {
 
     render(<App />);
 
+    fireEvent.click(await screen.findByRole("tab", { name: "Boosters" }));
+
     const section = await screen.findByRole("region", {
       name: "Booster details by game"
     });
@@ -894,9 +896,116 @@ describe("App", () => {
     expect(
       within(boosterCard).getByText("3", { selector: "dd" })
     ).toBeInTheDocument();
+
     expect(
       within(boosterCard).getByText(/Aug 27, 2026/)
     ).toHaveAttribute("datetime", "2026-08-27T00:00:00Z");
+  });
+  it("switches between item and booster result panels with manual keyboard activation", async () => {
+    const inventory = publicInventory([tradingCardItem(10)], {
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_status: "complete",
+      gem_message: "Gem values are current for all trading cards.",
+      boosters: [
+        {
+          game_app_id: "440",
+          game_name: "Team Fortress 2",
+          market_hash_name: "440-Team Fortress 2 Booster Pack",
+          card_count: 3,
+          price: validInventoryPrice
+        }
+      ]
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    const itemsTab = within(tablist).getByRole("tab", { name: "Items" });
+    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
+    const itemsPanel = document.getElementById("inventory-results-panel-items");
+    const boostersPanel = document.getElementById(
+      "inventory-results-panel-boosters"
+    );
+
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(boostersTab).toHaveAttribute("aria-selected", "false");
+    expect(itemsPanel).not.toBeNull();
+    expect(boostersPanel).not.toBeNull();
+    expect(itemsPanel).not.toHaveAttribute("hidden");
+    expect(boostersPanel).toHaveAttribute("hidden");
+    expect(
+      screen.getByRole("table", { name: "Inventory items" })
+    ).toBeInTheDocument();
+    const groupByGame = screen.getByRole("checkbox", {
+      name: "Group by game"
+    });
+    fireEvent.click(groupByGame);
+    expect(groupByGame).not.toBeChecked();
+    expect(
+      screen.queryByRole("region", { name: "Booster details by game" })
+    ).not.toBeInTheDocument();
+    expect(
+      boostersPanel?.querySelector("section[aria-labelledby=booster-coverage-title]")
+    ).not.toBeNull();
+
+    fireEvent.keyDown(itemsTab, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(boostersTab);
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(boostersTab).toHaveAttribute("aria-selected", "false");
+    fireEvent.keyDown(boostersTab, { key: " " });
+    expect(boostersTab).toHaveAttribute("aria-selected", "true");
+    expect(itemsTab).toHaveAttribute("aria-selected", "false");
+    expect(itemsPanel).toHaveAttribute("hidden");
+    expect(boostersPanel).not.toHaveAttribute("hidden");
+    expect(
+      screen.getByRole("region", { name: "Booster details by game" })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("table", { name: "Inventory items" })
+    ).not.toBeInTheDocument();
+    expect(
+      itemsPanel?.querySelector("table.inventory-table")
+    ).not.toBeNull();
+
+    fireEvent.click(itemsTab);
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("table", { name: "Inventory items" })
+    ).toBeInTheDocument();
+    expect(groupByGame).not.toBeChecked();
+  });
+
+  it("keeps an empty booster view selectable and explains the missing data", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(publicInventory([])))
+    );
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
+    fireEvent.click(boostersTab);
+
+    expect(
+      await screen.findByRole("heading", { name: "No booster packs to display" })
+    ).toBeInTheDocument();
+    expect(boostersTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByText(
+        "No trading-card games were identified in this inventory, so there are no related booster packs to display."
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "Booster details by game" })
+    ).not.toBeInTheDocument();
   });
   it("sorts every inventory field in both directions and keeps unavailable values last", async () => {
     const charlie = {

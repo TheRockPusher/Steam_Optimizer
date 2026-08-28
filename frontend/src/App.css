@@ -976,6 +976,16 @@ h3 {
   border-radius: var(--radius-sm);
   background: var(--color-surface);
 }
+.inventory-result-tabs {
+  margin-top: var(--space-7);
+  flex-wrap: nowrap;
+}
+
+.inventory-result-tabs .inventory-view-tab {
+  justify-content: center;
+  text-align: center;
+}
+
 
 .inventory-view-tab {
   display: inline-flex;
