@@ -1457,26 +1457,40 @@ class GemPricingService:
         cached_entries = self.cache.get_many(unique_keys)
         values: dict[tuple[str, CardRarity], GemResolution] = {}
         used_stale_cache = False
+        pending_count = 0
+        terminal_negative_count = 0
         for key in unique_keys:
             cached = cached_entries.get(key)
             if cached is None:
+                pending_count += 1
+                continue
+            if cached.status == "negative":
+                if cached.expired:
+                    pending_count += 1
+                else:
+                    terminal_negative_count += 1
                 continue
             resolution = cached.resolution()
             if resolution is None:
+                pending_count += 1
                 continue
             values[key] = resolution
             used_stale_cache = used_stale_cache or cached.expired
         rate_limited, retry_after_seconds = self._rate_limit_status()
         _LOGGER.info(
-            "gem cache refresh requested=%d cached=%d missing=%d rate_limited=%s",
+            (
+                "gem cache refresh requested=%d cached=%d pending=%d "
+                "terminal_negative=%d rate_limited=%s"
+            ),
             len(unique_keys),
             len(values),
-            len(unique_keys) - len(values),
+            pending_count,
+            terminal_negative_count,
             rate_limited,
         )
         return GemScanResult(
             values=values,
-            pending_count=len(unique_keys) - len(values),
+            pending_count=pending_count,
             rate_limited=rate_limited,
             retry_after_seconds=retry_after_seconds,
             used_stale_cache=used_stale_cache,
