@@ -10,10 +10,11 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping, Sequence
 
 
 import app.steam_gateway as steam_gateway
+from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import CardRarity, GemPriceCache, GemPricingService, GemScanResult
 from app.main import create_app
 from app.settings import Settings
@@ -146,6 +147,12 @@ class NoopGemPricing:
     ) -> GemScanResult:
         del groups
         return GemScanResult(values={})
+
+
+class NoopBoosterPricing:
+    async def resolve(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
+        del game_app_ids
+        return BoosterScanResult(values={})
 
 
 class MinimalClient:
@@ -766,6 +773,7 @@ def test_inventory_includes_booster_price_and_card_count() -> None:
         settings(),
         http_client=client,
         gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+        booster_pricing=NoopBoosterPricing(),  # type: ignore[arg-type]
     )
 
     result = run(steamapis.fetch_inventory("42"))
@@ -777,6 +785,8 @@ def test_inventory_includes_booster_price_and_card_count() -> None:
     assert booster.game_name == "Team Fortress 2"
     assert booster.market_hash_name == booster_market_hash_name
     assert booster.card_count == 3
+    assert booster.card_set_size is None
+    assert booster.gem_cost is None
     assert booster.price is not None
     assert booster.price.highest_buy == "0.11"
     assert booster.price.lowest_sell == "0.13"

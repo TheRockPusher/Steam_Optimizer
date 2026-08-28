@@ -11,10 +11,11 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator, Iterable, Mapping
 
     from httpx2 import Response
 
+from app.booster_pricing import BoosterResolution, BoosterScanResult
 from app.cookies import (
     InvalidCookieLifetimeError,
     InvalidCookiePayloadError,
@@ -60,6 +61,7 @@ class FakeGateway:
         self.profile_calls = 0
         self.inventory_calls = 0
         self.gem_refresh_calls: list[Mapping[tuple[str, CardRarity], None]] = []
+        self.booster_refresh_calls: list[tuple[str, ...]] = []
 
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         self.profile_calls += 1
@@ -95,6 +97,19 @@ class FakeGateway:
                     observed_at="2026-08-28T00:00:00Z",
                 )
                 for key in groups
+            }
+        )
+
+    async def refresh_boosters(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterScanResult:
+        game_app_ids = tuple(game_app_ids)
+        self.booster_refresh_calls.append(game_app_ids)
+        return BoosterScanResult(
+            values={
+                game_app_id: BoosterResolution(card_set_size=10, gem_cost=600)
+                for game_app_id in game_app_ids
             }
         )
 
@@ -395,6 +410,14 @@ def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
         "pending_group_count": 0,
         "gem_rate_limited": False,
         "gem_retry_after_seconds": None,
+        "boosters": [
+            {
+                "game_app_id": "440",
+                "card_set_size": 10,
+                "gem_cost": 600,
+            }
+        ],
+        "pending_booster_count": 0,
     }
     assert gateway.profile_calls == 0
     assert gateway.inventory_calls == 0
@@ -404,6 +427,7 @@ def test_gem_refresh_reads_cache_without_profile_or_inventory_checks() -> None:
             ("440", "foil"): None,
         }
     ]
+    assert gateway.booster_refresh_calls == [("440",)]
 
 
 class FakeResponse:

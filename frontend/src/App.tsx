@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
-import steamSignInCompact from "./assets/steam/sits_02.png";
 import "./App.css";
 
 type VisibilityStatus = "public" | "private" | "unavailable";
@@ -28,6 +34,8 @@ type BoosterInfo = {
   game_name: string | null;
   market_hash_name: string | null;
   card_count: 3;
+  card_set_size: number | null;
+  gem_cost: number | null;
   price: InventoryPrice | null;
 };
 
@@ -142,9 +150,17 @@ type GemRefreshValue = GemRefreshGroup & {
   gem_yield: number;
 };
 
+type BoosterRefreshValue = {
+  game_app_id: string;
+  card_set_size: number | null;
+  gem_cost: number | null;
+};
+
 type GemRefreshResponse = {
   values: GemRefreshValue[];
   pending_group_count: number;
+  boosters: BoosterRefreshValue[];
+  pending_booster_count: number;
   gem_rate_limited: boolean;
   gem_retry_after_seconds: number | null;
 };
@@ -331,6 +347,27 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
   );
 }
 
+function gemCostForCardSetSize(cardSetSize: number): number {
+  return Math.floor((12000 + cardSetSize) / (2 * cardSetSize));
+}
+
+function isBoosterDerivation(
+  cardSetSize: unknown,
+  gemCost: unknown
+): boolean {
+  if (cardSetSize === null || gemCost === null) {
+    return cardSetSize === null && gemCost === null;
+  }
+
+  return (
+    isSafeInteger(cardSetSize, 5) &&
+    cardSetSize <= 15 &&
+    isSafeInteger(gemCost, 0) &&
+    gemCost === gemCostForCardSetSize(cardSetSize)
+  );
+}
+
+
 function isBoosterInfo(value: unknown): value is BoosterInfo {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -350,6 +387,7 @@ function isBoosterInfo(value: unknown): value is BoosterInfo {
         booster.market_hash_name.length > 0)
     ) ||
     booster.card_count !== 3 ||
+    !isBoosterDerivation(booster.card_set_size, booster.gem_cost) ||
     (booster.price !== null && !isInventoryPrice(booster.price))
   ) {
     return false;
@@ -681,6 +719,8 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
   if (
     !Array.isArray(refresh.values) ||
     !isSafeInteger(refresh.pending_group_count, 0) ||
+    !Array.isArray(refresh.boosters) ||
+    !isSafeInteger(refresh.pending_booster_count, 0) ||
     typeof refresh.gem_rate_limited !== "boolean" ||
     typeof refresh.gem_retry_after_seconds === "undefined" ||
     (refresh.gem_retry_after_seconds !== null &&
@@ -690,6 +730,7 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
   ) {
     return false;
   }
+
   const keys = new Set<string>();
   for (const entry of refresh.values) {
     if (typeof entry !== "object" || entry === null) {
@@ -710,6 +751,25 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
     }
     keys.add(key);
   }
+
+  const boosterKeys = new Set<string>();
+  for (const entry of refresh.boosters) {
+    if (typeof entry !== "object" || entry === null) {
+      return false;
+    }
+    const candidate = entry as Partial<BoosterRefreshValue>;
+    if (
+      !isDecimalString(candidate.game_app_id) ||
+      !isBoosterDerivation(candidate.card_set_size, candidate.gem_cost)
+    ) {
+      return false;
+    }
+    if (boosterKeys.has(candidate.game_app_id)) {
+      return false;
+    }
+    boosterKeys.add(candidate.game_app_id);
+  }
+
   return true;
 }
 
@@ -763,11 +823,18 @@ async function requestGemRefresh(
   const requestedKeys = new Set(
     groups.map((group) => `${group.game_app_id}:${group.card_rarity}`)
   );
+  const requestedBoosterIds = new Set(
+    groups.map((group) => group.game_app_id)
+  );
   if (
     payload.values.length > groups.length ||
     payload.values.some(
       (entry) =>
         !requestedKeys.has(`${entry.game_app_id}:${entry.card_rarity}`)
+    ) ||
+    payload.boosters.length > requestedBoosterIds.size ||
+    payload.boosters.some(
+      (entry) => !requestedBoosterIds.has(entry.game_app_id)
     )
   ) {
     throw new Error("The gem refresh service returned unrequested values.");
@@ -783,6 +850,11 @@ function mergeGemRefresh(
     refresh.values.map(
       (entry) =>
         [`${entry.game_app_id}:${entry.card_rarity}`, entry.gem_yield] as const
+    )
+  );
+  const boosterValues = new Map<string, BoosterRefreshValue>(
+    refresh.boosters.map(
+      (entry) => [entry.game_app_id, entry] as const
     )
   );
   const items = inventory.items.map((item) => {
@@ -813,6 +885,17 @@ function mergeGemRefresh(
           )
     };
   });
+  const boosters = inventory.boosters.map((booster) => {
+    const refreshedBooster = boosterValues.get(booster.game_app_id);
+    if (typeof refreshedBooster === "undefined") {
+      return booster;
+    }
+    return {
+      ...booster,
+      card_set_size: refreshedBooster.card_set_size,
+      gem_cost: refreshedBooster.gem_cost
+    };
+  });
   const gemPriceableCount = items.filter(
     (item) => item.item_type === "trading_card"
   ).length;
@@ -837,6 +920,7 @@ function mergeGemRefresh(
   return {
     ...inventory,
     items,
+    boosters,
     gem_status: gemStatus,
     gem_message: gemMessage,
     gem_priceable_item_count: gemPriceableCount,
@@ -883,92 +967,72 @@ function secondsUntilDeadline(deadlineMs: number | null, nowMs: number): number 
   );
 }
 
-function Brand() {
+type PageKind = "home" | "faq";
+
+function Brand({ currentPage }: { currentPage: PageKind }) {
   return (
-    <div className="brand" aria-label="Steam Optimizer">
+    <a
+      className="brand"
+      href="/"
+      aria-label="Steam Optimizer home"
+      aria-current={currentPage === "home" ? "page" : undefined}
+    >
       <span className="brand-mark" aria-hidden="true">
         SO
       </span>
       <span className="brand-name">Steam Optimizer</span>
-    </div>
+    </a>
   );
 }
 
-function ReadOnlyBoundary() {
+function SiteHeader({
+  currentPage,
+  children
+}: {
+  currentPage: PageKind;
+  children?: ReactNode;
+}) {
   return (
-    <aside className="boundary-note" aria-labelledby="boundary-title">
-      <p className="section-label">Read-only by design</p>
-      <h2 id="boundary-title">Your account stays under your control.</h2>
-      <p>
-        Steam Optimizer only reads information Steam exposes publicly. It cannot
-        trade, sell, craft, or change your account. Any future account action
-        stays manual and happens on Steam.
-      </p>
-    </aside>
+    <header className="site-header">
+      <Brand currentPage={currentPage} />
+      <div className="site-header-actions">
+        <nav className="primary-nav" aria-label="Primary navigation">
+          <a
+            className="nav-link"
+            href="/faq"
+            aria-current={currentPage === "faq" ? "page" : undefined}
+          >
+            FAQ
+          </a>
+        </nav>
+        {children}
+      </div>
+    </header>
+  );
+}
+
+function SiteFooter() {
+  return (
+    <footer className="site-footer">
+      <p>Steam Optimizer</p>
+      <div className="footer-links">
+        <a href="/faq">FAQ</a>
+        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
+          Privacy &amp; Steam data terms
+          <span className="visually-hidden"> (opens in a new tab)</span>
+        </a>
+      </div>
+    </footer>
   );
 }
 
 function LoadingView() {
   return (
-    <section className="state-panel loading-panel" aria-labelledby="loading-title">
-      <div>
-        <p className="section-label">Steam connection</p>
-        <h2 id="loading-title">Checking your connection</h2>
-        <p className="state-copy">
-          Looking for an existing local session. No Steam credentials are sent
-          from this page.
-        </p>
-      </div>
-      <div className="loading-indicator">
+    <section className="session-status" aria-label="Steam session">
+      <p className="loading-indicator">
         <span className="loading-dot" aria-hidden="true" />
-        Checking session…
-      </div>
-    </section>
-  );
-}
-
-
-function SignedOutView() {
-  return (
-    <section className="state-panel connection-panel" aria-labelledby="connect-title">
-      <div className="connection-copy">
-        <p className="section-label">Stage one · Connect</p>
-        <h2 id="connect-title">Connect Steam to check public access.</h2>
-        <p id="connect-description" className="state-copy">
-          Continue to Steam in this browser. Steam handles sign-in and returns
-          your public Steam identity—your password never comes here.
-        </p>
-      </div>
-
-      <div className="connection-details" aria-label="Connection details">
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            01
-          </span>
-          <p>
-            <strong>Steam verifies you.</strong>
-            <span>Authentication happens on Steam Community.</span>
-          </p>
-        </div>
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            02
-          </span>
-          <p>
-            <strong>We check public surfaces.</strong>
-            <span>Profile and inventory access are reported separately.</span>
-          </p>
-        </div>
-        <div>
-          <span className="detail-number" aria-hidden="true">
-            03
-          </span>
-          <p>
-            <strong>You decide what comes next.</strong>
-            <span>No account actions are automated.</span>
-          </p>
-        </div>
-      </div>
+        Checking your Steam session…
+      </p>
     </section>
   );
 }
@@ -976,15 +1040,14 @@ function SignedOutView() {
 function ApiUnavailableView({ onRetry }: { onRetry: () => void }) {
   return (
     <section
-      className="state-panel unavailable-panel"
+      className="session-alert"
       aria-labelledby="unavailable-title"
     >
       <div>
-        <p className="section-label">Connection service</p>
         <h2 id="unavailable-title">Steam connection is unavailable.</h2>
-        <p className="state-copy">
-          We could not reach the app's session service. This is a service or
-          configuration problem—not a Steam privacy result.
+        <p>
+          The session service could not be reached. This is not a Steam privacy
+          result.
         </p>
       </div>
       <button className="secondary-action" type="button" onClick={onRetry}>
@@ -994,25 +1057,52 @@ function ApiUnavailableView({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-function SteamIdentity({ user }: { user: SteamUser }) {
+function SteamIdentity({
+  user,
+  isSigningOut,
+  isBusy,
+  onLogout
+}: {
+  user: SteamUser;
+  isSigningOut: boolean;
+  isBusy: boolean;
+  onLogout: () => void;
+}) {
   const displayName = user.display_name?.trim() || "Steam member";
   const initials = displayName.slice(0, 2).toUpperCase();
 
   return (
-    <div className="identity">
-      {user.avatar_url ? (
-        <img className="avatar" src={user.avatar_url} alt="" />
-      ) : (
-        <span className="avatar avatar-fallback" aria-hidden="true">
-          {initials}
+    <details className="account-menu">
+      <summary
+        className="identity-trigger"
+        aria-label={`Connected Steam account: ${displayName}`}
+      >
+        {user.avatar_url ? (
+          <img className="avatar" src={user.avatar_url} alt="" />
+        ) : (
+          <span className="avatar avatar-fallback" aria-hidden="true">
+            {initials}
+          </span>
+        )}
+        <span className="identity-name">{displayName}</span>
+        <span className="identity-chevron" aria-hidden="true">
+          ⌄
         </span>
-      )}
-      <div>
-        <p className="section-label">Connected Steam identity</p>
-        <h2 id="account-title">{displayName}</h2>
+      </summary>
+      <div className="account-popover">
+        <p className="section-label">Connected Steam account</p>
+        <p className="account-name">{displayName}</p>
         <p className="steam-id">Steam ID {user.steam_id}</p>
+        <button
+          className="text-action"
+          type="button"
+          onClick={onLogout}
+          disabled={isSigningOut || isBusy}
+        >
+          {isSigningOut ? "Signing out…" : "Sign out"}
+        </button>
       </div>
-    </div>
+    </details>
   );
 }
 
@@ -1857,9 +1947,9 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
         </p>
       </div>
       <p className="booster-coverage-copy">
-        Every Steam booster pack contains three trading cards. Prices are
-        read-only SteamApis order-book values, and this feed does not identify
-        the currency.
+        Gem cost is derived from the public normal-card set size. Every Steam
+        booster pack contains three cards. Market prices are read-only SteamApis
+        order-book values, and this feed does not identify the currency.
       </p>
       <div className="booster-grid">
         {boosters.map((booster) => {
@@ -1893,6 +1983,22 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
                 <div>
                   <dt>Highest buy</dt>
                   <dd>{highestBuy ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Gem cost</dt>
+                  <dd>
+                    {booster.gem_cost === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.gem_cost)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Cards in set</dt>
+                  <dd>
+                    {booster.card_set_size === null
+                      ? "Unavailable"
+                      : INVENTORY_COUNT_FORMATTER.format(booster.card_set_size)}
+                  </dd>
                 </div>
                 <div>
                   <dt>Cards per booster</dt>
@@ -2173,15 +2279,15 @@ function InventoryFaq({
   const gemCashContext = inventory.gem_cash_context;
 
   return (
-    <section className="faq" aria-labelledby="faq-title">
-      <div className="faq-heading">
+    <section className="inventory-faq" aria-labelledby="faq-title">
+      <div className="inventory-faq-heading">
         <p className="section-label">FAQ</p>
         <h2 id="faq-title">About these results</h2>
       </div>
-      <div className="faq-list">
-        <details className="faq-item">
+      <div className="inventory-faq-list">
+        <details className="inventory-faq-item">
           <summary>What do the Steam access statuses mean?</summary>
-          <div className="faq-answer">
+          <div className="inventory-faq-answer">
             <p>
               <strong>Public</strong> means Steam exposed that surface to the
               check. <strong>Private</strong> means Steam did not expose it.
@@ -2215,9 +2321,9 @@ function InventoryFaq({
             )}
           </div>
         </details>
-        <details className="faq-item">
+        <details className="inventory-faq-item">
           <summary>How do the market and gem numbers work?</summary>
-          <div className="faq-answer">
+          <div className="inventory-faq-answer">
             <p>
               The Market number is priced marketable item types over
               priceable item types. The Gems number is priced trading-card item
@@ -2239,6 +2345,10 @@ function InventoryFaq({
               </p>
             )}
             <p>{inventoryGemCoverageMessage(inventory)}</p>
+            <p>
+              <a href="/faq#gem-values">How gem values work</a> explains the
+              source data and replacement-cost calculation.
+            </p>
             {inventory.gem_message.trim().length > 0 && (
               <p>
                 <strong>Gem note:</strong> {inventory.gem_message}
@@ -2277,9 +2387,9 @@ function InventoryFaq({
             )}
           </div>
         </details>
-        <details className="faq-item">
+        <details className="inventory-faq-item">
           <summary>Why can the item count differ from table rows?</summary>
-          <div className="faq-answer">
+          <div className="inventory-faq-answer">
             <p>
               Items is the total number of Steam assets. The table combines
               matching assets into distinct item types, so one row can
@@ -2287,9 +2397,9 @@ function InventoryFaq({
             </p>
           </div>
         </details>
-        <details className="faq-item">
+        <details className="inventory-faq-item">
           <summary>Can Steam Optimizer change my Steam account?</summary>
-          <div className="faq-answer">
+          <div className="inventory-faq-answer">
             <p>
               No. Steam Optimizer only reads information Steam exposes
               publicly. It cannot trade, sell, craft, or change your account.
@@ -2307,64 +2417,22 @@ function SignedInView({
   session,
   isRechecking,
   isRefreshingGems,
-  isSigningOut,
   retryAfterSeconds,
   actionMessage,
   gemRefreshMessage,
-  onRecheck,
-  onRefreshGems,
-  onLogout
+  onRefreshGems
 }: {
   session: SignedInSession;
   isRechecking: boolean;
   isRefreshingGems: boolean;
-  isSigningOut: boolean;
   retryAfterSeconds: number;
   actionMessage: string | null;
   gemRefreshMessage: string | null;
-  onRecheck: () => void;
   onRefreshGems: () => void;
-  onLogout: () => void;
 }) {
-  const isRecheckDisabled =
-    isRechecking ||
-    isRefreshingGems ||
-    isSigningOut ||
-    retryAfterSeconds > 0;
 
   return (
-    <section className="account-view" aria-labelledby="account-title">
-      <div className="account-header">
-        <SteamIdentity user={session.user} />
-        <div className="account-header-side">
-          <AccessSummary
-            profile={session.checks.profile}
-            inventory={session.checks.inventory}
-          />
-          <div className="account-actions">
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={onRecheck}
-              disabled={isRecheckDisabled}
-              aria-describedby={
-                retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
-              }
-            >
-              {isRechecking ? "Checking…" : "Recheck Steam access"}
-            </button>
-            <button
-              className="text-action"
-              type="button"
-              onClick={onLogout}
-              disabled={isSigningOut || isRechecking || isRefreshingGems}
-            >
-              {isSigningOut ? "Signing out…" : "Sign out on this device"}
-            </button>
-          </div>
-        </div>
-      </div>
-
+    <section className="account-view">
       {(isRechecking || actionMessage) && (
         <p className={`action-status${actionMessage ? " action-status-error" : ""}`}>
           {isRechecking ? "Rechecking profile and inventory access…" : actionMessage}
@@ -2377,7 +2445,6 @@ function SignedInView({
           {retryAfterSeconds}s.
         </p>
       )}
-
       {session.checks.inventory.status === "public" && (
         <InventoryResults
           inventory={session.checks.inventory}
@@ -2394,7 +2461,7 @@ function SignedInView({
   );
 }
 
-export function App() {
+function HomePage() {
   const [viewState, setViewState] = useState<ViewState>({ kind: "loading" });
   const [isRechecking, setIsRechecking] = useState(false);
   const [isRefreshingGems, setIsRefreshingGems] = useState(false);
@@ -2609,55 +2676,67 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <title>Steam Optimizer</title>
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
 
-      <header className="site-header">
-        <Brand />
-        <div className="site-header-actions">
-          <p className="boundary-pill">
-            <span aria-hidden="true">●</span>
-            Read-only workspace
-          </p>
-          {viewState.kind === "signed-out" && (
-            <a
-              className="steam-sign-in-link"
-              href={STEAM_LOGIN_URL}
-              aria-describedby="connect-description"
+      <SiteHeader currentPage="home">
+        {viewState.kind === "signed-out" && (
+          <a className="steam-sign-in-link" href={STEAM_LOGIN_URL}>
+            <picture className="steam-sign-in-picture">
+              <img
+                className="steam-sign-in-image"
+                src={steamSignInWide}
+                width="180"
+                height="35"
+                alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+              />
+            </picture>
+          </a>
+        )}
+        {viewState.kind === "signed-in" && (
+          <div className="site-account">
+            <AccessSummary
+              profile={viewState.session.checks.profile}
+              inventory={viewState.session.checks.inventory}
+            />
+            <button
+              className="secondary-action"
+              type="button"
+              aria-label="Recheck Steam access"
+              onClick={() => void handleRecheck()}
+              disabled={
+                isRechecking ||
+                isRefreshingGems ||
+                isSigningOut ||
+                retryAfterSeconds > 0
+              }
+              aria-describedby={
+                retryAfterSeconds > 0 ? "recheck-cooldown" : undefined
+              }
             >
-              <picture className="steam-sign-in-picture">
-                <source
-                  media="(max-width: 40rem)"
-                  srcSet={steamSignInCompact}
-                  width="109"
-                  height="66"
-                />
-                <img
-                  className="steam-sign-in-image"
-                  src={steamSignInWide}
-                  width="180"
-                  height="35"
-                  alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
-                />
-              </picture>
-            </a>
-          )}
-        </div>
-      </header>
+              {isRechecking ? "Checking…" : "Recheck"}
+            </button>
+            <SteamIdentity
+              user={viewState.session.user}
+              isSigningOut={isSigningOut}
+              isBusy={isRechecking || isRefreshingGems}
+              onLogout={() => void handleLogout()}
+            />
+          </div>
+        )}
+      </SiteHeader>
 
       <main id="main-content" className="page-main">
         {viewState.kind !== "signed-in" && (
           <section className="hero" aria-labelledby="page-title">
-            <p className="eyebrow">Understand what Steam makes public</p>
-            <h1 id="page-title">A clearer view of your Steam inventory.</h1>
+            <h1 id="page-title">Compare your Steam inventory.</h1>
             <p className="hero-copy">
-              Connect your account to verify which Steam surfaces are public before
-              using read-only inventory and badge tools.
+              Check public access, market prices, and card gem values.
             </p>
           </section>
         )}
-
         <p
           className="visually-hidden"
           role="status"
@@ -2668,7 +2747,6 @@ export function App() {
         </p>
 
         {viewState.kind === "loading" && <LoadingView />}
-        {viewState.kind === "signed-out" && <SignedOutView />}
         {viewState.kind === "api-unavailable" && (
           <ApiUnavailableView onRetry={() => void handleRetry()} />
         )}
@@ -2677,27 +2755,126 @@ export function App() {
             session={viewState.session}
             isRechecking={isRechecking}
             isRefreshingGems={isRefreshingGems}
-            isSigningOut={isSigningOut}
             retryAfterSeconds={retryAfterSeconds}
             actionMessage={actionMessage}
             gemRefreshMessage={gemRefreshMessage}
-            onRecheck={() => void handleRecheck()}
             onRefreshGems={() => void handleGemRefresh()}
-            onLogout={() => void handleLogout()}
           />
         )}
 
-        {viewState.kind !== "signed-in" && <ReadOnlyBoundary />}
       </main>
 
-      <footer className="site-footer">
-        <p>Steam Optimizer</p>
-        <p>Public data in. Manual decisions out.</p>
-        <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
-          Privacy &amp; Steam data terms
-          <span className="visually-hidden"> (opens in a new tab)</span>
-        </a>
-      </footer>
+      <SiteFooter />
     </div>
   );
+}
+
+function FaqPage() {
+  return (
+    <div className="app-shell">
+      <title>FAQ | Steam Optimizer</title>
+      <a className="skip-link" href="#main-content">
+        Skip to main content
+      </a>
+      <SiteHeader currentPage="faq" />
+
+      <main id="main-content" className="page-main faq-main">
+        <header className="faq-hero">
+          <p className="eyebrow">FAQ</p>
+          <h1>Steam inventory questions, answered.</h1>
+          <p className="hero-copy">
+            The details on access, pricing, gems, and privacy.
+          </p>
+        </header>
+
+        <div className="faq-list">
+          <section id="account-access">
+            <h2>Can Steam Optimizer change my account?</h2>
+            <p>
+              No. Steam Optimizer reads public Steam Community data. It cannot
+              trade, sell, craft, buy, or change your account. Any action you
+              choose stays manual and happens on Steam.
+            </p>
+            <p>
+              Sign-in is handled by Steam Community. Your Steam password never
+              reaches this app.
+            </p>
+          </section>
+
+          <section id="visibility">
+            <h2>Why can profile and inventory access differ?</h2>
+            <p>
+              Steam exposes profile and inventory visibility separately. A
+              public profile can still have a private inventory.
+            </p>
+            <p>
+              Unavailable is not the same as private. It means Steam or the
+              session service could not complete that check, including during
+              rate limits.
+            </p>
+          </section>
+
+          <section id="market-prices">
+            <h2>Where do market prices come from?</h2>
+            <p>
+              Market snapshots come from SteamApis and are shown exactly as
+              received. The feed does not identify its currency, and values are
+              context—not sale offers.
+            </p>
+          </section>
+
+          <section id="gem-values">
+            <h2>How are gem values calculated?</h2>
+            <p>
+              Steam Community provides the gem yield for trading cards. The cash
+              estimate uses the SteamApis lowest-sell price for{" "}
+              {GEM_CASH_MARKET_HASH_NAME}, divided across{" "}
+              {INVENTORY_COUNT_FORMATTER.format(GEM_CASH_SACK_SIZE)} gems. It is
+              a per-card replacement-cost estimate.
+            </p>
+            <p>
+              “Worth more as gems” compares that estimate with the card's current
+              lowest-sell market price. Cards missing either value are excluded.
+            </p>
+          </section>
+
+          <section id="refreshes">
+            <h2>Why can pricing refreshes be delayed?</h2>
+            <p>
+              Steam Community and pricing providers can rate-limit requests.
+              Cached values remain visible while a refresh is delayed or only
+              partly complete.
+            </p>
+          </section>
+
+          <section id="privacy-settings">
+            <h2>How do I make my inventory public?</h2>
+            <p>
+              Open{" "}
+              <a href={STEAM_PRIVACY_URL} target="_blank" rel="noreferrer">
+                Steam privacy settings
+                <span className="visually-hidden"> (opens in a new tab)</span>
+              </a>
+              , change Inventory to Public, then return and recheck access.
+            </p>
+          </section>
+
+          <section id="affiliation">
+            <h2>Is this affiliated with Valve?</h2>
+            <p>
+              No. Steam Optimizer is an independent open-source project and is
+              not affiliated with Valve.
+            </p>
+          </section>
+        </div>
+      </main>
+
+      <SiteFooter />
+    </div>
+  );
+}
+
+export function App() {
+  const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
+  return pathname === "/faq" ? <FaqPage /> : <HomePage />;
 }
