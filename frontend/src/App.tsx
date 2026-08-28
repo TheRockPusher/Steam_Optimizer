@@ -1163,7 +1163,7 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
           {item.icon_url !== null && (
             <img
               className="inventory-item-icon"
-              src={item.icon_url}
+              src={`${item.icon_url}/64fx64f`}
               alt=""
               loading="lazy"
               decoding="async"

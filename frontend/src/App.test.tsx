@@ -340,6 +340,10 @@ describe("App", () => {
       .getByText("Prismatic Trading Card")
       .closest("tr");
     expect(pricedRow).not.toBeNull();
+    expect(pricedRow?.querySelector("img")).toHaveAttribute(
+      "src",
+      "https://cdn.example.test/items/prismatic.png/64fx64f"
+    );
     expect(within(pricedRow as HTMLElement).getByText("3")).toBeInTheDocument();
     expect(
       within(pricedRow as HTMLElement).getByText("Marketable")
