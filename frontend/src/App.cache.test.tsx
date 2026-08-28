@@ -172,8 +172,10 @@ describe("App inventory cache orchestration", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("article", { name: "Steam inventory" })
-    ).toHaveTextContent("Private");
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Private"
+      })
+    ).toBeInTheDocument();
     expect(screen.getByText(/Inventory last refreshed/i)).toHaveTextContent(
       "Aug 28, 2026"
     );
@@ -198,8 +200,10 @@ describe("App inventory cache orchestration", () => {
       render(<App />);
 
       expect(
-        await screen.findByRole("article", { name: "Steam inventory" })
-      ).toHaveTextContent("Private");
+        await screen.findByRole("definition", {
+          name: "Steam inventory: Private"
+        })
+      ).toBeInTheDocument();
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(fetchMock).toHaveBeenNthCalledWith(
         2,
@@ -253,13 +257,14 @@ describe("App inventory cache orchestration", () => {
 
     render(<App />);
 
-    await screen.findByRole("article", { name: "Steam inventory" });
-    fireEvent.click(screen.getByRole("button", { name: "Sign out on this device" }));
+    await screen.findByRole("definition", {
+      name: "Steam inventory: Private"
+    });
+    fireEvent.click(screen.getByLabelText("Connected Steam account: Alyx"));
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
+      await screen.findByRole("link", { name: /steam sign-in/i })
     ).toBeInTheDocument();
     expect(cacheMocks.clearInventoryCache).toHaveBeenCalledTimes(1);
   });
@@ -274,15 +279,15 @@ describe("App inventory cache orchestration", () => {
 
     render(<App />);
 
-    await screen.findByRole("article", { name: "Steam inventory" });
+    await screen.findByRole("definition", {
+      name: "Steam inventory: Private"
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam profile" })
     );
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
+      await screen.findByRole("link", { name: /steam sign-in/i })
     ).toBeInTheDocument();
     expect(cacheMocks.clearInventoryCache).not.toHaveBeenCalled();
   });
@@ -303,9 +308,7 @@ describe("App inventory cache orchestration", () => {
     );
 
     expect(
-      await screen.findByRole("heading", {
-        name: "Connect Steam to check public access."
-      })
+      await screen.findByRole("link", { name: /steam sign-in/i })
     ).toBeInTheDocument();
     expect(cacheMocks.clearInventoryCache).not.toHaveBeenCalled();
   });
@@ -341,7 +344,9 @@ describe("App inventory cache orchestration", () => {
         /Account changed\. Steam profile: Public\. Inventory check complete: Private\./
       )
     ).toBeInTheDocument();
-    expect(screen.getByText("Barney")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Connected Steam account: Barney")
+    ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
       "/api/auth/inventory",
@@ -384,6 +389,8 @@ describe("App inventory cache orchestration", () => {
         jsonResponse({
           values: [{ game_app_id: "440", card_rarity: "normal", gem_yield: 100 }],
           pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
           gem_rate_limited: false,
           gem_retry_after_seconds: null
         })

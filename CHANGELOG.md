@@ -1,6 +1,25 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.6.0
+
+
+### Documentation
+- Update changelog for v0.5.0
+
+
+### Features
+- Streamline inventory workspace design
+- Derive booster gem costs
+
+
+### Maintenance
+- Prepare release v0.6.0
+
+
+### Testing
+- Satisfy booster HTTP client protocol
+
 ## v0.5.0
 
 
