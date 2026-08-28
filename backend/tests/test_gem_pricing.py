@@ -250,7 +250,7 @@ def test_parse_item_metadata_maps_all_canonical_item_classes(
     class_number: int,
     expected: ItemType,
 ) -> None:
-    metadata = parse_item_metadata(item_tags(class_number), [])
+    metadata = parse_item_metadata(item_tags(class_number), [], None)
 
     assert metadata.item_type == expected
 
@@ -275,13 +275,13 @@ def test_parse_item_metadata_maps_all_canonical_item_classes(
 def test_parse_item_metadata_unknown_missing_and_conflicting_classes_are_other(
     tags: object,
 ) -> None:
-    metadata = parse_item_metadata(tags, [])
+    metadata = parse_item_metadata(tags, [], None)
 
     assert metadata.item_type == "other"
 
 
 def test_parse_item_metadata_preserves_independent_metadata() -> None:
-    metadata = parse_item_metadata(item_tags(3), [])
+    metadata = parse_item_metadata(item_tags(3), [], None)
 
     assert metadata == ItemMetadata(
         item_type="profile_background",
@@ -299,7 +299,7 @@ def test_whitespace_only_localized_metadata_is_discarded_independently() -> None
         if tag.get("category") in ("Game", "droprate"):
             tag["localized_tag_name"] = "   "
 
-    metadata = parse_item_metadata(tags, [])
+    metadata = parse_item_metadata(tags, [], None)
 
     assert metadata.item_type == "profile_background"
     assert metadata.game_app_id == "10"
@@ -324,7 +324,7 @@ def test_malformed_optional_metadata_fields_are_independent() -> None:
         {"category": "cardborder", "internal_name": "cardborder_unknown"},
     ]
 
-    metadata = parse_item_metadata(tags, [])
+    metadata = parse_item_metadata(tags, [], None)
 
     assert metadata.item_type == "emoticon"
     assert metadata.game_app_id is None
@@ -345,15 +345,90 @@ def test_keyed_backgrounds_and_emoticons_have_gem_key_without_class_inference(
             {"link": goo_action(app_id="10", item_type=42, border_color=1)},
             {"link": "javascript:showDetails()"},
         ],
+        None,
     )
 
     assert metadata.item_type in ("profile_background", "emoticon")
     assert metadata.gem_key == key
 
 
+@pytest.mark.parametrize(
+    ("class_number", "market_bucket_id", "expected"),
+    [
+        (2, "B620-5", GemKey("620", 5, 0)),
+        (2, "B278100-5-1", GemKey("278100", 5, 1)),
+        (3, "B730-18", GemKey("730", 18, 0)),
+        (4, "B730-14", GemKey("730", 14, 0)),
+    ],
+)
+def test_provider_market_bucket_ids_supply_exact_gem_keys(
+    class_number: int,
+    market_bucket_id: str,
+    expected: GemKey,
+) -> None:
+    metadata = parse_item_metadata(
+        item_tags(class_number),
+        [
+            {
+                "name": "View Full Size",
+                "link": "https://shared.steamstatic.com/background.jpg",
+            }
+        ],
+        market_bucket_id,
+    )
+
+    assert metadata.gem_key == expected
+
+
+@pytest.mark.parametrize(
+    "market_bucket_id",
+    [
+        None,
+        "",
+        "B730",
+        "B730-14-2",
+        "B730-14-extra",
+        "B730--14",
+        "B730-10000000000",
+        "B100000000000000000000-14",
+        {"id": "B730-14"},
+    ],
+)
+def test_provider_market_bucket_ids_reject_malformed_or_unbounded_values(
+    market_bucket_id: object,
+) -> None:
+    metadata = parse_item_metadata(item_tags(3), [], market_bucket_id)
+
+    assert metadata.gem_key is None
+
+
+def test_provider_market_bucket_id_is_limited_to_gem_convertible_item_classes() -> None:
+    metadata = parse_item_metadata(item_tags(5), [], "B730-14")
+
+    assert metadata.item_type == "booster_pack"
+    assert metadata.gem_key is None
+
+
+def test_owner_actions_and_market_bucket_id_must_not_conflict() -> None:
+    action = {"link": goo_action(app_id="10", item_type=5, border_color=0)}
+
+    assert parse_item_metadata(item_tags(3), [action], "B10-5").gem_key == GemKey(
+        "10", 5, 0
+    )
+    assert parse_item_metadata(item_tags(3), [action], "B10-6").gem_key is None
+    assert (
+        parse_item_metadata(
+            item_tags(3),
+            [{"link": "javascript:GetGooValue(1)"}],
+            "B10-5",
+        ).gem_key
+        is None
+    )
+
+
 @pytest.mark.parametrize("class_number", [5, 6, 7, 16, 17])
 def test_named_item_types_without_owner_action_are_keyless(class_number: int) -> None:
-    metadata = parse_item_metadata(item_tags(class_number), [])
+    metadata = parse_item_metadata(item_tags(class_number), [], None)
 
     assert metadata.item_type != "other"
     assert metadata.gem_key is None
@@ -412,12 +487,12 @@ def test_owner_actions_ignore_unrelated_and_reject_distinct_keys() -> None:
             {"link": "javascript:OpenURL('https://example.test/GetGooValue')"},
             first,
         ],
+        None,
     ).gem_key == GemKey("10", 5, 0)
-    assert parse_item_metadata(tags, [first, second]).gem_key is None
+    assert parse_item_metadata(tags, [first, second], None).gem_key is None
     assert (
         parse_item_metadata(
-            tags,
-            [first, {"link": "javascript:GetGooValue(1)"}],
+            tags, [first, {"link": "javascript:GetGooValue(1)"}], None
         ).gem_key
         is None
     )

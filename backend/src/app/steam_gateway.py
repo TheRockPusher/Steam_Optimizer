@@ -377,7 +377,7 @@ class _InventoryPage:
 
 
 def _owner_actions_for_description(description: Mapping[str, object]) -> object:
-    """Normalize Steam inventory action aliases without weakening validation."""
+    """Collect action sources while preserving malformed input for rejection."""
 
     has_owner_actions = "owner_actions" in description
     has_provider_actions = "actions" in description
@@ -387,8 +387,8 @@ def _owner_actions_for_description(description: Mapping[str, object]) -> object:
         if not isinstance(owner_actions, list) or not isinstance(
             provider_actions, list
         ):
-            # Preserve fail-closed parsing when either present alias is malformed.
-            return None
+            # A non-list sentinel prevents fallback to another gem identity source.
+            return False
         return owner_actions + provider_actions
     if has_owner_actions:
         return description["owner_actions"]
@@ -469,6 +469,7 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
         metadata = parse_item_metadata(
             raw_description.get("tags"),
             _owner_actions_for_description(raw_description),
+            raw_description.get("market_bucket_id"),
         )
         descriptions.append(
             _Description(
