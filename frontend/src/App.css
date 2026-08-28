@@ -1025,7 +1025,7 @@ h3 {
 }
 
 .inventory-column-marketability {
-  width: 12%;
+  width: 16%;
 }
 
 .inventory-column-price {
@@ -1033,15 +1033,15 @@ h3 {
 }
 
 .inventory-column-timestamp {
-  width: 12%;
-}
-
-.inventory-column-gem {
   width: 10%;
 }
 
+.inventory-column-gem {
+  width: 9%;
+}
+
 .inventory-column-gem-cash {
-  width: 14%;
+  width: 13%;
 }
 
 .inventory-table th {
@@ -1159,13 +1159,23 @@ h3 {
   font-size: var(--text-xs);
   line-height: 1.4;
 }
-.card-rarity-label {
+.item-type-label,
+.item-rarity-label,
+.item-border-label {
   display: block;
   margin-top: var(--space-1);
-  color: var(--color-accent-strong);
   font-size: var(--text-xs);
   font-weight: 750;
   line-height: 1.4;
+}
+
+.item-type-label {
+  color: var(--color-accent-strong);
+}
+
+.item-rarity-label,
+.item-border-label {
+  color: var(--color-ink-soft);
 }
 
 
@@ -1208,8 +1218,13 @@ h3 {
 }
 
 .marketability-label {
+  max-width: 100%;
+  justify-content: center;
   padding: var(--space-1) var(--space-2);
+  font-size: 0.6875rem;
+  letter-spacing: 0.02em;
   white-space: nowrap;
+  text-align: center;
 }
 
 .marketability-label-public {

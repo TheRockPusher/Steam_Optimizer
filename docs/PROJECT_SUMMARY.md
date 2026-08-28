@@ -17,11 +17,14 @@ transient unavailable results are not persisted.
 
 For a public inventory, the inventory endpoint retrieves the complete AppID 753/context 6 inventory
 through provider pagination, joins the global normalized AppID 753 market-price generation to
-marketable items, and reports explicit price coverage (`complete`, `partial`, or `unavailable`).
-For each identified trading-card game, it also looks up the canonical booster market item and
-reports its provider-denominated order-book values plus Steam's fixed three-card booster-pack size.
-The React interface exposes all retrieved items, booster details, the separate price coverage result,
-and the inventory cache refresh timestamp.
+marketable items, and reports explicit price coverage (`complete`, `partial`, or `unavailable`). It
+names every defined Steam Community item class, preserves independent game, rarity, and card-border
+metadata, and values any item carrying Steam's validated gem-conversion action. Gem cache and refresh
+identity uses the exact application ID, numeric item type, and border color from that action. For each
+identified trading-card game, it also looks up the canonical booster market item and reports its
+provider-denominated order-book values plus Steam's fixed three-card booster-pack size. The React
+interface exposes all retrieved items, booster details, separate price and gem coverage, and the
+inventory cache refresh timestamp.
 
 ## Safety and identity boundary
 
@@ -85,6 +88,7 @@ preserve those rows; incompatible or corrupt cache data is reset according to it
 The global caches are not keyed to a SteamID and are not part of logout deletion. The public
 [privacy policy and Steam Data disclaimer](../README.md#privacy-and-steam-data-policy) disclose
 storage, deletion, warranty, and liability terms.
+
 
 ## Technical direction
 

@@ -24,7 +24,7 @@ const privateInventory = {
   price_status: "unavailable",
   price_message: "Prices are unavailable while the inventory is private.",
   gem_status: "unavailable",
-  gem_message: "Gem values are unavailable while the inventory is private.",
+  gem_message: "Gem-convertible values are unavailable while the inventory is private.",
   gem_priceable_item_count: 0,
   gem_priced_item_count: 0,
   gem_rate_limited: false,
@@ -64,7 +64,9 @@ function inventoryItem(index: number) {
     item_type: "other",
     game_app_id: null,
     game_name: null,
-    card_rarity: null,
+    rarity: null,
+    card_border: null,
+    gem_key: null,
     gem_yield: null,
     gem_cash_value: null
   };
@@ -74,6 +76,21 @@ function tradingCardItem(
   index: number,
   overrides: Record<string, unknown> = {}
 ) {
+  const cardBorder =
+    "card_border" in overrides ? overrides.card_border : "normal";
+  const gameAppId =
+    "game_app_id" in overrides ? overrides.game_app_id : "440";
+  const gemKey =
+    "gem_key" in overrides
+      ? overrides.gem_key
+      : typeof gameAppId === "string"
+        ? {
+          app_id: gameAppId,
+          item_type: 2,
+          border_color: cardBorder === "foil" ? 1 : 0
+        }
+        : null;
+
   return {
     ...inventoryItem(index),
     name: `Card ${String(index).padStart(4, "0")}`,
@@ -81,11 +98,14 @@ function tradingCardItem(
     item_type: "trading_card",
     game_app_id: "440",
     game_name: "Team Fortress 2",
-    card_rarity: "normal",
+    rarity: null,
+    card_border: cardBorder,
+    gem_key: gemKey,
     gem_yield: 10,
     gem_cash_value: null,
     ...overrides
   };
+
 }
 const validInventoryPrice = {
   currency: null,
@@ -119,7 +139,7 @@ function publicInventory(
     price_status: "complete",
     price_message: "No marketable item types require pricing.",
     gem_status: "complete",
-    gem_message: "No trading cards require gem prices.",
+    gem_message: "No gem-convertible items require gem prices.",
     gem_priceable_item_count: 0,
     gem_priced_item_count: 0,
     gem_rate_limited: false,
@@ -415,7 +435,7 @@ describe("App", () => {
     ).toHaveLength(5);
   });
 
-  it("filters cards by exact per-card gem cash value above lowest sell", async () => {
+  it("filters gem-convertible items by exact per-item gem cash value above lowest sell", async () => {
     const eligibleCard = tradingCardItem(1, {
       name: "Gem-positive card",
       market_hash_name: "Gem-positive card",
@@ -529,7 +549,7 @@ describe("App", () => {
         price_status: "complete",
         price_message: "Current prices were found for every marketable type.",
         gem_status: "partial",
-        gem_message: "One trading card does not have a current gem value.",
+        gem_message: "One gem-convertible item does not have a current gem value.",
         gem_priceable_item_count: 7,
         gem_priced_item_count: 6,
         gem_cash_context: validGemCashContext
@@ -550,7 +570,7 @@ describe("App", () => {
     expect(worthMoreTab).toHaveAttribute("aria-selected", "true");
     expect(
       screen.getByText(
-        /Worth more as gems compares each trading card.*current lowest-sell market price/i
+        /Worth more as gems compares each gem-convertible item.*current lowest-sell market price/i
       )
     ).toBeInTheDocument();
     expect(
@@ -615,7 +635,7 @@ describe("App", () => {
       price_status: "complete",
       price_message: "Current prices were found for every marketable type.",
       gem_status: "complete",
-      gem_message: "Gem values were found for every trading card.",
+      gem_message: "Gem values were found for every gem-convertible item.",
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
@@ -718,7 +738,7 @@ describe("App", () => {
       price_status: "complete",
       price_message: "Current prices were found for every marketable type.",
       gem_status: "complete",
-      gem_message: "Gem values were found for every trading card.",
+      gem_message: "Gem values were found for every gem-convertible item.",
       gem_priceable_item_count: cards.length,
       gem_priced_item_count: cards.length,
       gem_cash_context: validGemCashContext
@@ -735,8 +755,9 @@ describe("App", () => {
         jsonResponse({
           values: [
             {
-              game_app_id: "440",
-              card_rarity: "normal",
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
               gem_yield: 20
             }
           ],
@@ -757,7 +778,7 @@ describe("App", () => {
       name: "Worth more as gems result count"
     });
     expect(resultStatus).toHaveTextContent(
-      "101 item types are currently worth more as gems."
+      "101 gem-convertible item types are currently worth more as gems."
     );
     fireEvent.change(
       screen.getByRole("combobox", { name: "Inventory page" }),
@@ -780,8 +801,9 @@ describe("App", () => {
         jsonResponse({
           values: [
             {
-              game_app_id: "440",
-              card_rarity: "normal",
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
               gem_yield: 0
             }
           ],
@@ -800,7 +822,7 @@ describe("App", () => {
       })
     ).toBeInTheDocument();
     expect(resultStatus).toHaveTextContent(
-      "No item types are currently worth more as gems."
+      "No gem-convertible item types are currently worth more as gems."
     );
     expect(document.getElementById("inventory-panel-worth-gems")).toHaveFocus();
 
@@ -810,7 +832,7 @@ describe("App", () => {
 
     await screen.findByRole("table", { name: "Inventory items" });
     expect(resultStatus).toHaveTextContent(
-      "101 item types are currently worth more as gems."
+      "101 gem-convertible item types are currently worth more as gems."
     );
     expect(
       screen.getByRole("status", { name: "Inventory pagination status" })
@@ -843,7 +865,7 @@ describe("App", () => {
       price_status: "complete",
       price_message: "Current prices were found for every marketable type.",
       gem_status: "complete",
-      gem_message: "Gem values were found for every trading card.",
+      gem_message: "Gem values were found for every gem-convertible item.",
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
       gem_cash_context: validGemCashContext
@@ -865,12 +887,12 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /No marketable trading card with both a gem cash value and a current lowest-sell market price currently qualifies/i
+        /No marketable gem-convertible item with both a gem cash value and a current lowest-sell market price currently qualifies/i
       )
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        /Worth more as gems compares each trading card.*current lowest-sell market price/i
+        /Worth more as gems compares each gem-convertible item.*current lowest-sell market price/i
       )
     ).toBeInTheDocument();
     expect(
@@ -900,7 +922,7 @@ describe("App", () => {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
       gem_status: "complete",
-      gem_message: "Gem values are current for all trading cards.",
+      gem_message: "Gem values are current for all gem-convertible items.",
       boosters: [
         {
           game_app_id: "440",
@@ -986,7 +1008,7 @@ describe("App", () => {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
       gem_status: "complete",
-      gem_message: "Gem values are current for all trading cards.",
+      gem_message: "Gem values are current for all gem-convertible items.",
       boosters: [
         {
           game_app_id: "440",
@@ -1137,7 +1159,7 @@ describe("App", () => {
     });
     const renderedNames = () =>
       Array.from(inventoryTable.querySelectorAll("tr.inventory-item")).map(
-        (row) => within(row as HTMLElement).getByRole("rowheader").textContent
+        (row) => row.querySelector("strong")?.textContent ?? null
       );
     const assertSort = (
       label: string,
@@ -2004,8 +2026,7 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
-
-  it("groups trading cards by game, keeps fallback and Other groups, and sorts within groups", async () => {
+  it("groups items by game metadata, keeps fallback and Other groups, and sorts within groups", async () => {
     const alphaCard = tradingCardItem(1, {
       name: "Alpha card",
       game_app_id: "10",
@@ -2024,7 +2045,7 @@ describe("App", () => {
       name: "Zeta low card",
       game_app_id: "20",
       game_name: "Zeta game",
-      card_rarity: "foil",
+      card_border: "foil",
       gem_yield: 5,
       gem_cash_value: "0.0025"
     });
@@ -2032,7 +2053,7 @@ describe("App", () => {
       name: "Unknown card",
       game_app_id: null,
       game_name: null,
-      card_rarity: null,
+      card_border: null,
       gem_yield: null,
       gem_cash_value: null
     });
@@ -2040,9 +2061,9 @@ describe("App", () => {
     const inventory = publicInventory(
       [zetaCard, otherItem, fallbackCard, alphaCard, zetaLowCard],
       {
-        gem_status: "partial",
-        gem_message: "One unknown trading-card group has no metadata.",
-        gem_priceable_item_count: 4,
+        gem_status: "complete",
+        gem_message: "Gem values are current for all gem-convertible items.",
+        gem_priceable_item_count: 3,
         gem_priced_item_count: 3,
         gem_cash_context: {
           currency: null,
@@ -2070,13 +2091,13 @@ describe("App", () => {
     expect(groupLabels()).toEqual([
       "Alpha game",
       "Zeta game",
-      "Trading cards (game unavailable)",
+      "Items (game unavailable)",
       "Other inventory items"
     ]);
     const faq = screen.getByRole("region", { name: "About these results" });
     expect(
       within(faq).getByText(
-        "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-card replacement-cost estimate."
+        "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-item replacement-cost estimate."
       )
     ).toBeInTheDocument();
     expect(
@@ -2084,8 +2105,8 @@ describe("App", () => {
     ).toHaveAttribute("href", "/faq#gem-values");
     expect(
       within(screen.getByText("Unknown card").closest("tr") as HTMLElement)
-        .getAllByText("Unavailable")
-    ).toHaveLength(2);
+        .getAllByText("Not applicable")
+    ).toHaveLength(5);
     expect(
       within(screen.getByText("Item 0005").closest("tr") as HTMLElement)
         .getAllByText("Not applicable")
@@ -2097,7 +2118,7 @@ describe("App", () => {
     expect(groupLabels()).toEqual([
       "Alpha game",
       "Zeta game",
-      "Trading cards (game unavailable)",
+      "Items (game unavailable)",
       "Other inventory items"
     ]);
     const zetaRowNames = () =>
@@ -2137,24 +2158,24 @@ describe("App", () => {
     expect(groupLabels()).toEqual([
       "Alpha game",
       "Zeta game",
-      "Trading cards (game unavailable)",
+      "Items (game unavailable)",
       "Other inventory items"
     ]);
   });
 
-  it("reports partial gem coverage, rate limiting, and per-card cash provenance", async () => {
+  it("reports partial gem coverage, rate limiting, and per-item cash provenance", async () => {
     const pricedCard = tradingCardItem(1, {
       gem_yield: 0,
       gem_cash_value: null
     });
     const pendingCard = tradingCardItem(2, {
-      card_rarity: "foil",
+      card_border: "foil",
       gem_yield: null,
       gem_cash_value: null
     });
     const inventory = publicInventory([pricedCard, pendingCard], {
       gem_status: "partial",
-      gem_message: "One trading-card group is still pending.",
+      gem_message: "One gem-convertible group is still pending.",
       gem_priceable_item_count: 2,
       gem_priced_item_count: 1,
       gem_rate_limited: true,
@@ -2174,11 +2195,11 @@ describe("App", () => {
     expect(within(pricingSummary).getByText("1/2")).toBeInTheDocument();
     expect(
       within(faq).getByText(
-        "Gem values are available for 1 of 2 trading-card item types."
+        "Gem values are available for 1 of 2 gem-convertible item types."
       )
     ).toBeInTheDocument();
     expect(
-      within(faq).getByText("One trading-card group is still pending.")
+      within(faq).getByText("One gem-convertible group is still pending.")
     ).toBeInTheDocument();
     expect(
       within(faq).getByText(/rate-limiting gem lookups/i)
@@ -2201,13 +2222,13 @@ describe("App", () => {
       gem_cash_value: null
     });
     const foilCard = tradingCardItem(2, {
-      card_rarity: "foil",
+      card_border: "foil",
       gem_yield: null,
       gem_cash_value: null
     });
     const inventory = publicInventory([normalCard, foilCard], {
       gem_status: "partial",
-      gem_message: "Background gem pricing is still processing card groups.",
+      gem_message: "Background gem pricing is still processing gem-convertible item groups.",
       gem_priceable_item_count: 2,
       gem_priced_item_count: 1,
       boosters: [
@@ -2230,13 +2251,15 @@ describe("App", () => {
         jsonResponse({
           values: [
             {
-              game_app_id: "440",
-              card_rarity: "foil",
+              app_id: "440",
+              item_type: 2,
+              border_color: 1,
               gem_yield: 100
             },
             {
-              game_app_id: "440",
-              card_rarity: "normal",
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
               gem_yield: 10
             }
           ],
@@ -2267,7 +2290,7 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Gem values are available for 2 of 2 trading-card item types."
+        "Gem values are available for 2 of 2 gem-convertible item types."
       )
     ).toBeInTheDocument();
     expect(
@@ -2296,9 +2319,10 @@ describe("App", () => {
     const request = fetchMock.mock.calls[2][1] as RequestInit;
     expect(JSON.parse(request.body as string)).toEqual({
       groups: [
-        { game_app_id: "440", card_rarity: "foil" },
-        { game_app_id: "440", card_rarity: "normal" }
-      ]
+        { app_id: "440", item_type: 2, border_color: 0 },
+        { app_id: "440", item_type: 2, border_color: 1 }
+      ],
+      booster_game_app_ids: ["440"]
     });
   });
 
@@ -2388,8 +2412,9 @@ describe("App", () => {
         jsonResponse({
           values: [
             {
-              game_app_id: "440",
-              card_rarity: "normal",
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
               gem_yield: 10
             }
           ],
@@ -2413,11 +2438,11 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("rejects card metadata that violates the item-type invariants", async () => {
+  it("rejects gem values without a semantic gem key", async () => {
     const malformedItem = {
       ...inventoryItem(1),
-      item_type: "other",
-      game_app_id: "440"
+      item_type: "badge",
+      gem_yield: 1,
     };
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
@@ -2436,11 +2461,13 @@ describe("App", () => {
       screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
   });
-  it("rejects partially populated trading-card metadata", async () => {
+  it("rejects an invalid semantic gem key", async () => {
     const malformedCard = tradingCardItem(1, {
-      card_rarity: null,
-      gem_yield: null,
-      gem_cash_value: null
+      gem_key: {
+        app_id: "440",
+        item_type: 1.5,
+        border_color: 0
+      },
     });
     const inventory = publicInventory([malformedCard], {
       gem_status: "unavailable",
@@ -2459,6 +2486,301 @@ describe("App", () => {
         name: "Steam inventory: Unavailable"
       })
     ).toBeInTheDocument();
+  });
+
+
+  it("renders the exact label for every supported item type", async () => {
+    const itemTypes = [
+      ["badge", "Badge"],
+      ["trading_card", "Trading card"],
+      ["profile_background", "Profile background"],
+      ["emoticon", "Emoticon"],
+      ["booster_pack", "Booster pack"],
+      ["consumable", "Consumable"],
+      ["game_goo", "Game goo"],
+      ["profile_modifier", "Profile modifier"],
+      ["scene", "Scene"],
+      ["sale_item", "Sale item"],
+      ["sticker", "Sticker"],
+      ["chat_effect", "Chat effect"],
+      ["mini_profile_background", "Mini profile background"],
+      ["avatar_frame", "Avatar frame"],
+      ["animated_avatar", "Animated avatar"],
+      ["steam_deck_keyboard_skin", "Steam Deck keyboard skin"],
+      ["steam_deck_startup_movie", "Steam Deck startup movie"],
+      ["other", "Other"]
+    ] as const;
+    const items = itemTypes.map(([itemType], index) => ({
+      ...inventoryItem(index + 1),
+      item_type: itemType
+    }));
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          publicInventory(items, {
+            total_asset_count: items.length,
+            unique_item_count: items.length
+          })
+        )
+      );
+
+    render(<App />);
+
+    const table = await screen.findByRole("table", { name: "Inventory items" });
+    for (const [, label] of itemTypes) {
+      expect(within(table).getByText(label, { exact: true })).toBeInTheDocument();
+    }
+  });
+
+  it("shows independent game, rarity, and card-border metadata for named types", async () => {
+    const background = {
+      ...inventoryItem(1),
+      name: "Aurora background",
+      item_type: "profile_background",
+      game_app_id: "753",
+      game_name: null,
+      rarity: "Rare",
+      card_border: "foil"
+    };
+    const badge = {
+      ...inventoryItem(2),
+      name: "Community badge",
+      item_type: "badge",
+      game_app_id: null,
+      game_name: "Community assets"
+    };
+    const inventory = publicInventory([background, badge], {
+      total_asset_count: 2,
+      unique_item_count: 2
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    const table = await screen.findByRole("table", { name: "Inventory items" });
+    expect(within(table).getByText("Community assets")).toBeInTheDocument();
+    const row = within(table)
+      .getByText("Aurora background")
+      .closest("tr") as HTMLElement;
+    expect(within(row).getByText("Profile background")).toBeInTheDocument();
+    expect(within(row).getByText("Rarity: Rare")).toBeInTheDocument();
+    expect(within(row).getByText("Foil card border")).toBeInTheDocument();
+    const badgeRow = within(table)
+      .getByText("Community badge")
+      .closest("tr") as HTMLElement;
+    expect(within(badgeRow).getByText("Badge")).toBeInTheDocument();
+    expect(
+      badgeRow.querySelector(".inventory-gem-value")
+    ).toHaveTextContent("Not applicable");
+    expect(
+      badgeRow.querySelector(".inventory-gem-cash-value")
+    ).toHaveTextContent("Not applicable");
+  });
+
+  it("uses collision-free heading IDs for name-only game groups", async () => {
+    const items = ["A/B", "A:B"].map((gameName, index) => ({
+      ...inventoryItem(index + 1),
+      name: `Named item ${index + 1}`,
+      item_type: "badge",
+      game_name: gameName
+    }));
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
+
+    render(<App />);
+
+    const table = await screen.findByRole("table", { name: "Inventory items" });
+    const headingIds = Array.from(
+      table.querySelectorAll(".inventory-group-header th")
+    ).map((heading) => heading.id);
+    expect(headingIds).toHaveLength(2);
+    expect(new Set(headingIds).size).toBe(2);
+  });
+
+
+  it("includes keyed backgrounds and emoticons in gem comparisons", async () => {
+    const background = {
+      ...inventoryItem(1),
+      name: "Keyed background",
+      market_hash_name: "500-Keyed background",
+      item_type: "profile_background",
+      game_app_id: "500",
+      game_name: "Keyed game",
+      gem_key: { app_id: "500", item_type: 4, border_color: 0 },
+      gem_yield: 7,
+      gem_cash_value: "0.70007",
+      marketable: true,
+      price: { ...validInventoryPrice, lowest_sell: "0.5000" }
+    };
+    const emoticon = {
+      ...inventoryItem(2),
+      name: "Keyed emoticon",
+      market_hash_name: "500-Keyed emoticon",
+      item_type: "emoticon",
+      game_app_id: "500",
+      game_name: "Keyed game",
+      gem_key: { app_id: "500", item_type: 5, border_color: 1 },
+      gem_yield: null,
+      gem_cash_value: null,
+      marketable: true,
+      price: { ...validInventoryPrice, lowest_sell: "0.8000" }
+    };
+    const inventory = publicInventory([background, emoticon], {
+      total_asset_count: 2,
+      unique_item_count: 2,
+      priceable_item_count: 2,
+      priced_item_count: 2,
+      gem_status: "partial",
+      gem_message: "One gem-convertible item is still pending.",
+      gem_priceable_item_count: 2,
+      gem_priced_item_count: 1,
+      gem_cash_context: validGemCashContext
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
+    });
+    expect(faq).toHaveTextContent(
+      "Gem values are available for 1 of 2 gem-convertible item types."
+    );
+    fireEvent.click(
+      screen.getByRole("tab", { name: /^Worth more as gems/ })
+    );
+    const filtered = screen.getByRole("table", { name: "Inventory items" });
+    expect(within(filtered).getByText("Keyed background")).toBeInTheDocument();
+    expect(
+      within(filtered).queryByText("Keyed emoticon")
+    ).not.toBeInTheDocument();
+  });
+
+  it("refreshes and merges yields by the complete semantic gem key", async () => {
+    const background = {
+      ...inventoryItem(1),
+      name: "Refresh background",
+      item_type: "profile_background",
+      gem_key: { app_id: "500", item_type: 4, border_color: 0 },
+      gem_yield: null,
+      gem_cash_value: null
+    };
+    const emoticon = {
+      ...inventoryItem(2),
+      name: "Refresh emoticon",
+      item_type: "emoticon",
+      gem_key: { app_id: "500", item_type: 5, border_color: 0 },
+      gem_yield: null,
+      gem_cash_value: null
+    };
+    const inventory = publicInventory([background, emoticon], {
+      total_asset_count: 2,
+      unique_item_count: 2,
+      gem_status: "unavailable",
+      gem_message: "Gem prices are unavailable for these items.",
+      gem_priceable_item_count: 2,
+      gem_priced_item_count: 0
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            { app_id: "500", item_type: 4, border_color: 0, gem_yield: 12 }
+          ],
+          pending_group_count: 1,
+          boosters: [],
+          pending_booster_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh gem values" })
+    );
+    await screen.findByText("Gem values refreshed from the background cache.");
+    const backgroundRow = screen
+      .getByText("Refresh background")
+      .closest("tr") as HTMLElement;
+    const emoticonRow = screen
+      .getByText("Refresh emoticon")
+      .closest("tr") as HTMLElement;
+    expect(backgroundRow.querySelector(".inventory-gem-value")).toHaveTextContent(
+      "12"
+    );
+    expect(emoticonRow.querySelector(".inventory-gem-value")).toHaveTextContent(
+      "Unavailable"
+    );
+    const request = fetchMock.mock.calls[2][1] as RequestInit;
+    expect(JSON.parse(request.body as string)).toEqual({
+      groups: [
+        { app_id: "500", item_type: 4, border_color: 0 },
+        { app_id: "500", item_type: 5, border_color: 0 }
+      ],
+      booster_game_app_ids: []
+    });
+  });
+
+  it("batches refreshes at the backend group limit", async () => {
+    const items = Array.from({ length: 10_001 }, (_, index) => ({
+      ...inventoryItem(index + 1),
+      gem_key: { app_id: "500", item_type: index, border_color: 0 }
+    }));
+    const inventory = publicInventory(items, {
+      gem_status: "unavailable",
+      gem_message: "Gem prices are pending.",
+      gem_priceable_item_count: items.length,
+      gem_priced_item_count: 0
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [],
+          pending_group_count: 10_000,
+          boosters: [],
+          pending_booster_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [],
+          pending_group_count: 1,
+          boosters: [],
+          pending_booster_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Refresh gem values" })
+    );
+    await screen.findByText("Gem values refreshed from the background cache.");
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const firstRequest = fetchMock.mock.calls[2][1] as RequestInit;
+    const secondRequest = fetchMock.mock.calls[3][1] as RequestInit;
+    expect(JSON.parse(firstRequest.body as string).groups).toHaveLength(10_000);
+    expect(JSON.parse(secondRequest.body as string).groups).toEqual([
+      { app_id: "500", item_type: 10_000, border_color: 0 }
+    ]);
   });
   it("clears the local session with a credentialed logout POST", async () => {
     const fetchMock = vi

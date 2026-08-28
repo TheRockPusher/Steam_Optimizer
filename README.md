@@ -86,9 +86,12 @@ The current connection and inventory stage provides:
   `partial`, or `unavailable` price coverage: `complete` when all priceable rows are priced,
   `partial` when some but not all priceable rows are priced, and `unavailable` when zero
   priceable rows are priced or no usable provider generation exists.
+- Canonical names and independent game, rarity, and card-border metadata for every Steam
+  Community item class, with gem eligibility derived from Steam's validated conversion action
+  rather than inferred from the class.
 - A responsive, sortable inventory interface that paginates all retrieved items, lets users switch
-  game grouping on or off, and filters marketable trading cards whose exact per-card gem cash value
-  exceeds their current lowest-sell market price.
+  game grouping on or off, and filters marketable gem-convertible items whose exact per-item gem
+  cash value exceeds their current lowest-sell market price.
 
 SteamApis is a third-party provider: inventory availability, response fields, and price snapshots
 depend on provider data and availability and may differ from Steam Community at a given time. A
@@ -106,9 +109,11 @@ The browser inventory cache and server market cache have separate retention boun
 browser sessions reuse valid matching public/private records until logout, account change, invalid
 schema, or explicit refresh; the displayed timestamp identifies when that record was refreshed.
 Only validated semantic gem-yield rows and normalized global market-price rows persist server-side in
-separate SQLite caches on the attached `backend-data` Railway volume. Ordinary restarts and redeploys
-preserve those rows; incompatible or corrupt cache data is reset according to its cache schema.
-Railway services run in exact EU-West region `europe-west4-drams3a`.
+separate SQLite caches on the attached `backend-data` Railway volume. Gem cache rows use Steam's
+exact conversion identity—application ID, numeric item type, and border color—so cards, profile
+backgrounds, emoticons, and other action-bearing classes cannot collide. Ordinary restarts and
+redeploys preserve those rows; incompatible or corrupt cache data is reset according to its cache
+schema. Railway services run in exact EU-West region `europe-west4-drams3a`.
 
 
 ## Why

@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 import httpx2
 import ijson
 from ijson.common import IncompleteJSONError, JSONError
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 from app.booster_pricing import (
     BoosterPricingService,
@@ -24,13 +24,14 @@ from app.booster_pricing import (
 )
 from app.gem_pricing import (
     SACK_OF_GEMS_MARKET_HASH_NAME,
-    CardRarity,
+    GemKey,
     GemPricingService,
     GemScanResult,
+    ItemType,
     SteamCommunityLimiter,
     canonical_decimal,
     gem_cash_value,
-    parse_card_metadata,
+    parse_item_metadata,
 )
 from app.steamapis_price_cache import (
     CachedPrice,
@@ -62,7 +63,8 @@ _INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 CheckStatus = Literal["public", "private", "unavailable"]
 PriceStatus = Literal["complete", "partial", "unavailable"]
 GemStatus = Literal["complete", "partial", "unavailable"]
-InventoryItemType = Literal["trading_card", "other"]
+InventoryItemType = ItemType
+CardBorder = Literal["normal", "foil"]
 
 _ASCII_DIGITS = re.compile(r"^[0-9]+$")
 _PRIVATE_INVENTORY_MESSAGE = (
@@ -187,9 +189,11 @@ class InventoryItem(BaseModel):
     tradable: bool
     item_type: InventoryItemType = "other"
     game_app_id: str | None = Field(default=None, pattern=r"^[0-9]+$")
-    game_name: str | None = None
-    card_rarity: CardRarity | None = None
-    gem_yield: int | None = Field(default=None, ge=0)
+    game_name: str | None = Field(default=None, max_length=MAX_INVENTORY_TEXT_LENGTH)
+    rarity: str | None = Field(default=None, max_length=MAX_INVENTORY_TEXT_LENGTH)
+    card_border: CardBorder | None = None
+    gem_key: GemKey | None = None
+    gem_yield: StrictInt | None = Field(default=None, ge=0)
     gem_cash_value: str | None = Field(
         default=None,
         max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
@@ -206,34 +210,11 @@ class InventoryItem(BaseModel):
 
     @model_validator(mode="after")
     def validate_gem_metadata(self) -> InventoryItem:
-        if self.item_type == "other":
-            if any(
-                value is not None
-                for value in (
-                    self.game_app_id,
-                    self.game_name,
-                    self.card_rarity,
-                    self.gem_yield,
-                    self.gem_cash_value,
-                )
-            ):
-                raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
-            return self
-        if self.game_app_id is None:
-            if any(
-                value is not None
-                for value in (
-                    self.game_name,
-                    self.card_rarity,
-                    self.gem_yield,
-                    self.gem_cash_value,
-                )
-            ):
-                raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
-            return self
-        if self.card_rarity is None or (
-            self.gem_cash_value is not None and self.gem_yield is None
+        if self.gem_key is None and (
+            self.gem_yield is not None or self.gem_cash_value is not None
         ):
+            raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
+        if self.gem_cash_value is not None and self.gem_yield is None:
             raise ValueError(_INVALID_ITEM_GEM_METADATA_ERROR)
         return self
 
@@ -278,7 +259,7 @@ class SteamGatewayProtocol(Protocol):
 
     async def refresh_gems(
         self,
-        groups: Mapping[tuple[str, CardRarity], None],
+        keys: Iterable[GemKey],
     ) -> GemScanResult:
         """Read cached gem values without fetching a Steam inventory."""
         ...
@@ -382,7 +363,9 @@ class _Description:
     item_type: InventoryItemType
     game_app_id: str | None
     game_name: str | None
-    card_rarity: CardRarity | None
+    rarity: str | None
+    card_border: CardBorder | None
+    gem_key: GemKey | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,7 +445,10 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
         tradable = _flag(raw_description.get("tradable"))
         if marketable is None or tradable is None:
             return None
-        metadata = parse_card_metadata(raw_description.get("tags"))
+        metadata = parse_item_metadata(
+            raw_description.get("tags"),
+            raw_description.get("owner_actions"),
+        )
         descriptions.append(
             _Description(
                 class_id=class_id,
@@ -475,7 +461,9 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
                 item_type=metadata.item_type,
                 game_app_id=metadata.game_app_id,
                 game_name=metadata.game_name,
-                card_rarity=metadata.card_rarity,
+                rarity=metadata.rarity,
+                card_border=metadata.card_border,
+                gem_key=metadata.gem_key,
             )
         )
 
@@ -668,20 +656,19 @@ def _gem_status_for_items(
     items: list[InventoryItem],
     scan: GemScanResult,
 ) -> tuple[GemStatus, str, int, int]:
-    priceable_count = sum(item.item_type == "trading_card" for item in items)
+    priceable_count = sum(item.gem_key is not None for item in items)
     priced_count = sum(
-        item.item_type == "trading_card" and item.gem_yield is not None
-        for item in items
+        item.gem_key is not None and item.gem_yield is not None for item in items
     )
     if priceable_count == 0:
         return (
             "complete",
-            "No trading cards require gem prices.",
+            "No gem-convertible items require gem prices.",
             priceable_count,
             priced_count,
         )
     if priced_count == priceable_count:
-        message = "Gem prices are current for all trading cards."
+        message = "Gem prices are current for all gem-convertible items."
         if scan.used_stale_cache:
             message = "Gem prices are complete using a cached fallback."
         if scan.rate_limited:
@@ -693,9 +680,9 @@ def _gem_status_for_items(
                 "Gem prices are partially available; remaining values are pending."
             )
         else:
-            message = "Gem prices are unavailable for some trading cards."
+            message = "Gem prices are unavailable for some gem-convertible items."
     elif scan.pending_count:
-        message = "Gem prices are pending for some trading cards."
+        message = "Gem prices are pending for some gem-convertible items."
     else:
         message = "Gem prices are unavailable."
     if scan.rate_limited:
@@ -719,20 +706,17 @@ def _gem_cash_context(price: InventoryPrice | None) -> GemCashContext | None:
 
 def _gem_group_representatives(
     items: list[InventoryItem],
-) -> dict[tuple[str, CardRarity], str | None]:
-    groups: dict[tuple[str, CardRarity], str | None] = {}
+) -> dict[GemKey, str | None]:
+    groups: dict[GemKey, str | None] = {}
     for item in items:
-        if (
-            item.item_type != "trading_card"
-            or item.game_app_id is None
-            or item.card_rarity is None
-        ):
+        key = item.gem_key
+        if key is None:
             continue
-        key = (item.game_app_id, item.card_rarity)
         market_hash_name = item.market_hash_name
         existing = groups.get(key)
-        if existing is None or (
-            market_hash_name is not None and market_hash_name < existing
+        if key not in groups or (
+            market_hash_name is not None
+            and (existing is None or market_hash_name < existing)
         ):
             groups[key] = market_hash_name
     return groups
@@ -1427,7 +1411,9 @@ class SteamApisClient:
                 item_type=description.item_type,
                 game_app_id=description.game_app_id,
                 game_name=description.game_name,
-                card_rarity=description.card_rarity,
+                rarity=description.rarity,
+                card_border=description.card_border,
+                gem_key=description.gem_key,
             )
             for description in descriptions.values()
             if (description.class_id, description.instance_id) in quantities
@@ -1440,7 +1426,7 @@ class SteamApisClient:
             for item in items
             if item.marketable and item.market_hash_name
         }
-        if any(item.item_type == "trading_card" for item in items):
+        if any(item.gem_key is not None for item in items):
             # The sack is a reference price, not an inventory row and therefore
             # does not affect ordinary SteamApis coverage counts.
             priceable_names.add(SACK_OF_GEMS_MARKET_HASH_NAME)
@@ -1550,15 +1536,11 @@ class SteamApisClient:
                     "Displayed booster or gem market context uses a cached fallback."
                 )
         for index, item in enumerate(items):
-            if item.item_type != "trading_card":
+            key = item.gem_key
+            if key is None:
                 continue
-            key = (
-                (item.game_app_id, item.card_rarity)
-                if item.game_app_id is not None and item.card_rarity is not None
-                else None
-            )
-            resolution = gem_scan.values.get(key) if key is not None else None
-            if resolution is None:
+            resolution = gem_scan.values.get(key)
+            if resolution is None or getattr(resolution, "key", None) != key:
                 continue
             items[index] = item.model_copy(
                 update={
@@ -1592,7 +1574,7 @@ class SteamApisClient:
             gem_rate_limited=gem_scan.rate_limited,
             gem_retry_after_seconds=gem_scan.retry_after_seconds,
             gem_cash_context=_gem_cash_context(sack_price)
-            if any(item.item_type == "trading_card" for item in items)
+            if any(item.gem_key is not None for item in items)
             else None,
             items=items,
             boosters=boosters,
@@ -1825,9 +1807,9 @@ class SteamGateway:
 
     async def refresh_gems(
         self,
-        groups: Mapping[tuple[str, CardRarity], None],
+        keys: Iterable[GemKey],
     ) -> GemScanResult:
-        return self.steamapis.gem_pricing.read_cached(groups)
+        return self.steamapis.gem_pricing.read_cached(keys)
 
     async def refresh_boosters(
         self,

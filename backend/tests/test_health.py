@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
     import pytest
 
@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import main as main_module
 from app.booster_pricing import BoosterScanResult
-from app.gem_pricing import CardRarity, GemScanResult
+from app.gem_pricing import GemKey, GemScanResult
 from app.main import app, create_app
 from app.settings import Settings
 from app.steam_gateway import InventoryCheck, ProfileCheck
@@ -37,9 +37,9 @@ class LifecycleGateway:
 
     async def refresh_gems(
         self,
-        groups: Mapping[tuple[str, CardRarity], None],
+        keys: Iterable[GemKey],
     ) -> GemScanResult:
-        del groups
+        del keys
         return GemScanResult(values={})
 
     async def refresh_boosters(

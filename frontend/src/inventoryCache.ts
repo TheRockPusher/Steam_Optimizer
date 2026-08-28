@@ -1,4 +1,4 @@
-export const INVENTORY_CACHE_SCHEMA_VERSION = 1;
+export const INVENTORY_CACHE_SCHEMA_VERSION = 2;
 export const INVENTORY_CACHE_DATABASE_NAME = "steam-optimizer-inventory";
 export const INVENTORY_CACHE_STORE_NAME = "inventory";
 

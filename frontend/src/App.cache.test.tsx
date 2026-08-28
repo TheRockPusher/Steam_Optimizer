@@ -89,7 +89,7 @@ const publicInventory = {
   price_status: "complete",
   price_message: "No marketable item types require pricing.",
   gem_status: "complete",
-  gem_message: "Gem values are current for all trading cards.",
+  gem_message: "Gem values are current for all gem-convertible items.",
   gem_priceable_item_count: 1,
   gem_priced_item_count: 1,
   gem_rate_limited: false,
@@ -115,7 +115,9 @@ const publicInventory = {
       item_type: "trading_card",
       game_app_id: "440",
       game_name: "Team Fortress 2",
-      card_rarity: "normal",
+      rarity: null,
+      card_border: "normal",
+      gem_key: { app_id: "440", item_type: 2, border_color: 0 },
       gem_yield: 10,
       gem_cash_value: "1.0001"
     }
@@ -137,7 +139,7 @@ function jsonResponse(payload: unknown, status = 200) {
 
 function cacheRecord(inventory: unknown) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     steam_id: steamId,
     refreshed_at: "2026-08-28T12:34:56.000Z",
     inventory
@@ -387,7 +389,14 @@ describe("App inventory cache orchestration", () => {
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(
         jsonResponse({
-          values: [{ game_app_id: "440", card_rarity: "normal", gem_yield: 100 }],
+          values: [
+            {
+              app_id: "440",
+              item_type: 2,
+              border_color: 0,
+              gem_yield: 100
+            }
+          ],
           pending_group_count: 0,
           boosters: [],
           pending_booster_count: 0,

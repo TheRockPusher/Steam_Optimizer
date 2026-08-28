@@ -27,7 +27,33 @@ type PriceStatus = "complete" | "partial" | "unavailable";
 
 type GemStatus = "complete" | "partial" | "unavailable";
 
-type CardRarity = "normal" | "foil";
+type ItemType =
+  | "badge"
+  | "trading_card"
+  | "profile_background"
+  | "emoticon"
+  | "booster_pack"
+  | "consumable"
+  | "game_goo"
+  | "profile_modifier"
+  | "scene"
+  | "sale_item"
+  | "sticker"
+  | "chat_effect"
+  | "mini_profile_background"
+  | "avatar_frame"
+  | "animated_avatar"
+  | "steam_deck_keyboard_skin"
+  | "steam_deck_startup_movie"
+  | "other";
+
+type CardBorder = "normal" | "foil";
+
+type GemKey = {
+  app_id: string;
+  item_type: number;
+  border_color: 0 | 1;
+};
 
 type InventoryPrice = {
   currency: null;
@@ -65,10 +91,12 @@ type InventoryItem = {
   marketable: boolean;
   tradable: boolean;
   price: InventoryPrice | null;
-  item_type: "trading_card" | "other";
+  item_type: ItemType;
   game_app_id: string | null;
   game_name: string | null;
-  card_rarity: CardRarity | null;
+  rarity: string | null;
+  card_border: CardBorder | null;
+  gem_key: GemKey | null;
   gem_yield: number | null;
   gem_cash_value: string | null;
 };
@@ -147,10 +175,7 @@ type SignedInSession = {
 };
 
 type SessionResponse = SignedOutSession | SignedInSession;
-type GemRefreshGroup = {
-  game_app_id: string;
-  card_rarity: CardRarity;
-};
+type GemRefreshGroup = GemKey;
 
 type GemRefreshValue = GemRefreshGroup & {
   gem_yield: number;
@@ -186,6 +211,7 @@ type InventoryLoadResult = {
   preserved?: boolean;
 };
 
+
 type ViewState =
   | { kind: "loading" }
   | { kind: "signed-out" }
@@ -202,7 +228,82 @@ const STEAM_PRIVACY_URL = "https://steamcommunity.com/my/edit/settings";
 const PRIVACY_POLICY_URL =
   "https://github.com/TheRockPusher/Steam_Optimizer#privacy-and-steam-data-policy";
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
+const MAX_RETRY_AFTER_SECONDS = 900;
+const MAX_DECIMAL_LENGTH = 16_384;
+const GEM_MAX_APP_ID_LENGTH = 20;
+const GEM_MAX_ITEM_TYPE = 1_000_000_000;
+const MAX_GEM_REFRESH_GROUPS = 10_000;
+const MAX_BOOSTER_REFRESH_GROUPS = 10_000;
+const ITEM_TYPE_LABELS: Record<ItemType, string> = {
+  badge: "Badge",
+  trading_card: "Trading card",
+  profile_background: "Profile background",
+  emoticon: "Emoticon",
+  booster_pack: "Booster pack",
+  consumable: "Consumable",
+  game_goo: "Game goo",
+  profile_modifier: "Profile modifier",
+  scene: "Scene",
+  sale_item: "Sale item",
+  sticker: "Sticker",
+  chat_effect: "Chat effect",
+  mini_profile_background: "Mini profile background",
+  avatar_frame: "Avatar frame",
+  animated_avatar: "Animated avatar",
+  steam_deck_keyboard_skin: "Steam Deck keyboard skin",
+  steam_deck_startup_movie: "Steam Deck startup movie",
+  other: "Other"
+};
 const NONNEGATIVE_DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
+function isItemType(value: unknown): value is ItemType {
+  return (
+    value === "badge" ||
+    value === "trading_card" ||
+    value === "profile_background" ||
+    value === "emoticon" ||
+    value === "booster_pack" ||
+    value === "consumable" ||
+    value === "game_goo" ||
+    value === "profile_modifier" ||
+    value === "scene" ||
+    value === "sale_item" ||
+    value === "sticker" ||
+    value === "chat_effect" ||
+    value === "mini_profile_background" ||
+    value === "avatar_frame" ||
+    value === "animated_avatar" ||
+    value === "steam_deck_keyboard_skin" ||
+    value === "steam_deck_startup_movie" ||
+    value === "other"
+  );
+}
+
+function isCanonicalGemAppId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= GEM_MAX_APP_ID_LENGTH &&
+    /^(?:0|[1-9][0-9]*)$/.test(value)
+  );
+}
+
+function isGemKey(value: unknown): value is GemKey {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const key = value as Partial<GemKey>;
+  return (
+    isCanonicalGemAppId(key.app_id) &&
+    isSafeInteger(key.item_type, 0) &&
+    key.item_type <= GEM_MAX_ITEM_TYPE &&
+    (key.border_color === 0 || key.border_color === 1)
+  );
+}
+
+function gemKeyToken(key: GemKey): string {
+  return `${key.app_id}:${key.item_type}:${key.border_color}`;
+}
+
 const INVENTORY_PAGE_SIZE = 50;
 const INVENTORY_VIEWS: ReadonlyArray<InventoryViewDefinition> = [
   {
@@ -314,7 +415,7 @@ function isCanonicalGemDecimal(value: unknown): value is string {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
-    value.length > 128 ||
+    value.length > MAX_DECIMAL_LENGTH ||
     !NONNEGATIVE_DECIMAL_PATTERN.test(value)
   ) {
     return false;
@@ -455,17 +556,18 @@ function isInventoryItem(value: unknown): value is InventoryItem {
     typeof item.marketable === "boolean" &&
     typeof item.tradable === "boolean" &&
     (item.price === null || isInventoryPrice(item.price));
-  const hasValidType =
-    item.item_type === "trading_card" || item.item_type === "other";
   const hasValidGameId =
     item.game_app_id === null || isDecimalString(item.game_app_id);
   const hasValidGameName =
     item.game_name === null ||
     (typeof item.game_name === "string" && item.game_name.trim().length > 0);
   const hasValidRarity =
-    item.card_rarity === null ||
-    item.card_rarity === "normal" ||
-    item.card_rarity === "foil";
+    item.rarity === null ||
+    (typeof item.rarity === "string" && item.rarity.trim().length > 0);
+  const hasValidCardBorder =
+    item.card_border === null ||
+    item.card_border === "normal" ||
+    item.card_border === "foil";
   const hasValidGemYield =
     item.gem_yield === null || isSafeInteger(item.gem_yield, 0);
   const hasValidGemCashValue =
@@ -474,49 +576,34 @@ function isInventoryItem(value: unknown): value is InventoryItem {
 
   if (
     !hasValidBaseFields ||
-    !hasValidType ||
+    !isItemType(item.item_type) ||
     !hasValidGameId ||
     !hasValidGameName ||
     !hasValidRarity ||
+    !hasValidCardBorder ||
+    (item.gem_key !== null && !isGemKey(item.gem_key)) ||
     !hasValidGemYield ||
-    !hasValidGemCashValue
-  ) {
-    return false;
-  }
-
-  if (
+    !hasValidGemCashValue ||
+    typeof item.game_app_id === "undefined" ||
+    typeof item.game_name === "undefined" ||
+    typeof item.rarity === "undefined" ||
+    typeof item.card_border === "undefined" ||
+    typeof item.gem_key === "undefined" ||
     typeof item.gem_yield === "undefined" ||
     typeof item.gem_cash_value === "undefined"
   ) {
     return false;
   }
 
-  if (item.item_type === "other") {
-    return (
-      item.game_app_id === null &&
-      item.game_name === null &&
-      item.card_rarity === null &&
-      item.gem_yield === null &&
-      item.gem_cash_value === null
-    );
+  if (
+    (item.gem_key === null &&
+      (item.gem_yield !== null || item.gem_cash_value !== null)) ||
+    (item.gem_cash_value !== null && item.gem_yield === null)
+  ) {
+    return false;
   }
 
-  if (item.game_app_id === null) {
-    return (
-      item.game_name === null &&
-      item.card_rarity === null &&
-      item.gem_yield === null &&
-      item.gem_cash_value === null
-    );
-  }
-
-  return (
-    item.card_rarity !== null &&
-    ((item.gem_yield === null && item.gem_cash_value === null) ||
-      (item.gem_yield !== null &&
-        (item.gem_cash_value === null ||
-          typeof item.gem_cash_value === "string")))
-  );
+  return true;
 }
 
 function isInventoryCheck(value: unknown): value is InventoryCheck {
@@ -531,6 +618,7 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     typeof retryAfterSeconds === "undefined" ||
     (retryAfterSeconds !== null &&
       (!isSafeInteger(retryAfterSeconds, 0) ||
+        retryAfterSeconds > MAX_RETRY_AFTER_SECONDS ||
         !Number.isSafeInteger(
           retryAfterSeconds * MILLISECONDS_PER_SECOND
         ))) ||
@@ -553,6 +641,7 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     typeof gemRetryAfterSeconds === "undefined" ||
     (gemRetryAfterSeconds !== null &&
       (!isSafeInteger(gemRetryAfterSeconds, 0) ||
+        gemRetryAfterSeconds > MAX_RETRY_AFTER_SECONDS ||
         !Number.isSafeInteger(
           gemRetryAfterSeconds * MILLISECONDS_PER_SECOND
         ))) ||
@@ -586,10 +675,10 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
   let totalAssetCount = 0;
   let marketableItemCount = 0;
   let pricedItemCount = 0;
-  let tradingCardCount = 0;
+  let gemPriceableItemCount = 0;
   let gemPricedItemCount = 0;
   let gemCashValueCount = 0;
-  const gemYieldsByGroup = new Map<string, number | null>();
+  const gemYieldsByKey = new Map<string, number | null>();
 
   for (const item of check.items) {
     if (!isInventoryItem(item)) {
@@ -617,28 +706,29 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
       pricedItemCount += 1;
     }
 
-    if (item.item_type === "trading_card") {
-      tradingCardCount += 1;
-      if (item.game_app_id !== null) {
-        tradingCardGameIds.add(item.game_app_id);
-      }
+    if (item.item_type === "trading_card" && item.game_app_id !== null) {
+      tradingCardGameIds.add(item.game_app_id);
+    }
+
+    if (item.gem_key !== null) {
+      gemPriceableItemCount += 1;
       if (item.gem_yield !== null) {
         gemPricedItemCount += 1;
       }
       if (item.gem_cash_value !== null) {
         gemCashValueCount += 1;
       }
-      if (item.game_app_id !== null && item.card_rarity !== null) {
-        const groupKey = `${item.game_app_id}:${item.card_rarity}`;
-        const existingYield = gemYieldsByGroup.get(groupKey);
-        if (
-          typeof existingYield !== "undefined" &&
-          existingYield !== item.gem_yield
-        ) {
-          return false;
-        }
-        gemYieldsByGroup.set(groupKey, item.gem_yield);
+
+      const key = gemKeyToken(item.gem_key);
+      const existingYield = gemYieldsByKey.get(key);
+      if (
+        typeof existingYield !== "undefined" &&
+        existingYield !== item.gem_yield
+      ) {
+        return false;
       }
+      gemYieldsByKey.set(key, item.gem_yield);
+
       if (
         item.gem_yield !== null &&
         check.gem_cash_context !== null &&
@@ -663,7 +753,7 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     [...boosterKeys].some((gameAppId) => !tradingCardGameIds.has(gameAppId)) ||
     gemCashValueCount > gemPricedItemCount ||
     (gemCashValueCount > 0 && check.gem_cash_context === null) ||
-    (tradingCardCount === 0 && check.gem_cash_context !== null)
+    (gemPriceableItemCount === 0 && check.gem_cash_context !== null)
   ) {
     return false;
   }
@@ -675,10 +765,9 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     check.priceable_item_count <= check.unique_item_count &&
     marketableItemCount === check.priceable_item_count &&
     pricedItemCount === check.priced_item_count &&
-    check.gem_priceable_item_count === tradingCardCount &&
+    check.gem_priceable_item_count === gemPriceableItemCount &&
     check.gem_priced_item_count === gemPricedItemCount &&
     check.gem_priced_item_count <= check.gem_priceable_item_count &&
-    check.gem_priceable_item_count <= tradingCardCount &&
     (check.gem_status === "complete"
       ? check.gem_priced_item_count === check.gem_priceable_item_count
       : check.gem_status === "partial"
@@ -748,12 +837,15 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
   if (
     !Array.isArray(refresh.values) ||
     !isSafeInteger(refresh.pending_group_count, 0) ||
+    refresh.pending_group_count > MAX_GEM_REFRESH_GROUPS ||
     !Array.isArray(refresh.boosters) ||
     !isSafeInteger(refresh.pending_booster_count, 0) ||
+    refresh.pending_booster_count > MAX_BOOSTER_REFRESH_GROUPS ||
     typeof refresh.gem_rate_limited !== "boolean" ||
     typeof refresh.gem_retry_after_seconds === "undefined" ||
     (refresh.gem_retry_after_seconds !== null &&
-      !isSafeInteger(refresh.gem_retry_after_seconds, 0)) ||
+      (!isSafeInteger(refresh.gem_retry_after_seconds, 0) ||
+        refresh.gem_retry_after_seconds > MAX_RETRY_AFTER_SECONDS)) ||
     (!refresh.gem_rate_limited &&
       refresh.gem_retry_after_seconds !== null)
   ) {
@@ -767,14 +859,19 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
     }
     const candidate = entry as Partial<GemRefreshValue>;
     if (
-      !isDecimalString(candidate.game_app_id) ||
-      (candidate.card_rarity !== "normal" &&
-        candidate.card_rarity !== "foil") ||
+      !isCanonicalGemAppId(candidate.app_id) ||
+      !isSafeInteger(candidate.item_type, 0) ||
+      candidate.item_type > GEM_MAX_ITEM_TYPE ||
+      (candidate.border_color !== 0 && candidate.border_color !== 1) ||
       !isSafeInteger(candidate.gem_yield, 0)
     ) {
       return false;
     }
-    const key = `${candidate.game_app_id}:${candidate.card_rarity}`;
+    const key = gemKeyToken({
+      app_id: candidate.app_id,
+      item_type: candidate.item_type,
+      border_color: candidate.border_color
+    });
     if (keys.has(key)) {
       return false;
     }
@@ -805,36 +902,39 @@ function isGemRefreshResponse(value: unknown): value is GemRefreshResponse {
 function gemRefreshGroups(items: InventoryItem[]): GemRefreshGroup[] {
   const groups = new Map<string, GemRefreshGroup>();
   for (const item of items) {
-    if (
-      item.item_type !== "trading_card" ||
-      item.game_app_id === null ||
-      item.card_rarity === null
-    ) {
+    if (item.gem_key === null) {
       continue;
     }
-    const key = `${item.game_app_id}:${item.card_rarity}`;
-    groups.set(key, {
-      game_app_id: item.game_app_id,
-      card_rarity: item.card_rarity
-    });
+    const key = gemKeyToken(item.gem_key);
+    groups.set(key, { ...item.gem_key });
   }
   return [...groups.values()].sort((left, right) => {
-    const appComparison = compareDecimalStrings(
-      left.game_app_id,
-      right.game_app_id
-    );
-    return appComparison === 0
-      ? left.card_rarity.localeCompare(right.card_rarity)
-      : appComparison;
+    const appComparison = compareDecimalStrings(left.app_id, right.app_id);
+    if (appComparison !== 0) {
+      return appComparison;
+    }
+    if (left.item_type !== right.item_type) {
+      return left.item_type - right.item_type;
+    }
+    return left.border_color - right.border_color;
   });
 }
 
-async function requestGemRefresh(
-  inventory: InventoryCheck
+function boosterRefreshGameAppIds(boosters: BoosterInfo[]): string[] {
+  return [...new Set(boosters.map((booster) => booster.game_app_id))].sort(
+    compareDecimalStrings
+  );
+}
+
+async function requestGemRefreshBatch(
+  groups: GemRefreshGroup[],
+  boosterGameAppIds: string[]
 ): Promise<GemRefreshResponse> {
-  const groups = gemRefreshGroups(inventory.items);
   const response = await fetch(GEM_REFRESH_URL, {
-    body: JSON.stringify({ groups }),
+    body: JSON.stringify({
+      groups,
+      booster_game_app_ids: boosterGameAppIds
+    }),
     credentials: "include",
     headers: {
       Accept: "application/json",
@@ -849,19 +949,16 @@ async function requestGemRefresh(
   if (!isGemRefreshResponse(payload)) {
     throw new Error("The gem refresh service returned an invalid response.");
   }
-  const requestedKeys = new Set(
-    groups.map((group) => `${group.game_app_id}:${group.card_rarity}`)
-  );
-  const requestedBoosterIds = new Set(
-    groups.map((group) => group.game_app_id)
-  );
+  const requestedKeys = new Set(groups.map(gemKeyToken));
+  const requestedBoosterIds = new Set(boosterGameAppIds);
   if (
     payload.values.length > groups.length ||
+    payload.pending_group_count > groups.length - payload.values.length ||
     payload.values.some(
-      (entry) =>
-        !requestedKeys.has(`${entry.game_app_id}:${entry.card_rarity}`)
+      (entry) => !requestedKeys.has(gemKeyToken(entry))
     ) ||
     payload.boosters.length > requestedBoosterIds.size ||
+    payload.pending_booster_count > requestedBoosterIds.size ||
     payload.boosters.some(
       (entry) => !requestedBoosterIds.has(entry.game_app_id)
     )
@@ -871,15 +968,62 @@ async function requestGemRefresh(
   return payload;
 }
 
+async function requestGemRefresh(
+  inventory: InventoryCheck
+): Promise<GemRefreshResponse> {
+  const groups = gemRefreshGroups(inventory.items);
+  const boosterGameAppIds = boosterRefreshGameAppIds(inventory.boosters);
+  const values: GemRefreshValue[] = [];
+  const boosters: BoosterRefreshValue[] = [];
+  let pendingGroupCount = 0;
+  let pendingBoosterCount = 0;
+  let gemRateLimited = false;
+  let gemRetryAfterSeconds: number | null = null;
+  const batchCount = Math.max(
+    Math.ceil(groups.length / MAX_GEM_REFRESH_GROUPS),
+    Math.ceil(boosterGameAppIds.length / MAX_BOOSTER_REFRESH_GROUPS)
+  );
+
+  for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
+    const groupOffset = batchIndex * MAX_GEM_REFRESH_GROUPS;
+    const boosterOffset = batchIndex * MAX_BOOSTER_REFRESH_GROUPS;
+    const response = await requestGemRefreshBatch(
+      groups.slice(groupOffset, groupOffset + MAX_GEM_REFRESH_GROUPS),
+      boosterGameAppIds.slice(
+        boosterOffset,
+        boosterOffset + MAX_BOOSTER_REFRESH_GROUPS
+      )
+    );
+    values.push(...response.values);
+    boosters.push(...response.boosters);
+    pendingGroupCount += response.pending_group_count;
+    pendingBoosterCount += response.pending_booster_count;
+    gemRateLimited ||= response.gem_rate_limited;
+    if (
+      response.gem_retry_after_seconds !== null &&
+      (gemRetryAfterSeconds === null ||
+        response.gem_retry_after_seconds > gemRetryAfterSeconds)
+    ) {
+      gemRetryAfterSeconds = response.gem_retry_after_seconds;
+    }
+  }
+
+  return {
+    values,
+    pending_group_count: pendingGroupCount,
+    boosters,
+    pending_booster_count: pendingBoosterCount,
+    gem_rate_limited: gemRateLimited,
+    gem_retry_after_seconds: gemRetryAfterSeconds
+  };
+}
+
 function mergeGemRefresh(
   inventory: InventoryCheck,
   refresh: GemRefreshResponse
 ): InventoryCheck {
   const yields = new Map<string, number>(
-    refresh.values.map(
-      (entry) =>
-        [`${entry.game_app_id}:${entry.card_rarity}`, entry.gem_yield] as const
-    )
+    refresh.values.map((entry) => [gemKeyToken(entry), entry.gem_yield])
   );
   const boosterValues = new Map<string, BoosterRefreshValue>(
     refresh.boosters.map(
@@ -887,17 +1031,10 @@ function mergeGemRefresh(
     )
   );
   const items = inventory.items.map((item) => {
-    if (
-      item.item_type !== "trading_card" ||
-      item.game_app_id === null ||
-      item.card_rarity === null
-    ) {
+    if (item.gem_key === null) {
       return item;
     }
-    const key = `${item.game_app_id}:${item.card_rarity}`;
-    if (!yields.has(key)) {
-      return item;
-    }
+    const key = gemKeyToken(item.gem_key);
     const gemYield = yields.get(key);
     if (typeof gemYield !== "number") {
       return item;
@@ -926,11 +1063,10 @@ function mergeGemRefresh(
     };
   });
   const gemPriceableCount = items.filter(
-    (item) => item.item_type === "trading_card"
+    (item) => item.gem_key !== null
   ).length;
   const gemPricedCount = items.filter(
-    (item) =>
-      item.item_type === "trading_card" && item.gem_yield !== null
+    (item) => item.gem_key !== null && item.gem_yield !== null
   ).length;
   const gemStatus: GemStatus =
     gemPriceableCount === 0 || gemPricedCount === gemPriceableCount
@@ -941,11 +1077,11 @@ function mergeGemRefresh(
   const gemMessage =
     gemStatus === "complete"
       ? gemPriceableCount === 0
-        ? "No trading cards require gem prices."
-        : "Gem prices are current for all trading cards."
+        ? "No gem-convertible items require gem prices."
+        : "Gem prices are current for all gem-convertible items."
       : refresh.pending_group_count > 0
-        ? "Background gem pricing is still processing uncached card groups."
-        : "Gem prices are unavailable for some trading cards.";
+        ? "Background gem pricing is still processing uncached gem-convertible item groups."
+        : "Gem prices are unavailable for some gem-convertible items.";
   return {
     ...inventory,
     items,
@@ -1235,7 +1371,7 @@ function compareDecimalStrings(left: string, right: string): number {
 
 function isWorthMoreAsGems(item: InventoryItem): boolean {
   if (
-    item.item_type !== "trading_card" ||
+    item.gem_key === null ||
     !item.marketable ||
     item.gem_cash_value === null ||
     item.price === null ||
@@ -1393,19 +1529,19 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
       ? item.market_hash_name
       : null;
   const gemValue =
-    item.item_type === "other"
+    item.gem_key === null
       ? "Not applicable"
       : item.gem_yield === null
         ? "Unavailable"
         : INVENTORY_COUNT_FORMATTER.format(item.gem_yield);
   const gemCashValue =
-    item.item_type === "other"
+    item.gem_key === null
       ? "Not applicable"
       : item.gem_cash_value ?? "Unavailable";
-  const cardRarity =
-    item.item_type === "trading_card" && item.card_rarity !== null
-      ? `${item.card_rarity === "foil" ? "Foil" : "Normal"} card`
-      : null;
+  const cardBorder =
+    item.card_border === null
+      ? null
+      : `${item.card_border === "foil" ? "Foil" : "Normal"} card border`;
 
   return (
     <tr className={`inventory-item inventory-item-${item.item_type}`}>
@@ -1422,8 +1558,16 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
           )}
           <div>
             <strong>{item.name}</strong>
-            {cardRarity !== null && (
-              <span className="card-rarity-label">{cardRarity}</span>
+            <span className="item-type-label">
+              {ITEM_TYPE_LABELS[item.item_type]}
+            </span>
+            {item.rarity !== null && (
+              <span className="item-rarity-label">
+                Rarity: {item.rarity}
+              </span>
+            )}
+            {cardBorder !== null && (
+              <span className="item-border-label">{cardBorder}</span>
             )}
             {marketHashName !== null && (
               <span className="market-hash-name">{marketHashName}</span>
@@ -1498,11 +1642,13 @@ function groupInventoryItems(
 
   for (const item of items) {
     const key =
-      item.item_type === "other"
-        ? "other"
-        : item.game_app_id === null
-          ? "trading-card-fallback"
-          : `game:${item.game_app_id}`;
+      item.game_app_id !== null
+        ? `game:${item.game_app_id}`
+        : item.game_name !== null
+          ? `game-name:${item.game_name.trim()}`
+          : item.item_type === "other"
+            ? "other"
+            : "game-fallback";
     const existingGroup = groupsByKey.get(key);
 
     if (existingGroup !== undefined) {
@@ -1520,16 +1666,13 @@ function groupInventoryItems(
     groupsByKey.set(key, {
       key,
       kind:
-        item.item_type === "other"
-          ? "other"
-          : item.game_app_id === null
-            ? "fallback"
-            : "game",
-      game_app_id: item.item_type === "other" ? null : item.game_app_id,
-      game_name:
-        item.item_type === "other" || item.game_name === null
-          ? null
-          : item.game_name.trim(),
+        item.game_app_id !== null || item.game_name !== null
+          ? "game"
+          : item.item_type === "other"
+            ? "other"
+            : "fallback",
+      game_app_id: item.game_app_id,
+      game_name: item.game_name === null ? null : item.game_name.trim(),
       items: [item]
     });
   }
@@ -1787,18 +1930,17 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
             </tr>
           </thead>
           {visibleGroups.map((group) => {
-            const headingId = `inventory-group-${group.key.replace(
-              /[^a-zA-Z0-9_-]/g,
-              "-"
-            )}`;
+            const firstItem = group.items[0];
+            const headingId =
+              `inventory-group-${firstItem.class_id}-${firstItem.instance_id}`;
             const groupLabel =
               group.kind === "other"
                 ? "Other inventory items"
                 : group.game_name !== null
                   ? group.game_name
                   : group.game_app_id !== null
-                    ? `Trading cards (unknown game, App ID ${group.game_app_id})`
-                    : "Trading cards (game unavailable)";
+                    ? `Items (unknown game, App ID ${group.game_app_id})`
+                    : "Items (game unavailable)";
 
             return (
               <tbody
@@ -1965,19 +2107,20 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
               aria-atomic="true"
             >
               {worthMoreAsGemsItems.length === 0
-                ? "No item types are currently worth more as gems."
+                ? "No gem-convertible item types are currently worth more as gems."
                 : `${INVENTORY_COUNT_FORMATTER.format(
                   worthMoreAsGemsItems.length
-                )} item ${worthMoreAsGemsItems.length === 1 ? "type is" : "types are"
+                )} gem-convertible item ${worthMoreAsGemsItems.length === 1 ? "type is" : "types are"
                 } currently worth more as gems.`}
             </p>
+
             {activeItems.length === 0 ? (
               <div className="inventory-filtered-empty">
                 <h4>No items are worth more as gems</h4>
                 <p>
-                  No marketable trading card with both a gem cash value and a
-                  current lowest-sell market price currently qualifies. Review
-                  All items to see every returned item type.
+                  No marketable gem-convertible item with both a gem cash value
+                  and a current lowest-sell market price currently qualifies.
+                  Review All items to see every returned item type.
                 </p>
               </div>
             ) : (
@@ -2127,7 +2270,7 @@ function InventoryPricingSummary({
         </div>
         <div
           className={`inventory-pricing-stat inventory-pricing-stat-${inventory.gem_status}`}
-          aria-label={`Gem pricing: ${gemStatusLabel}. ${gemPricingCount} trading-card item types priced`}
+          aria-label={`Gem pricing: ${gemStatusLabel}. ${gemPricingCount} gem-convertible item types priced`}
         >
           <dt>
             <span className="status-dot" aria-hidden="true" />
@@ -2165,12 +2308,12 @@ function inventoryPriceCoverageMessage(inventory: InventoryCheck): string {
 
 function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
   return inventory.gem_priceable_item_count === 0
-    ? "No trading-card item types require a gem lookup."
+    ? "No gem-convertible item types require a gem lookup."
     : `Gem values are available for ${INVENTORY_COUNT_FORMATTER.format(
       inventory.gem_priced_item_count
     )} of ${INVENTORY_COUNT_FORMATTER.format(
       inventory.gem_priceable_item_count
-    )} trading-card item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
+    )} gem-convertible item ${inventory.gem_priceable_item_count === 1 ? "type" : "types"
     }.`;
 }
 
@@ -2203,6 +2346,7 @@ function InventoryResults({
       resultTabRefs.current[view]?.focus();
     }
   }
+
 
   return (
     <section className="inventory-results" aria-labelledby="inventory-results-title">
@@ -2387,13 +2531,13 @@ function InventoryFaq({
           <div className="inventory-faq-answer">
             <p>
               The Market number is priced marketable item types over
-              priceable item types. The Gems number is priced trading-card item
-              types over trading-card item types that can be checked.
+              priceable item types. The Gems number is priced gem-convertible
+              item types over gem-convertible item types that can be checked.
             </p>
             <p>
-              Worth more as gems compares each trading card&apos;s per-card gem
-              cash value against its current lowest-sell market price. Missing
-              values are excluded from this view.
+              Worth more as gems compares each gem-convertible item&apos;s
+              per-item gem cash value against its current lowest-sell market
+              price. Missing values are excluded from this view.
             </p>
             <p>{inventoryPriceCoverageMessage(inventory)}</p>
             <p>
@@ -2428,7 +2572,7 @@ function InventoryFaq({
             <p>
               Gem cash value uses the SteamApis lowest-sell basis for{" "}
               {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed
-              has unknown currency. Each value is a per-card replacement-cost
+              has unknown currency. Each value is a per-item replacement-cost
               estimate.
             </p>
             {gemCashContext !== null && (
@@ -3201,7 +3345,7 @@ function HomePage() {
       });
       setGemRefreshMessage("Gem values refreshed from the background cache.");
       setStatusAnnouncement(
-        `Gem refresh complete. ${mergedInventory.gem_priced_item_count} of ${mergedInventory.gem_priceable_item_count} trading-card item types have gem values.`
+        `Gem refresh complete. ${mergedInventory.gem_priced_item_count} of ${mergedInventory.gem_priceable_item_count} gem-convertible item types have gem values.`
       );
     } catch {
       const message =
@@ -3422,15 +3566,16 @@ function FaqPage() {
           <section id="gem-values">
             <h2>How are gem values calculated?</h2>
             <p>
-              Steam Community provides the gem yield for trading cards. The cash
-              estimate uses the SteamApis lowest-sell price for{" "}
+              Steam Community provides the gem yield for eligible inventory
+              items. The cash estimate uses the SteamApis lowest-sell price for{" "}
               {GEM_CASH_MARKET_HASH_NAME}, divided across{" "}
               {INVENTORY_COUNT_FORMATTER.format(GEM_CASH_SACK_SIZE)} gems. It is
-              a per-card replacement-cost estimate.
+              a per-item replacement-cost estimate.
             </p>
             <p>
-              “Worth more as gems” compares that estimate with the card's current
-              lowest-sell market price. Cards missing either value are excluded.
+              “Worth more as gems” compares that estimate with the item&apos;s
+              current lowest-sell market price. Items missing either value are
+              excluded.
             </p>
           </section>
 

@@ -4,7 +4,7 @@ import hmac
 import secrets
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 
 if TYPE_CHECKING:
     from app.settings import Settings
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from app.booster_pricing import (
     BoosterResolution,
@@ -21,6 +21,7 @@ from app.booster_pricing import (
     derive_booster_gem_cost,
 )
 from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
+from app.gem_pricing import GemBorderColor, GemKey
 from app.steam_gateway import InventoryCheck, ProfileCheck
 from app.steam_openid import (
     OpenIDValidationError,
@@ -34,9 +35,11 @@ from app.steam_openid import (
 STATE_PURPOSE = "login-state"
 SESSION_PURPOSE = "session"
 MAX_GEM_REFRESH_GROUPS = 10_000
-_DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
+MAX_BOOSTER_REFRESH_GROUPS = 10_000
 _AUTHENTICATION_REQUIRED_MESSAGE = "Steam authentication is required."
 _GEM_REFRESH_UNAVAILABLE_MESSAGE = "Gem value refresh is unavailable."
+_DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
+_DUPLICATE_BOOSTER_REFRESH_GROUP_ERROR = "Booster refresh game AppIDs must be unique."
 _INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
 _INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 
@@ -77,25 +80,39 @@ SessionResponse = Annotated[
     Field(discriminator="authenticated"),
 ]
 
+BoosterGameAppId = Annotated[
+    str,
+    Field(pattern=r"^(?:0|[1-9][0-9]*)$", max_length=20),
+]
+
 
 class GemRefreshGroup(BaseModel):
-    game_app_id: str = Field(pattern=r"^[0-9]+$", max_length=20)
-    card_rarity: Literal["normal", "foil"]
+    app_id: str = Field(pattern=r"^(?:0|[1-9][0-9]*)$", max_length=20)
+    item_type: StrictInt = Field(ge=0, le=1_000_000_000)
+    border_color: StrictInt = Field(ge=0, le=1)
 
 
 class GemRefreshRequest(BaseModel):
     groups: list[GemRefreshGroup] = Field(max_length=MAX_GEM_REFRESH_GROUPS)
+    booster_game_app_ids: list[BoosterGameAppId] = Field(
+        default_factory=list,
+        max_length=MAX_BOOSTER_REFRESH_GROUPS,
+    )
 
     @model_validator(mode="after")
     def require_unique_groups(self) -> GemRefreshRequest:
-        keys = {(group.game_app_id, group.card_rarity) for group in self.groups}
-        if len(keys) != len(self.groups):
+        gem_keys = {
+            (group.app_id, group.item_type, group.border_color) for group in self.groups
+        }
+        if len(gem_keys) != len(self.groups):
             raise ValueError(_DUPLICATE_GEM_REFRESH_GROUP_ERROR)
+        if len(set(self.booster_game_app_ids)) != len(self.booster_game_app_ids):
+            raise ValueError(_DUPLICATE_BOOSTER_REFRESH_GROUP_ERROR)
         return self
 
 
 class GemRefreshValue(GemRefreshGroup):
-    gem_yield: int = Field(ge=0)
+    gem_yield: StrictInt = Field(ge=0)
 
 
 class BoosterRefreshValue(BaseModel):
@@ -475,12 +492,19 @@ def create_auth_router(
                 status_code=401,
                 detail=_AUTHENTICATION_REQUIRED_MESSAGE,
             ) from error
-        groups = {
-            (group.game_app_id, group.card_rarity): None for group in payload.groups
-        }
-        requested_groups = tuple(sorted(groups))
+        keys = sorted(
+            {
+                GemKey(
+                    app_id=group.app_id,
+                    item_type=group.item_type,
+                    border_color=cast("GemBorderColor", group.border_color),
+                )
+                for group in payload.groups
+            },
+            key=lambda key: (int(key.app_id), key.item_type, key.border_color),
+        )
         try:
-            scan = await steam_gateway.refresh_gems(groups)
+            scan = await steam_gateway.refresh_gems(keys)
         except (
             AttributeError,
             OSError,
@@ -494,10 +518,9 @@ def create_auth_router(
                 status_code=503,
                 detail=_GEM_REFRESH_UNAVAILABLE_MESSAGE,
             ) from error
-
         requested_booster_ids = tuple(
             sorted(
-                {group.game_app_id for group in payload.groups},
+                set(payload.booster_game_app_ids),
                 key=lambda value: (len(value), value),
             )
         )
@@ -532,22 +555,24 @@ def create_auth_router(
                     pending_count=booster_pending_count,
                 )
 
-        gem_values = []
-        for key in requested_groups:
-            resolution = scan.values.get(key)
-            gem_yield = getattr(resolution, "gem_yield", None)
-            if (
-                isinstance(gem_yield, int)
-                and not isinstance(gem_yield, bool)
-                and gem_yield >= 0
-            ):
-                gem_values.append(
-                    GemRefreshValue(
-                        game_app_id=key[0],
-                        card_rarity=key[1],
-                        gem_yield=gem_yield,
-                    )
-                )
+        requested_keys = set(keys)
+        gem_values = [
+            GemRefreshValue(
+                app_id=key.app_id,
+                item_type=key.item_type,
+                border_color=key.border_color,
+                gem_yield=resolution.gem_yield,
+            )
+            for key, resolution in sorted(
+                scan.values.items(),
+                key=lambda entry: (
+                    int(entry[0].app_id),
+                    entry[0].item_type,
+                    entry[0].border_color,
+                ),
+            )
+            if key in requested_keys and getattr(resolution, "key", None) == key
+        ]
 
         booster_values = []
         for game_app_id in requested_booster_ids:
@@ -580,10 +605,7 @@ def create_auth_router(
                 )
         return GemRefreshResponse(
             values=gem_values,
-            pending_group_count=min(
-                len(requested_groups),
-                max(0, scan.pending_count),
-            ),
+            pending_group_count=min(len(keys), max(0, scan.pending_count)),
             gem_rate_limited=scan.rate_limited,
             gem_retry_after_seconds=scan.retry_after_seconds,
             boosters=booster_values,
