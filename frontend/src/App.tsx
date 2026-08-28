@@ -75,6 +75,15 @@ type InventorySort = {
   direction: SortDirection;
 };
 
+type InventoryView = "all" | "worth-more-as-gems";
+
+type InventoryViewDefinition = {
+  key: InventoryView;
+  label: string;
+  tabId: string;
+  panelId: string;
+};
+
 type InventoryCheck = VisibilityCheck & {
   retry_after_seconds: number | null;
   rate_limited: boolean;
@@ -149,6 +158,21 @@ const PRIVACY_POLICY_URL =
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
 const NONNEGATIVE_DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
 const INVENTORY_PAGE_SIZE = 50;
+const INVENTORY_VIEWS: ReadonlyArray<InventoryViewDefinition> = [
+  {
+    key: "all",
+    label: "All items",
+    tabId: "inventory-tab-all",
+    panelId: "inventory-panel-all"
+  },
+  {
+    key: "worth-more-as-gems",
+    label: "Worth more as gems",
+    tabId: "inventory-tab-worth-gems",
+    panelId: "inventory-panel-worth-gems"
+  }
+];
+
 const INVENTORY_COUNT_FORMATTER = new Intl.NumberFormat("en-US");
 const PRICE_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("en-US", {
   year: "numeric",
@@ -1054,6 +1078,20 @@ function compareDecimalStrings(left: string, right: string): number {
     .localeCompare(rightFraction.padEnd(fractionLength, "0"));
 }
 
+function isWorthMoreAsGems(item: InventoryItem): boolean {
+  if (
+    item.item_type !== "trading_card" ||
+    !item.marketable ||
+    item.gem_cash_value === null ||
+    item.price === null ||
+    item.price.lowest_sell === null
+  ) {
+    return false;
+  }
+
+  return compareDecimalStrings(item.gem_cash_value, item.price.lowest_sell) > 0;
+}
+
 function comparePriceTimestamps(left: string, right: string): number {
   const leftTimestamp = Date.parse(left);
   const rightTimestamp = Date.parse(right);
@@ -1393,12 +1431,38 @@ function groupInventoryItems(
 
 function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   const [requestedPageIndex, setRequestedPageIndex] = useState(0);
+  const [knownPageCount, setKnownPageCount] = useState(() =>
+    Math.max(1, Math.ceil(items.length / INVENTORY_PAGE_SIZE))
+  );
   const [sort, setSort] = useState<InventorySort | null>(null);
   const [groupByGame, setGroupByGame] = useState(true);
+  const [activeView, setActiveView] = useState<InventoryView>("all");
+  const tabRefs = useRef<Record<InventoryView, HTMLButtonElement | null>>({
+    all: null,
+    "worth-more-as-gems": null
+  });
+  const allItemsPanelRef = useRef<HTMLDivElement>(null);
+  const worthMoreAsGemsPanelRef = useRef<HTMLDivElement>(null);
+  const focusWasWithinActivePanel = useRef(false);
+  const worthMoreAsGemsItems = useMemo(
+    () => items.filter(isWorthMoreAsGems),
+    [items]
+  );
+  const activeItems =
+    activeView === "all" ? items : worthMoreAsGemsItems;
+
+  function activateInventoryView(view: InventoryView, focusTab = false) {
+    setActiveView(view);
+    setRequestedPageIndex(0);
+    if (focusTab) {
+      tabRefs.current[view]?.focus();
+    }
+  }
+
   const groupedItems = useMemo(
     () =>
       groupByGame
-        ? groupInventoryItems(items, sort)
+        ? groupInventoryItems(activeItems, sort)
         : [
           {
             key: "all",
@@ -1407,24 +1471,42 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
             game_name: null,
             items:
               sort === null
-                ? items
-                : [...items].sort((left, right) =>
+                ? activeItems
+                : [...activeItems].sort((left, right) =>
                   compareInventoryItems(left, right, sort)
                 )
           }
         ],
-    [groupByGame, items, sort]
+    [activeItems, groupByGame, sort]
   );
   const pageCount = Math.max(
     1,
-    Math.ceil(items.length / INVENTORY_PAGE_SIZE)
+    Math.ceil(activeItems.length / INVENTORY_PAGE_SIZE)
   );
+  if (knownPageCount !== pageCount) {
+    setKnownPageCount(pageCount);
+    setRequestedPageIndex((currentIndex) =>
+      Math.min(currentIndex, pageCount - 1)
+    );
+  }
   const pageIndex = Math.min(requestedPageIndex, pageCount - 1);
+  useEffect(() => {
+    const activePanel =
+      activeView === "all"
+        ? allItemsPanelRef.current
+        : worthMoreAsGemsPanelRef.current;
+    if (
+      focusWasWithinActivePanel.current &&
+      document.activeElement === document.body
+    ) {
+      activePanel?.focus();
+    }
+  }, [activeItems.length, activeView, pageCount]);
 
   const firstItemIndex = pageIndex * INVENTORY_PAGE_SIZE;
   const lastItemIndex = Math.min(
     firstItemIndex + INVENTORY_PAGE_SIZE,
-    items.length
+    activeItems.length
   );
   const visibleGroups = useMemo(() => {
     let remainingOffset = firstItemIndex;
@@ -1465,6 +1547,134 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
     setRequestedPageIndex(0);
   }
 
+  function renderInventoryLedger() {
+    if (activeItems.length === 0) {
+      return null;
+    }
+
+    return (
+      <>
+        <p
+          className="inventory-page-status"
+          role="status"
+          aria-label="Inventory pagination status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          Showing {INVENTORY_COUNT_FORMATTER.format(firstItemIndex + 1)}–
+          {INVENTORY_COUNT_FORMATTER.format(lastItemIndex)} of{" "}
+          {INVENTORY_COUNT_FORMATTER.format(activeItems.length)}. Page{" "}
+          {pageIndex + 1} of {pageCount}.
+        </p>
+
+        {pageCount > 1 && (
+          <nav className="inventory-pagination" aria-label="Inventory pages">
+            <button
+              className="secondary-action"
+              type="button"
+              onClick={() => setRequestedPageIndex(pageIndex - 1)}
+              disabled={pageIndex === 0}
+              aria-label="Previous inventory page"
+            >
+              Previous
+            </button>
+            <label className="inventory-page-picker">
+              <span>Page</span>
+              <select
+                value={pageIndex + 1}
+                onChange={(event) =>
+                  setRequestedPageIndex(Number(event.currentTarget.value) - 1)
+                }
+                aria-label="Inventory page"
+              >
+                {Array.from({ length: pageCount }, (_, index) => (
+                  <option key={index} value={index + 1}>
+                    {index + 1}
+                  </option>
+                ))}
+              </select>
+              <span>of {pageCount}</span>
+            </label>
+            <button
+              className="secondary-action"
+              type="button"
+              onClick={() => setRequestedPageIndex(pageIndex + 1)}
+              disabled={pageIndex === pageCount - 1}
+              aria-label="Next inventory page"
+            >
+              Next
+            </button>
+          </nav>
+        )}
+
+        <table className="inventory-table" aria-labelledby="inventory-items-title">
+          <colgroup>
+            <col className="inventory-column-item" />
+            <col className="inventory-column-quantity" />
+            <col className="inventory-column-marketability" />
+            <col className="inventory-column-price" />
+            <col className="inventory-column-price" />
+            <col className="inventory-column-timestamp" />
+            <col className="inventory-column-gem" />
+            <col className="inventory-column-gem-cash" />
+          </colgroup>
+          <thead>
+            <tr>
+              {INVENTORY_COLUMNS.map((column) => (
+                <InventoryColumnHeader
+                  key={column.field}
+                  field={column.field}
+                  label={column.label}
+                  sort={sort}
+                  onSort={handleSort}
+                />
+              ))}
+            </tr>
+          </thead>
+          {visibleGroups.map((group) => {
+            const headingId = `inventory-group-${group.key.replace(
+              /[^a-zA-Z0-9_-]/g,
+              "-"
+            )}`;
+            const groupLabel =
+              group.kind === "other"
+                ? "Other inventory items"
+                : group.game_name !== null
+                  ? group.game_name
+                  : group.game_app_id !== null
+                    ? `Trading cards (unknown game, App ID ${group.game_app_id})`
+                    : "Trading cards (game unavailable)";
+
+            return (
+              <tbody
+                key={group.key}
+                aria-labelledby={groupByGame ? headingId : undefined}
+              >
+                {groupByGame && (
+                  <tr className="inventory-group-header">
+                    <th
+                      id={headingId}
+                      scope="rowgroup"
+                      colSpan={INVENTORY_COLUMNS.length}
+                    >
+                      {groupLabel}
+                    </th>
+                  </tr>
+                )}
+                {group.items.map((item) => (
+                  <InventoryItemRow
+                    key={`${item.class_id}:${item.instance_id}`}
+                    item={item}
+                  />
+                ))}
+              </tbody>
+            );
+          })}
+        </table>
+      </>
+    );
+  }
+
   return (
     <section className="inventory-browser" aria-labelledby="inventory-items-title">
       <div className="inventory-browser-heading">
@@ -1490,124 +1700,147 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
           </label>
         </div>
       </div>
-
-      <p
-        className="inventory-page-status"
-        role="status"
-        aria-label="Inventory pagination status"
-        aria-live="polite"
-        aria-atomic="true"
+      <div
+        className="inventory-view-tabs"
+        role="tablist"
+        aria-label="Inventory views"
       >
-        Showing {INVENTORY_COUNT_FORMATTER.format(firstItemIndex + 1)}–
-        {INVENTORY_COUNT_FORMATTER.format(lastItemIndex)} of{" "}
-        {INVENTORY_COUNT_FORMATTER.format(items.length)}. Page{" "}
-        {pageIndex + 1} of {pageCount}.
-      </p>
-
-      {pageCount > 1 && (
-        <nav className="inventory-pagination" aria-label="Inventory pages">
-          <button
-            className="secondary-action"
-            type="button"
-            onClick={() => setRequestedPageIndex(pageIndex - 1)}
-            disabled={pageIndex === 0}
-            aria-label="Previous inventory page"
-          >
-            Previous
-          </button>
-          <label className="inventory-page-picker">
-            <span>Page</span>
-            <select
-              value={pageIndex + 1}
-              onChange={(event) =>
-                setRequestedPageIndex(Number(event.currentTarget.value) - 1)
-              }
-              aria-label="Inventory page"
-            >
-              {Array.from({ length: pageCount }, (_, index) => (
-                <option key={index} value={index + 1}>
-                  {index + 1}
-                </option>
-              ))}
-            </select>
-            <span>of {pageCount}</span>
-          </label>
-          <button
-            className="secondary-action"
-            type="button"
-            onClick={() => setRequestedPageIndex(pageIndex + 1)}
-            disabled={pageIndex === pageCount - 1}
-            aria-label="Next inventory page"
-          >
-            Next
-          </button>
-        </nav>
-      )}
-
-      <table className="inventory-table" aria-labelledby="inventory-items-title">
-        <colgroup>
-          <col className="inventory-column-item" />
-          <col className="inventory-column-quantity" />
-          <col className="inventory-column-marketability" />
-          <col className="inventory-column-price" />
-          <col className="inventory-column-price" />
-          <col className="inventory-column-timestamp" />
-          <col className="inventory-column-gem" />
-          <col className="inventory-column-gem-cash" />
-        </colgroup>
-        <thead>
-          <tr>
-            {INVENTORY_COLUMNS.map((column) => (
-              <InventoryColumnHeader
-                key={column.field}
-                field={column.field}
-                label={column.label}
-                sort={sort}
-                onSort={handleSort}
-              />
-            ))}
-          </tr>
-        </thead>
-        {visibleGroups.map((group) => {
-          const headingId = `inventory-group-${group.key.replace(
-            /[^a-zA-Z0-9_-]/g,
-            "-"
-          )}`;
-          const groupLabel =
-            group.kind === "other"
-              ? "Other inventory items"
-              : group.game_name !== null
-                ? group.game_name
-                : group.game_app_id !== null
-                  ? `Trading cards (unknown game, App ID ${group.game_app_id})`
-                  : "Trading cards (game unavailable)";
+        {INVENTORY_VIEWS.map((view, index) => {
+          const isActive = activeView === view.key;
+          const itemCount =
+            view.key === "all"
+              ? items.length
+              : worthMoreAsGemsItems.length;
 
           return (
-            <tbody
-              key={group.key}
-              aria-labelledby={groupByGame ? headingId : undefined}
+            <button
+              key={view.key}
+              ref={(element) => {
+                tabRefs.current[view.key] = element;
+              }}
+              className="inventory-view-tab"
+              id={view.tabId}
+              type="button"
+              role="tab"
+              aria-controls={view.panelId}
+              aria-selected={isActive}
+              tabIndex={isActive ? 0 : -1}
+              onClick={() => activateInventoryView(view.key, true)}
+              onKeyDown={(event) => {
+                let nextIndex: number | null = null;
+
+                if (event.key === "ArrowLeft") {
+                  nextIndex =
+                    (index - 1 + INVENTORY_VIEWS.length) %
+                    INVENTORY_VIEWS.length;
+                } else if (event.key === "ArrowRight") {
+                  nextIndex = (index + 1) % INVENTORY_VIEWS.length;
+                } else if (event.key === "Home") {
+                  nextIndex = 0;
+                } else if (event.key === "End") {
+                  nextIndex = INVENTORY_VIEWS.length - 1;
+                }
+
+                if (nextIndex === null) {
+                  return;
+                }
+
+                event.preventDefault();
+                activateInventoryView(
+                  INVENTORY_VIEWS[nextIndex].key,
+                  true
+                );
+              }}
             >
-              {groupByGame && (
-                <tr className="inventory-group-header">
-                  <th
-                    id={headingId}
-                    scope="rowgroup"
-                    colSpan={INVENTORY_COLUMNS.length}
-                  >
-                    {groupLabel}
-                  </th>
-                </tr>
-              )}
-              {group.items.map((item) => (
-                <InventoryItemRow
-                  key={`${item.class_id}:${item.instance_id}`}
-                  item={item}
-                />
-              ))}
-            </tbody>
+              <span>{view.label}</span>
+              <span className="inventory-view-tab-count">
+                ({INVENTORY_COUNT_FORMATTER.format(itemCount)})
+              </span>
+            </button>
           );
         })}
-      </table>
+      </div>
+
+      <div
+        ref={allItemsPanelRef}
+        className="inventory-view-panel"
+        id="inventory-panel-all"
+        role="tabpanel"
+        aria-labelledby="inventory-tab-all"
+        tabIndex={activeView === "all" ? 0 : -1}
+        hidden={activeView !== "all"}
+        onFocusCapture={() => {
+          focusWasWithinActivePanel.current = true;
+        }}
+        onBlurCapture={(event) => {
+          if (
+            event.relatedTarget instanceof Node &&
+            !event.currentTarget.contains(event.relatedTarget)
+          ) {
+            focusWasWithinActivePanel.current = false;
+          }
+        }}
+      >
+        {activeView === "all" && renderInventoryLedger()}
+      </div>
+
+      <div
+        ref={worthMoreAsGemsPanelRef}
+        className="inventory-view-panel"
+        id="inventory-panel-worth-gems"
+        role="tabpanel"
+        aria-labelledby="inventory-tab-worth-gems"
+        tabIndex={activeView === "worth-more-as-gems" ? 0 : -1}
+        hidden={activeView !== "worth-more-as-gems"}
+        onFocusCapture={() => {
+          focusWasWithinActivePanel.current = true;
+        }}
+        onBlurCapture={(event) => {
+          if (
+            event.relatedTarget instanceof Node &&
+            !event.currentTarget.contains(event.relatedTarget)
+          ) {
+            focusWasWithinActivePanel.current = false;
+          }
+        }}
+      >
+        {activeView === "worth-more-as-gems" && (
+          <>
+            <p
+              className="visually-hidden"
+              role="status"
+              aria-label="Worth more as gems result count"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {worthMoreAsGemsItems.length === 0
+                ? "No item types are currently worth more as gems."
+                : `${INVENTORY_COUNT_FORMATTER.format(
+                  worthMoreAsGemsItems.length
+                )} item ${worthMoreAsGemsItems.length === 1 ? "type is" : "types are"
+                } currently worth more as gems.`}
+            </p>
+            <p className="inventory-view-explanation">
+              Worth more as gems compares each trading card&apos;s per-card gem
+              cash value against its current lowest-sell market price. Missing
+              values are excluded from this view.
+            </p>
+            {activeItems.length === 0 ? (
+              <div className="inventory-filtered-empty">
+                <h4>No items are worth more as gems</h4>
+                <p>
+                  No marketable trading card with both a gem cash value and a
+                  current lowest-sell market price currently qualifies. Review
+                  All items to see every returned item type.
+                </p>
+              </div>
+            ) : (
+              renderInventoryLedger()
+            )}
+          </>
+        )}
+      </div>
+
     </section>
   );
 }
