@@ -53,6 +53,8 @@ _PRIVATE_INVENTORY_MESSAGE = (
     "(403) (403)"
 )
 MAX_RETRY_AFTER_SECONDS = 900
+BOOSTER_CARD_COUNT = 3
+
 
 # Inventory pages are normally 2,000 assets.  These bounds leave room for
 # unusually large inventories while stopping provider-controlled amplification.
@@ -113,6 +115,16 @@ class InventoryPrice(BaseModel):
         pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
     )
     observed_at: str | None = None
+
+
+class BoosterInfo(BaseModel):
+    game_app_id: str = Field(pattern=r"^[0-9]+$")
+    game_name: str | None = Field(default=None, max_length=MAX_INVENTORY_TEXT_LENGTH)
+    market_hash_name: str | None = Field(
+        default=None, max_length=MAX_PRICE_STREAM_SCALAR_LENGTH
+    )
+    card_count: Literal[3] = BOOSTER_CARD_COUNT
+    price: InventoryPrice | None = None
 
 
 class GemCashContext(BaseModel):
@@ -210,6 +222,7 @@ class InventoryCheck(CheckResult):
     price_status: PriceStatus = "unavailable"
     price_message: str = "Steam item prices are unavailable."
     items: list[InventoryItem] = Field(default_factory=list)
+    boosters: list[BoosterInfo] = Field(default_factory=list)
 
     gem_status: GemStatus = "unavailable"
     gem_message: str = "Gem prices are unavailable."
@@ -638,6 +651,62 @@ def _gem_group_representatives(
         ):
             groups[key] = market_hash_name
     return groups
+
+
+def _booster_market_hash_name(game_app_id: str, game_name: str) -> str:
+    return f"{game_app_id}-{game_name} Booster Pack"
+
+
+def _booster_games(items: list[InventoryItem]) -> list[tuple[str, str | None]]:
+    games: dict[str, str | None] = {}
+    for item in items:
+        if item.item_type != "trading_card" or item.game_app_id is None:
+            continue
+        game_name = item.game_name.strip() if item.game_name is not None else None
+        if game_name == "":
+            game_name = None
+        existing = games.get(item.game_app_id)
+        if item.game_app_id not in games or (
+            game_name is not None
+            and (
+                existing is None
+                or (game_name.casefold(), game_name) < (existing.casefold(), existing)
+            )
+        ):
+            games[item.game_app_id] = game_name
+    return sorted(
+        games.items(),
+        key=lambda entry: (
+            (entry[1] or "").casefold(),
+            len(entry[0]),
+            entry[0],
+        ),
+    )
+
+
+def _booster_infos(
+    games: list[tuple[str, str | None]],
+    prices: Mapping[str, InventoryPrice],
+) -> list[BoosterInfo]:
+    boosters: list[BoosterInfo] = []
+    for game_app_id, game_name in games:
+        market_hash_name = (
+            _booster_market_hash_name(game_app_id, game_name)
+            if game_name is not None
+            else None
+        )
+        boosters.append(
+            BoosterInfo(
+                game_app_id=game_app_id,
+                game_name=game_name,
+                market_hash_name=market_hash_name,
+                card_count=BOOSTER_CARD_COUNT,
+                price=prices.get(market_hash_name)
+                if market_hash_name is not None
+                else None,
+            )
+        )
+    return boosters
 
 
 def _unavailable_inventory(
@@ -1172,8 +1241,16 @@ class SteamApisClient:
             # The sack is a reference price, not an inventory row and therefore
             # does not affect ordinary SteamApis coverage counts.
             priceable_names.add(SACK_OF_GEMS_MARKET_HASH_NAME)
+        booster_games = _booster_games(items)
+        booster_names = {
+            _booster_market_hash_name(game_app_id, game_name)
+            for game_app_id, game_name in booster_games
+            if game_name is not None
+        }
         try:
-            price_lookup = await self.fetch_prices(frozenset(priceable_names))
+            price_lookup = await self.fetch_prices(
+                frozenset(priceable_names | booster_names)
+            )
         except _PRICE_STREAM_JSON_ERRORS:
             price_lookup = _unavailable_price_lookup()
         except (
@@ -1186,6 +1263,7 @@ class SteamApisClient:
             RuntimeError,
         ):
             price_lookup = _unavailable_price_lookup()
+        boosters = _booster_infos(booster_games, price_lookup.prices)
         for index, item in enumerate(items):
             if not item.marketable or item.market_hash_name is None:
                 continue
@@ -1265,6 +1343,7 @@ class SteamApisClient:
             if any(item.item_type == "trading_card" for item in items)
             else None,
             items=items,
+            boosters=boosters,
         )
 
     async def fetch_prices(self, requested_names: frozenset[str]) -> _PriceLookup:

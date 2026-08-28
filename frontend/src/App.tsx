@@ -23,6 +23,14 @@ type InventoryPrice = {
   observed_at: string | null;
 };
 
+type BoosterInfo = {
+  game_app_id: string;
+  game_name: string | null;
+  market_hash_name: string | null;
+  card_count: 3;
+  price: InventoryPrice | null;
+};
+
 type GemCashContext = {
   currency: null;
   basis: "lowest_sell";
@@ -83,6 +91,7 @@ type InventoryCheck = VisibilityCheck & {
   gem_rate_limited: boolean;
   gem_retry_after_seconds: number | null;
   gem_cash_context: GemCashContext | null;
+  boosters: BoosterInfo[];
   items: InventoryItem[];
 };
 
@@ -274,6 +283,37 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
   );
 }
 
+function isBoosterInfo(value: unknown): value is BoosterInfo {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const booster = value as Partial<BoosterInfo>;
+  if (
+    !isDecimalString(booster.game_app_id) ||
+    !(
+      booster.game_name === null ||
+      (typeof booster.game_name === "string" &&
+        booster.game_name.trim().length > 0)
+    ) ||
+    !(
+      booster.market_hash_name === null ||
+      (typeof booster.market_hash_name === "string" &&
+        booster.market_hash_name.length > 0)
+    ) ||
+    booster.card_count !== 3 ||
+    (booster.price !== null && !isInventoryPrice(booster.price))
+  ) {
+    return false;
+  }
+
+  return (
+    (booster.market_hash_name === null || booster.game_name !== null) &&
+    (booster.price === null || booster.market_hash_name !== null)
+  );
+}
+
+
 function isGemCashContext(value: unknown): value is GemCashContext {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -412,6 +452,7 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     typeof check.gem_cash_context === "undefined" ||
     (check.gem_cash_context !== null &&
       !isGemCashContext(check.gem_cash_context)) ||
+    !Array.isArray(check.boosters) ||
     !Array.isArray(check.items)
   ) {
     return false;
@@ -421,7 +462,20 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
     return false;
   }
 
+  const boosterKeys = new Set<string>();
+  for (const booster of check.boosters) {
+    if (!isBoosterInfo(booster)) {
+      return false;
+    }
+    const boosterKey = booster.game_app_id;
+    if (boosterKeys.has(boosterKey)) {
+      return false;
+    }
+    boosterKeys.add(boosterKey);
+  }
+
   const itemKeys = new Set<string>();
+  const tradingCardGameIds = new Set<string>();
   let totalAssetCount = 0;
   let marketableItemCount = 0;
   let pricedItemCount = 0;
@@ -458,6 +512,9 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
 
     if (item.item_type === "trading_card") {
       tradingCardCount += 1;
+      if (item.game_app_id !== null) {
+        tradingCardGameIds.add(item.game_app_id);
+      }
       if (item.gem_yield !== null) {
         gemPricedItemCount += 1;
       }
@@ -496,6 +553,7 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
   }
 
   if (
+    [...boosterKeys].some((gameAppId) => !tradingCardGameIds.has(gameAppId)) ||
     gemCashValueCount > gemPricedItemCount ||
     (gemCashValueCount > 0 && check.gem_cash_context === null) ||
     (tradingCardCount === 0 && check.gem_cash_context !== null)
@@ -1554,6 +1612,81 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   );
 }
 
+function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
+  return (
+    <section
+      className="booster-coverage"
+      aria-labelledby="booster-coverage-title"
+    >
+      <div className="booster-coverage-heading">
+        <div>
+          <p className="section-label">Booster packs</p>
+          <h3 id="booster-coverage-title">Booster details by game</h3>
+        </div>
+        <p>
+          {INVENTORY_COUNT_FORMATTER.format(boosters.length)} game
+          {boosters.length === 1 ? "" : "s"} with trading-card data
+        </p>
+      </div>
+      <p className="booster-coverage-copy">
+        Every Steam booster pack contains three trading cards. Prices are
+        read-only SteamApis order-book values, and this feed does not identify
+        the currency.
+      </p>
+      <div className="booster-grid">
+        {boosters.map((booster) => {
+          const gameLabel =
+            booster.game_name?.trim() || `App ID ${booster.game_app_id}`;
+          const headingId = `booster-game-${booster.game_app_id}`;
+          const lowestSell = booster.price?.lowest_sell;
+          const highestBuy = booster.price?.highest_buy;
+          const observedAt = booster.price?.observed_at;
+
+          return (
+            <article
+              className="booster-card"
+              key={booster.game_app_id}
+              aria-labelledby={headingId}
+            >
+              <div className="booster-card-heading">
+                <div>
+                  <h4 id={headingId}>{gameLabel}</h4>
+                  <p>App ID {booster.game_app_id}</p>
+                </div>
+                <span className="booster-card-count">
+                  {INVENTORY_COUNT_FORMATTER.format(booster.card_count)} cards
+                </span>
+              </div>
+              <dl className="booster-summary">
+                <div>
+                  <dt>Lowest sell</dt>
+                  <dd>{lowestSell ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Highest buy</dt>
+                  <dd>{highestBuy ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Cards per booster</dt>
+                  <dd>{INVENTORY_COUNT_FORMATTER.format(booster.card_count)}</dd>
+                </div>
+              </dl>
+              {typeof observedAt === "string" && observedAt.length > 0 && (
+                <p className="booster-observed-at">
+                  Price observed{" "}
+                  <time dateTime={observedAt}>
+                    {formatPriceTimestamp(observedAt)}
+                  </time>
+                </p>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function InventoryResults({
   inventory,
   isRefreshingGems,
@@ -1734,7 +1867,9 @@ function InventoryResults({
           </div>
         </dl>
       </section>
-
+      {inventory.boosters.length > 0 && (
+        <BoosterResults boosters={inventory.boosters} />
+      )}
       {inventory.items.length > 0 ? (
         <InventoryBrowser
           key={inventory.unique_item_count}

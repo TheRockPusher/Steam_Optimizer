@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 import app.steam_gateway as steam_gateway
-from app.gem_pricing import GemPriceCache, GemPricingService
+from app.gem_pricing import CardRarity, GemPriceCache, GemPricingService, GemScanResult
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -140,6 +140,14 @@ class FakeHTTPClient:
         yield self.stream_response
 
 
+class NoopGemPricing:
+    async def resolve(
+        self, groups: Mapping[tuple[str, CardRarity], str | None]
+    ) -> GemScanResult:
+        del groups
+        return GemScanResult(values={})
+
+
 class MinimalClient:
     def __init__(self) -> None:
         self.closed = False
@@ -197,8 +205,9 @@ def item_description(
     icon_url: str | None = None,
     marketable: object = 0,
     tradable: object = 1,
+    tags: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    return {
+    description: dict[str, object] = {
         "classid": class_id,
         "instanceid": instance_id,
         "name": name,
@@ -207,6 +216,23 @@ def item_description(
         "marketable": marketable,
         "tradable": tradable,
     }
+    if tags is not None:
+        description["tags"] = tags
+    return description
+
+
+def trading_card_tags(
+    app_id: str = "440", game_name: str = "Team Fortress 2"
+) -> list[dict[str, object]]:
+    return [
+        {"category": "item_class", "internal_name": "item_class_2"},
+        {
+            "category": "Game",
+            "internal_name": f"app_{app_id}",
+            "localized_tag_name": game_name,
+        },
+        {"category": "cardborder", "internal_name": "cardborder_0"},
+    ]
 
 
 def item_asset(
@@ -693,6 +719,68 @@ def test_price_coverage_is_per_row_and_nonmarketable_rows_stay_unpriced() -> Non
     assert by_id["2"].price is not None
     assert by_id["3"].price is None
     assert by_id["4"].price is None
+
+
+def test_inventory_includes_booster_price_and_card_count() -> None:
+    card_market_hash_name = "440-Test Card (Trading Card)"
+    booster_market_hash_name = "440-Team Fortress 2 Booster Pack"
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset("1")],
+                    descriptions=[
+                        item_description(
+                            "1",
+                            "Test Card",
+                            market_hash_name=card_market_hash_name,
+                            marketable=1,
+                            tags=trading_card_tags(),
+                        )
+                    ],
+                ),
+            ),
+            FakeResponse(
+                302,
+                headers={
+                    "Location": "https://prices.r2.cloudflarestorage.com/items.json"
+                },
+            ),
+        ],
+        stream_response=FakeResponse(
+            200,
+            chunks=[
+                b'{"items":['
+                b'{"marketHashName":"440-Test Card (Trading Card)",'
+                b'"orderBook":{"highestBuy":"0.10","lowestSell":"0.20"},'
+                b'"updatedAt":1787788800000},'
+                b'{"marketHashName":"440-Team Fortress 2 Booster Pack",'
+                b'"orderBook":{"highestBuy":"0.11","lowestSell":"0.13"},'
+                b'"updatedAt":1787788800000}'
+                b"]}"
+            ],
+        ),
+    )
+    steamapis = SteamApisClient(
+        settings(),
+        http_client=client,
+        gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+    )
+
+    result = run(steamapis.fetch_inventory("42"))
+
+    assert result.status == "public"
+    assert len(result.boosters) == 1
+    booster = result.boosters[0]
+    assert booster.game_app_id == "440"
+    assert booster.game_name == "Team Fortress 2"
+    assert booster.market_hash_name == booster_market_hash_name
+    assert booster.card_count == 3
+    assert booster.price is not None
+    assert booster.price.highest_buy == "0.11"
+    assert booster.price.lowest_sell == "0.13"
+    assert booster.price.observed_at == "2026-08-27T00:00:00Z"
 
 
 def test_truncated_bulk_json_preserves_public_inventory() -> None:
