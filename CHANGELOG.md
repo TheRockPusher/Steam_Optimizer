@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.5.0
+
+
+### Documentation
+- Update changelog for v0.4.0
+
+
+### Features
+- Add inventory result tabs
+
+
+### Maintenance
+- Prepare release v0.5.0
+
 ## v0.4.0
 
 
