@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.7.1
+
+
+### Bug Fixes
+- Restore gem values from Steam inventory
+
+
+### Documentation
+- Update changelog for v0.7.0
+
+
+### Maintenance
+- Prepare release v0.7.1
+
 ## v0.7.0
 
 
