@@ -29,6 +29,8 @@ Conventional Commits with [git-cliff](https://git-cliff.org/).
   gem and provider-denominated cash-value columns.
 - Add a signed-in circular gem refresh control that reads completed background-cache values
   without refetching the Steam profile, inventory, or market feed.
+- Add an accessible `Worth more as gems` inventory tab that compares exact per-card gem cash values
+  with current lowest-sell market prices and excludes equal or incomplete comparisons.
 - Keep the optional Steam Web API profile key server-only.
 - Configure all Railway services and future Railway processes in EU-West
   (`europe-west4-drams3a`).

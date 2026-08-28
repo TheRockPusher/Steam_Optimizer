@@ -92,6 +92,15 @@ const validInventoryPrice = {
   observed_at: null
 };
 
+const validGemCashContext = {
+  currency: null,
+  basis: "lowest_sell",
+  market_hash_name: "753-Sack of Gems",
+  sack_gems: 1000,
+  sack_price: "100.01",
+  observed_at: null
+};
+
 function publicInventory(
   items: unknown[],
   overrides: Record<string, unknown> = {}
@@ -361,6 +370,481 @@ describe("App", () => {
     expect(
       within(nonmarketableRow as HTMLElement).getAllByText("Not applicable")
     ).toHaveLength(5);
+  });
+
+  it("filters cards by exact per-card gem cash value above lowest sell", async () => {
+    const eligibleCard = tradingCardItem(1, {
+      name: "Gem-positive card",
+      market_hash_name: "Gem-positive card",
+      game_app_id: "1001",
+      game_name: "Gem-positive game",
+      gem_yield: 20,
+      gem_cash_value: "2.0002",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "2.0000"
+      }
+    });
+    const highestBuyOnlyCard = tradingCardItem(2, {
+      name: "Highest-buy-only card",
+      market_hash_name: "Highest-buy-only card",
+      game_app_id: "1002",
+      game_name: "Highest-buy-only game",
+      gem_yield: 11,
+      gem_cash_value: "1.10011",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "1.0000",
+        lowest_sell: "2.0000"
+      }
+    });
+    const equalValueCard = tradingCardItem(3, {
+      name: "Equal-value card",
+      market_hash_name: "Equal-value card",
+      game_app_id: "1003",
+      game_name: "Equal-value game",
+      gem_yield: 10,
+      gem_cash_value: "1.0001",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "1.00010"
+      }
+    });
+    const lowerValueCard = tradingCardItem(4, {
+      name: "Lower-value card",
+      market_hash_name: "Lower-value card",
+      game_app_id: "1004",
+      game_name: "Lower-value game",
+      gem_yield: 9,
+      gem_cash_value: "0.90009",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "0.9001"
+      }
+    });
+    const missingGemValueCard = tradingCardItem(5, {
+      name: "Missing-gem-value card",
+      market_hash_name: "Missing-gem-value card",
+      game_app_id: "1005",
+      game_name: "Missing-gem-value game",
+      gem_yield: null,
+      gem_cash_value: null,
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "0.0100"
+      }
+    });
+    const missingLowestSellCard = tradingCardItem(6, {
+      name: "Missing-lowest-sell card",
+      market_hash_name: "Missing-lowest-sell card",
+      game_app_id: "1006",
+      game_name: "Missing-lowest-sell game",
+      gem_yield: 10,
+      gem_cash_value: "1.0001",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.0100",
+        lowest_sell: null
+      }
+    });
+    const nonmarketableCard = tradingCardItem(9, {
+      name: "Nonmarketable gem-rich card",
+      market_hash_name: "Nonmarketable gem-rich card",
+      game_app_id: "1007",
+      game_name: "Nonmarketable game",
+      gem_yield: 20,
+      gem_cash_value: "2.0002",
+      marketable: false,
+      price: null
+    });
+
+    const inventory = publicInventory(
+      [
+        eligibleCard,
+        highestBuyOnlyCard,
+        equalValueCard,
+        lowerValueCard,
+        missingGemValueCard,
+        missingLowestSellCard,
+        nonmarketableCard
+      ],
+      {
+        total_asset_count: 7,
+        unique_item_count: 7,
+        priceable_item_count: 6,
+        priced_item_count: 6,
+        price_status: "complete",
+        price_message: "Current prices were found for every marketable type.",
+        gem_status: "partial",
+        gem_message: "One trading card does not have a current gem value.",
+        gem_priceable_item_count: 7,
+        gem_priced_item_count: 6,
+        gem_cash_context: validGemCashContext
+      }
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const allTab = await screen.findByRole("tab", { name: /^All items/ });
+    const worthMoreTab = screen.getByRole("tab", {
+      name: /^Worth more as gems/
+    });
+    fireEvent.click(worthMoreTab);
+
+    expect(worthMoreTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByText(
+        /Worth more as gems compares each trading card.*current lowest-sell market price/i
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Missing values are excluded from this view/i)
+    ).toBeInTheDocument();
+    const filteredTable = screen.getByRole("table", {
+      name: "Inventory items"
+    });
+    const filteredRows = filteredTable.querySelectorAll("tr.inventory-item");
+    expect(filteredRows).toHaveLength(1);
+    expect(
+      within(filteredRows[0] as HTMLElement).getByText("Gem-positive card")
+    ).toBeInTheDocument();
+    for (const excludedName of [
+      "Highest-buy-only card",
+      "Equal-value card",
+      "Lower-value card",
+      "Missing-gem-value card",
+      "Missing-lowest-sell card",
+      "Nonmarketable gem-rich card"
+    ]) {
+      expect(
+        within(filteredTable).queryByText(excludedName, { exact: true })
+      ).not.toBeInTheDocument();
+    }
+
+    fireEvent.click(allTab);
+
+    expect(allTab).toHaveAttribute("aria-selected", "true");
+    const restoredTable = screen.getByRole("table", {
+      name: "Inventory items"
+    });
+    expect(restoredTable.querySelectorAll("tr.inventory-item")).toHaveLength(7);
+    expect(
+      within(restoredTable).getByText("Highest-buy-only card")
+    ).toBeInTheDocument();
+    expect(
+      within(restoredTable).getByText("Equal-value card")
+    ).toBeInTheDocument();
+  });
+
+  it("connects inventory tabs to panels and activates wrapped keyboard focus", async () => {
+    const accessibleCard = tradingCardItem(7, {
+      name: "Accessible card",
+      market_hash_name: "Accessible card",
+      game_app_id: "2001",
+      game_name: "Accessible game",
+      gem_yield: 10,
+      gem_cash_value: "1.0001",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "0.5000"
+      }
+    });
+    const inventory = publicInventory([accessibleCard], {
+      total_asset_count: 1,
+      unique_item_count: 1,
+      priceable_item_count: 1,
+      priced_item_count: 1,
+      price_status: "complete",
+      price_message: "Current prices were found for every marketable type.",
+      gem_status: "complete",
+      gem_message: "Gem values were found for every trading card.",
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_cash_context: validGemCashContext
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory views"
+    });
+    const allTab = within(tablist).getByRole("tab", { name: /^All items/ });
+    const worthMoreTab = within(tablist).getByRole("tab", {
+      name: /^Worth more as gems/
+    });
+    const allPanel = document.getElementById("inventory-panel-all");
+    const worthMorePanel = document.getElementById(
+      "inventory-panel-worth-gems"
+    );
+
+    expect(allPanel).not.toBeNull();
+    expect(worthMorePanel).not.toBeNull();
+    expect(allTab).toHaveAttribute("id", "inventory-tab-all");
+    expect(allTab).toHaveAttribute("aria-controls", "inventory-panel-all");
+    expect(allTab).toHaveAttribute("aria-selected", "true");
+    expect(allTab).toHaveAttribute("tabindex", "0");
+    expect(worthMoreTab).toHaveAttribute("id", "inventory-tab-worth-gems");
+    expect(worthMoreTab).toHaveAttribute(
+      "aria-controls",
+      "inventory-panel-worth-gems"
+    );
+    expect(worthMoreTab).toHaveAttribute("aria-selected", "false");
+    expect(worthMoreTab).toHaveAttribute("tabindex", "-1");
+    expect(allPanel).toHaveAttribute("role", "tabpanel");
+    expect(allPanel).toHaveAttribute("aria-labelledby", "inventory-tab-all");
+    expect(allPanel).toHaveAttribute("tabindex", "0");
+    expect(allPanel).not.toHaveAttribute("hidden");
+    expect(worthMorePanel).toHaveAttribute("role", "tabpanel");
+    expect(worthMorePanel).toHaveAttribute(
+      "aria-labelledby",
+      "inventory-tab-worth-gems"
+    );
+    expect(worthMorePanel).toHaveAttribute("hidden");
+    expect(worthMorePanel?.querySelector("table")).toBeNull();
+
+    fireEvent.click(worthMoreTab);
+
+    expect(worthMoreTab).toHaveAttribute("aria-selected", "true");
+    expect(allTab).toHaveAttribute("aria-selected", "false");
+    expect(allPanel).toHaveAttribute("hidden");
+    expect(worthMorePanel).not.toHaveAttribute("hidden");
+    expect(worthMorePanel).toHaveAttribute("tabindex", "0");
+    expect(screen.getAllByRole("table", { name: "Inventory items" })).toHaveLength(
+      1
+    );
+    expect(document.querySelectorAll("table.inventory-table")).toHaveLength(1);
+
+    allTab.focus();
+    fireEvent.keyDown(allTab, { key: "ArrowLeft" });
+    expect(worthMoreTab).toHaveAttribute("aria-selected", "true");
+    expect(worthMoreTab).toHaveFocus();
+
+    fireEvent.keyDown(worthMoreTab, { key: "Home" });
+    expect(allTab).toHaveAttribute("aria-selected", "true");
+    expect(allTab).toHaveFocus();
+
+    fireEvent.keyDown(allTab, { key: "End" });
+    expect(worthMoreTab).toHaveAttribute("aria-selected", "true");
+    expect(worthMoreTab).toHaveFocus();
+
+    fireEvent.keyDown(worthMoreTab, { key: "ArrowRight" });
+    expect(allTab).toHaveAttribute("aria-selected", "true");
+    expect(allTab).toHaveFocus();
+  });
+
+  it("normalizes filtered pagination and announces refresh-driven result changes", async () => {
+    const cards = Array.from({ length: 101 }, (_, index) =>
+      tradingCardItem(100 + index, {
+        name: `Refresh card ${index + 1}`,
+        market_hash_name: `Refresh card ${index + 1}`,
+        game_app_id: "440",
+        game_name: "Refresh game",
+        gem_yield: 20,
+        gem_cash_value: "2.0002",
+        marketable: true,
+        price: {
+          ...validInventoryPrice,
+          highest_buy: "0.5000",
+          lowest_sell: "1.0000"
+        }
+      })
+    );
+    const inventory = publicInventory(cards, {
+      total_asset_count: cards.length,
+      unique_item_count: cards.length,
+      priceable_item_count: cards.length,
+      priced_item_count: cards.length,
+      price_status: "complete",
+      price_message: "Current prices were found for every marketable type.",
+      gem_status: "complete",
+      gem_message: "Gem values were found for every trading card.",
+      gem_priceable_item_count: cards.length,
+      gem_priced_item_count: cards.length,
+      gem_cash_context: validGemCashContext
+    });
+    let resolveShrink!: (response: Response) => void;
+    const shrinkResponse = new Promise<Response>((resolve) => {
+      resolveShrink = resolve;
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(publicInventorySession(inventory)))
+      .mockImplementationOnce(() => shrinkResponse)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            {
+              game_app_id: "440",
+              card_rarity: "normal",
+              gem_yield: 20
+            }
+          ],
+          pending_group_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("tab", { name: /^Worth more as gems/ })
+    );
+    const resultStatus = screen.getByRole("status", {
+      name: "Worth more as gems result count"
+    });
+    expect(resultStatus).toHaveTextContent(
+      "101 item types are currently worth more as gems."
+    );
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Inventory page" }),
+      { target: { value: "3" } }
+    );
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Page 3 of 3.");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh gem values" })
+    );
+    const sortButton = screen.getByRole("button", {
+      name: "Sort by Item, ascending"
+    });
+    sortButton.focus();
+    expect(sortButton).toHaveFocus();
+    await act(async () => {
+      resolveShrink(
+        jsonResponse({
+          values: [
+            {
+              game_app_id: "440",
+              card_rarity: "normal",
+              gem_yield: 0
+            }
+          ],
+          pending_group_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+    });
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "No items are worth more as gems"
+      })
+    ).toBeInTheDocument();
+    expect(resultStatus).toHaveTextContent(
+      "No item types are currently worth more as gems."
+    );
+    expect(document.getElementById("inventory-panel-worth-gems")).toHaveFocus();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh gem values" })
+    );
+
+    await screen.findByRole("table", { name: "Inventory items" });
+    expect(resultStatus).toHaveTextContent(
+      "101 item types are currently worth more as gems."
+    );
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Page 1 of 3.");
+    expect(screen.getByRole("combobox", { name: "Inventory page" })).toHaveValue(
+      "1"
+    );
+  });
+
+  it("shows a filtered empty view without a table or pagination for zero matches", async () => {
+    const nonQualifyingCard = tradingCardItem(8, {
+      name: "No-match card",
+      market_hash_name: "No-match card",
+      game_app_id: "3001",
+      game_name: "No-match game",
+      gem_yield: 10,
+      gem_cash_value: "1.0001",
+      marketable: true,
+      price: {
+        ...validInventoryPrice,
+        highest_buy: "0.1000",
+        lowest_sell: "2.0000"
+      }
+    });
+    const inventory = publicInventory([nonQualifyingCard], {
+      total_asset_count: 1,
+      unique_item_count: 1,
+      priceable_item_count: 1,
+      priced_item_count: 1,
+      price_status: "complete",
+      price_message: "Current prices were found for every marketable type.",
+      gem_status: "complete",
+      gem_message: "Gem values were found for every trading card.",
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_cash_context: validGemCashContext
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(publicInventorySession(inventory))
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("tab", { name: /^Worth more as gems/ })
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "No items are worth more as gems"
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /No marketable trading card with both a gem cash value and a current lowest-sell market price currently qualifies/i
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Worth more as gems compares each trading card.*current lowest-sell market price/i
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Missing values are excluded from this view/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("table", { name: "Inventory items" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("navigation", { name: "Inventory pages" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Inventory pagination status" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Inventory page" })
+    ).not.toBeInTheDocument();
+    expect(document.querySelector("table.inventory-table")).toBeNull();
+    expect(document.querySelector("nav.inventory-pagination")).toBeNull();
+    expect(
+      document.querySelector('[aria-label="Inventory pagination status"]')
+    ).toBeNull();
   });
 
   it("sorts every inventory field in both directions and keeps unavailable values last", async () => {
