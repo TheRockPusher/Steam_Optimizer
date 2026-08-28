@@ -294,23 +294,25 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Steam ID 76561198000000001")).toBeInTheDocument();
 
-    const profileCard = screen.getByRole("article", { name: "Steam profile" });
-    expect(within(profileCard).getByText("Public")).toBeInTheDocument();
-    expect(
-      within(profileCard).getByText("Your Steam profile is publicly visible.")
-    ).toBeInTheDocument();
-
-    const inventoryCard = screen.getByRole("article", {
-      name: "Steam inventory"
+    const profileStatus = screen.getByRole("definition", {
+      name: "Steam profile: Public"
     });
-    expect(within(inventoryCard).getByText("Private")).toBeInTheDocument();
+    expect(profileStatus).toBeInTheDocument();
+
+    const inventoryStatus = screen.getByRole("definition", {
+      name: "Steam inventory: Private"
+    });
+    expect(inventoryStatus).toBeInTheDocument();
+
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(inventoryCard).getByText(
-        "Steam reports that this inventory is private."
-      )
+      within(faq).getByText("Your Steam profile is publicly visible.")
     ).toBeInTheDocument();
     expect(
-      within(inventoryCard).getByRole("link", {
+      within(faq).getByText("Steam reports that this inventory is private.")
+    ).toBeInTheDocument();
+    expect(
+      within(faq).getByRole("link", {
         name: /open Steam privacy settings/i
       })
     ).toHaveAttribute("href", "https://steamcommunity.com/my/edit/settings");
@@ -354,26 +356,31 @@ describe("App", () => {
     render(<App />);
 
     const inventoryRegion = await screen.findByRole("region", {
-      name: "Your items"
+      name: "Items and boosters"
     });
+    const pricingSummary = within(inventoryRegion).getByLabelText(
+      "Inventory pricing summary"
+    );
+    expect(within(pricingSummary).getByText("Items")).toBeInTheDocument();
+    expect(within(pricingSummary).getByText("4")).toBeInTheDocument();
+    expect(within(pricingSummary).getByText("1/1")).toBeInTheDocument();
     expect(
-      within(inventoryRegion).getByText(/4 assets.*2 item types/)
-    ).toBeInTheDocument();
-    const coverage = screen.getByRole("region", {
-      name: "Current market snapshot"
-    });
-    expect(within(coverage).getByText("Complete pricing")).toBeInTheDocument();
+      within(pricingSummary).getByRole("button", {
+        name: "Refresh gem values"
+      })
+    ).toBeDisabled();
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "SteamApis price data is available for 1 of 1 marketable item type."
       )
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
-        "SteamApis does not identify the currency; values are shown as received."
+      within(faq).getByText(
+        "SteamApis does not specify the market feed currency. Values are shown exactly as received, without a currency symbol."
       )
     ).toBeInTheDocument();
-    expect(coverage).not.toHaveTextContent("USD");
+    expect(faq).not.toHaveTextContent("USD");
 
     const inventoryTable = screen.getByRole("table", { name: "Inventory items" });
     const pricedRow = within(inventoryTable)
@@ -1440,12 +1447,13 @@ describe("App", () => {
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Current market snapshot"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Partial pricing")).toBeInTheDocument();
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    expect(within(pricingSummary).getByText("1/2")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "SteamApis price data is available for 1 of 2 marketable item types."
       )
     ).toBeInTheDocument();
@@ -1476,20 +1484,21 @@ describe("App", () => {
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Current market snapshot"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Pricing unavailable")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "The inventory is public, but current Steam market prices are unavailable."
       )
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("article", { name: "Steam inventory" })
-    ).toHaveTextContent("Public");
+      screen.getByRole("definition", { name: "Steam inventory: Public" })
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("link", { name: /open Steam privacy settings/i })
+      within(faq).queryByRole("link", {
+        name: /open Steam privacy settings/i
+      })
     ).not.toBeInTheDocument();
   });
 
@@ -1725,14 +1734,16 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByLabelText("Connected Steam account: Alyx");
-    const profileCard = screen.getByRole("article", { name: "Steam profile" });
-
-    expect(within(profileCard).getByText("Unavailable")).toBeInTheDocument();
+    const profileStatus = screen.getByRole("definition", {
+      name: "Steam profile: Unavailable"
+    });
+    expect(profileStatus).toBeInTheDocument();
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(profileCard).getByText("The Steam Web API is not configured.")
+      within(faq).getByText("The Steam Web API is not configured.")
     ).toBeInTheDocument();
-    expect(within(profileCard).getByText(/not a privacy result/i)).toBeInTheDocument();
-    expect(within(profileCard).queryByText("Private")).not.toBeInTheDocument();
+    expect(within(faq).getByText(/not a privacy result/i)).toBeInTheDocument();
+    expect(profileStatus).not.toHaveTextContent("Private");
   });
 
   it("shows the backend 429 copy and rate-limit guidance instead of privacy guidance", async () => {
@@ -1757,25 +1768,24 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByLabelText("Connected Steam account: Alyx");
-    const inventoryCard = screen.getByRole("article", {
-      name: "Steam inventory"
+    const inventoryStatus = screen.getByRole("definition", {
+      name: "Steam inventory: Try later"
     });
-    expect(within(inventoryCard).getByText(rateLimitMessage)).toBeInTheDocument();
-    expect(within(inventoryCard).getByText("Try later")).toBeInTheDocument();
+    expect(inventoryStatus).toBeInTheDocument();
+    const faq = screen.getByRole("region", { name: "About these results" });
+    expect(within(faq).getByText(rateLimitMessage)).toBeInTheDocument();
     expect(
-      within(inventoryCard).getByText(
-        "Steam is temporarily limiting checks. This is not a privacy result."
+      within(faq).getByText(
+        /Steam is temporarily limiting automated checks/i
       )
-    ).toBeInTheDocument();
+    ).toHaveTextContent(/does not mean the inventory is private/i);
     expect(
-      within(inventoryCard).queryByRole("link", {
+      within(faq).queryByRole("link", {
         name: /open Steam privacy settings/i
       })
     ).not.toBeInTheDocument();
     expect(
-      within(inventoryCard).queryByText(
-        /Recheck when the service is available/i
-      )
+      within(faq).queryByText(/Recheck when the service is available/i)
     ).not.toBeInTheDocument();
   });
 
@@ -1952,10 +1962,11 @@ describe("App", () => {
       expect(screen.getByText("Inventory access was checked again.")).toBeInTheDocument();
     });
     expect(
-      within(
-        screen.getByRole("article", { name: "Steam inventory" })
-      ).getByText("Unavailable")
+      screen.getByRole("definition", {
+        name: "Steam inventory: Unavailable"
+      })
     ).toBeInTheDocument();
+
     expect(statusRegion).toHaveTextContent(
       "Recheck complete. Steam profile: Private. Steam inventory: Unavailable."
     );
@@ -1988,9 +1999,9 @@ describe("App", () => {
       screen.getByText(message, { selector: ".action-status" })
     ).toBeInTheDocument();
     expect(
-      within(
-        screen.getByRole("article", { name: "Steam inventory" })
-      ).getByText("Private")
+      screen.getByRole("definition", {
+        name: "Steam inventory: Private"
+      })
     ).toBeInTheDocument();
   });
 
@@ -2062,10 +2073,14 @@ describe("App", () => {
       "Trading cards (game unavailable)",
       "Other inventory items"
     ]);
+    const faq = screen.getByRole("region", { name: "About these results" });
     expect(
-      within(
-        screen.getByRole("region", { name: "Trading-card gem values" })
-      ).getByRole("link", { name: "How gem values work" })
+      within(faq).getByText(
+        "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-card replacement-cost estimate."
+      )
+    ).toBeInTheDocument();
+    expect(
+      within(faq).getByRole("link", { name: "How gem values work" })
     ).toHaveAttribute("href", "/faq#gem-values");
     expect(
       within(screen.getByText("Unknown card").closest("tr") as HTMLElement)
@@ -2152,24 +2167,25 @@ describe("App", () => {
 
     render(<App />);
 
-    const coverage = await screen.findByRole("region", {
-      name: "Trading-card gem values"
+    const faq = await screen.findByRole("region", {
+      name: "About these results"
     });
-    expect(within(coverage).getByText("Partial gem pricing")).toBeInTheDocument();
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    expect(within(pricingSummary).getByText("1/2")).toBeInTheDocument();
     expect(
-      within(coverage).getByText(
+      within(faq).getByText(
         "Gem values are available for 1 of 2 trading-card item types."
       )
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText("One trading-card group is still pending.")
+      within(faq).getByText("One trading-card group is still pending.")
     ).toBeInTheDocument();
     expect(
-      within(coverage).getByText(/rate-limiting gem lookups/i)
+      within(faq).getByText(/rate-limiting gem lookups/i)
     ).toHaveTextContent("try again in 30s");
     expect(
-      within(coverage).getByRole("link", { name: "How gem values work" })
-    ).toHaveAttribute("href", "/faq#gem-values");
+      within(faq).getByText(/lowest-sell basis/i)
+    ).toHaveTextContent(/unknown currency/i);
     const pricedRow = screen.getByText("Card 0001").closest("tr");
     expect(pricedRow).not.toBeNull();
     expect(within(pricedRow as HTMLElement).getByText("0")).toBeInTheDocument();
