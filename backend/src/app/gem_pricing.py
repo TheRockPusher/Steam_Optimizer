@@ -671,6 +671,11 @@ class GemPriceCache:
         if self.path != ":memory:":
             connection.close()
 
+    def initialize(self) -> None:
+        """Validate and migrate the persistent cache before serving requests."""
+        connection = self._connect()
+        self._close(connection)
+
     @staticmethod
     def _sqlite_text(value: object, *, maximum: int) -> str | None:
         if not isinstance(value, str) or not value or len(value) > maximum:
@@ -1291,7 +1296,8 @@ class GemPricingService:
         )
 
     async def start(self) -> None:
-        """Start the single warmer worker; repeated starts are harmless."""
+        """Initialize the cache and start the single warmer worker."""
+        self.cache.initialize()
         self._ensure_started()
 
     async def stop(self) -> None:

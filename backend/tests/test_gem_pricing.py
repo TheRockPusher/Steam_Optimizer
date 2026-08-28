@@ -897,6 +897,26 @@ def resolution_for(
     )
 
 
+def test_service_start_initializes_persistent_cache(tmp_path: Path) -> None:
+    cache_path = tmp_path / "gems.sqlite3"
+    service = GemPricingService(
+        settings(),
+        cache=GemPriceCache(cache_path),
+        provider=ScriptedProvider(),
+    )
+
+    async def exercise() -> None:
+        await service.start()
+        await service.stop()
+
+    run(exercise())
+
+    with sqlite3.connect(cache_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            CACHE_SCHEMA_VERSION,
+        )
+
+
 def test_service_returns_fresh_and_expired_positive_immediately() -> None:
     key: tuple[str, CardRarity] = ("10", "normal")
     stale_key: tuple[str, CardRarity] = ("20", "foil")

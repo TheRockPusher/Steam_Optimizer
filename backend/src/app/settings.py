@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     nonce_future_skew_seconds: int = 60
     steam_request_timeout_seconds: float = 10.0
     steam_bulk_timeout_seconds: float = 120.0
-    gem_price_cache_path: str = "gem_price_cache.sqlite3"
+    gem_price_cache_path: str = ".cache/steam-optimizer/gem_prices.sqlite3"
 
     model_config = SettingsConfigDict(
         env_file=".env",
