@@ -83,6 +83,15 @@ type InventoryViewDefinition = {
   tabId: string;
   panelId: string;
 };
+type InventoryResultView = "items" | "boosters";
+
+type InventoryResultViewDefinition = {
+  key: InventoryResultView;
+  label: string;
+  tabId: string;
+  panelId: string;
+};
+
 
 type InventoryCheck = VisibilityCheck & {
   retry_after_seconds: number | null;
@@ -172,6 +181,21 @@ const INVENTORY_VIEWS: ReadonlyArray<InventoryViewDefinition> = [
     panelId: "inventory-panel-worth-gems"
   }
 ];
+const INVENTORY_RESULT_VIEWS: ReadonlyArray<InventoryResultViewDefinition> = [
+  {
+    key: "items",
+    label: "Items",
+    tabId: "inventory-results-tab-items",
+    panelId: "inventory-results-panel-items"
+  },
+  {
+    key: "boosters",
+    label: "Boosters",
+    tabId: "inventory-results-tab-boosters",
+    panelId: "inventory-results-panel-boosters"
+  }
+];
+
 
 const INVENTORY_COUNT_FORMATTER = new Intl.NumberFormat("en-US");
 const PRICE_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("en-US", {
@@ -1931,6 +1955,25 @@ function InventoryResults({
   refreshMessage: string | null;
   onRefreshGems: () => void;
 }) {
+  const [activeResultView, setActiveResultView] =
+    useState<InventoryResultView>("items");
+  const resultTabRefs = useRef<
+    Record<InventoryResultView, HTMLButtonElement | null>
+  >({
+    items: null,
+    boosters: null
+  });
+
+  function activateResultView(
+    view: InventoryResultView,
+    focusTab = false
+  ) {
+    setActiveResultView(view);
+    if (focusTab) {
+      resultTabRefs.current[view]?.focus();
+    }
+  }
+
   const coverageMessage =
     inventory.priceable_item_count === 0
       ? "No marketable item types require a price lookup."
@@ -2100,23 +2143,109 @@ function InventoryResults({
           </div>
         </dl>
       </section>
-      {inventory.boosters.length > 0 && (
-        <BoosterResults boosters={inventory.boosters} />
-      )}
-      {inventory.items.length > 0 ? (
-        <InventoryBrowser
-          key={inventory.unique_item_count}
-          items={inventory.items}
-        />
-      ) : (
-        <div className="inventory-empty">
-          <h3>No inventory items to display</h3>
-          <p>
-            Steam returned a public inventory with no items. Recheck after your
-            inventory changes.
-          </p>
-        </div>
-      )}
+      <div
+        className="inventory-view-tabs inventory-result-tabs"
+        role="tablist"
+        aria-label="Inventory result views"
+      >
+        {INVENTORY_RESULT_VIEWS.map((view, index) => {
+          const isActive = activeResultView === view.key;
+
+          return (
+            <button
+              key={view.key}
+              ref={(element) => {
+                resultTabRefs.current[view.key] = element;
+              }}
+              className="inventory-view-tab"
+              id={view.tabId}
+              type="button"
+              role="tab"
+              aria-controls={view.panelId}
+              aria-selected={isActive}
+              tabIndex={isActive ? 0 : -1}
+              onClick={() => activateResultView(view.key, true)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  activateResultView(view.key, true);
+                  return;
+                }
+
+                let nextIndex: number | null = null;
+
+                if (event.key === "ArrowLeft") {
+                  nextIndex =
+                    (index - 1 + INVENTORY_RESULT_VIEWS.length) %
+                    INVENTORY_RESULT_VIEWS.length;
+                } else if (event.key === "ArrowRight") {
+                  nextIndex = (index + 1) % INVENTORY_RESULT_VIEWS.length;
+                } else if (event.key === "Home") {
+                  nextIndex = 0;
+                } else if (event.key === "End") {
+                  nextIndex = INVENTORY_RESULT_VIEWS.length - 1;
+                }
+
+                if (nextIndex === null) {
+                  return;
+                }
+
+                event.preventDefault();
+                resultTabRefs.current[
+                  INVENTORY_RESULT_VIEWS[nextIndex].key
+                ]?.focus();
+              }}
+            >
+              {view.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div
+        className="inventory-view-panel"
+        id="inventory-results-panel-items"
+        role="tabpanel"
+        aria-labelledby="inventory-results-tab-items"
+        tabIndex={activeResultView === "items" ? 0 : -1}
+        hidden={activeResultView !== "items"}
+      >
+        {inventory.items.length > 0 ? (
+          <InventoryBrowser
+            key={inventory.unique_item_count}
+            items={inventory.items}
+          />
+        ) : (
+          <div className="inventory-empty">
+            <h3>No inventory items to display</h3>
+            <p>
+              Steam returned a public inventory with no items. Recheck after
+              your inventory changes.
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div
+        className="inventory-view-panel"
+        id="inventory-results-panel-boosters"
+        role="tabpanel"
+        aria-labelledby="inventory-results-tab-boosters"
+        tabIndex={activeResultView === "boosters" ? 0 : -1}
+        hidden={activeResultView !== "boosters"}
+      >
+        {inventory.boosters.length > 0 ? (
+          <BoosterResults boosters={inventory.boosters} />
+        ) : (
+          <div className="inventory-empty">
+            <h3>No booster packs to display</h3>
+            <p>
+              No trading-card games were identified in this inventory, so
+              there are no related booster packs to display.
+            </p>
+          </div>
+        )}
+      </div>
     </section>
   );
 }
