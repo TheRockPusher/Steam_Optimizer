@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Mapping, Sequence
+    from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
     from pathlib import Path
 
 from app.booster_pricing import (
@@ -41,11 +41,21 @@ class FakeResponse:
         self.headers = dict(headers or {})
         self.json_error = json_error
         self.text = ""
+        self.chunks: tuple[bytes, ...] = ()
 
     def json(self) -> object:
         if self.json_error is not None:
             raise self.json_error
         return self.payload
+
+    def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        del chunk_size
+
+        async def chunks() -> AsyncIterator[bytes]:
+            for chunk in self.chunks:
+                yield chunk
+
+        return chunks()
 
 
 class FakeHTTPClient:
@@ -55,6 +65,7 @@ class FakeHTTPClient:
     ) -> None:
         self.responses = list(responses)
         self.get_calls: list[dict[str, object]] = []
+        self.stream_response: FakeResponse | None = None
 
     async def get(
         self,
@@ -80,6 +91,30 @@ class FakeHTTPClient:
         if isinstance(response, BaseException):
             raise response
         return response
+
+    async def post(
+        self,
+        url: str,
+        *,
+        data: Mapping[str, str],
+    ) -> FakeResponse:
+        del url, data
+        raise AssertionError
+
+    @asynccontextmanager
+    async def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        follow_redirects: bool = False,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> AsyncIterator[FakeResponse]:
+        del method, url, headers, follow_redirects, timeout
+        if self.stream_response is None:
+            raise AssertionError
+        yield self.stream_response
 
 
 def settings(**overrides: object) -> Settings:
