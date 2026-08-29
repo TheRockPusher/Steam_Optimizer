@@ -559,6 +559,8 @@ def test_live_provider_market_buckets_resolve_exact_gem_values() -> None:
     assert result.gem_status == "complete"
     assert result.gem_priceable_item_count == 4
     assert result.gem_priced_item_count == 4
+    assert result.gem_cash_context is not None
+    assert result.gem_cash_context.currency == "USD"
     by_name = {item.name: item for item in result.items}
     assert result.gem_cash_context is not None
     assert result.gem_cash_context.sack_price == "0.2"
@@ -984,7 +986,7 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
     assert result.items[2].price is not None
     assert result.items[2].price.highest_buy == "0.12"
     assert result.items[2].price.lowest_sell == "0.13"
-    assert result.items[2].price.currency is None
+    assert result.items[2].price.currency == "USD"
     assert result.items[2].price.observed_at == "2026-08-27T00:00:00Z"
     assert client.stream_calls[0]["headers"] is None
     stream_url = client.stream_calls[0]["url"]

@@ -21,8 +21,8 @@ marketable items, and reports explicit price coverage (`complete`, `partial`, or
 names every defined Steam Community item class, preserves independent game, rarity, and card-border
 metadata, and values any item carrying Steam's validated gem-conversion action. Gem cache and refresh
 identity uses the exact application ID, numeric item type, and border color from that action. For each
-identified trading-card game, it also looks up the canonical booster market item and reports its
-provider-denominated order-book values plus Steam's fixed three-card booster-pack size. The React
+identified trading-card game, it also looks up the canonical booster market item and reports
+its USD-denominated order-book values plus Steam's fixed three-card booster-pack size. The React
 interface exposes all retrieved items, booster details, separate price and gem coverage, and the
 inventory cache refresh timestamp.
 
@@ -61,9 +61,9 @@ materialized or retained. Raw feed data, API keys, and redirect URLs are not per
 
 The bulk feed is filtered and joined to marketable inventory items, so some items may have no current
 price and the result can be `partial` or `unavailable` even when the inventory itself is public.
-SteamApis omits currency metadata from its bulk feed. Order-book values are preserved exactly as
-provider-denominated decimals and displayed without a currency symbol. Optimization must not treat
-them as monetary values until an authoritative currency contract or explicit configuration exists.
+SteamApis price-list order-book decimals are treated as USD major-unit amounts, preserved exactly,
+and displayed with an explicit USD label. The endpoint omits currency metadata, so this integration
+contract must be revisited if SteamApis changes its USD source behavior.
 
 Successful public/private inventory results persist on the client in browser IndexedDB, keyed by
 SteamID64, with a schema version and ISO refresh timestamp. A valid matching record avoids another

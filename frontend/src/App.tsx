@@ -57,7 +57,7 @@ type GemKey = {
 };
 
 type InventoryPrice = {
-  currency: null;
+  currency: "USD";
   highest_buy: string | null;
   lowest_sell: string | null;
   observed_at: string | null;
@@ -74,7 +74,7 @@ type BoosterInfo = {
 };
 
 type GemCashContext = {
-  currency: null;
+  currency: "USD";
   basis: "lowest_sell";
   market_hash_name: "753-Sack of Gems";
   sack_gems: 1000;
@@ -463,6 +463,10 @@ function gemCashValueForItem(
     : gemCashValueForYield(item.gem_yield, sackPrice);
 }
 
+function formatUsdAmount(value: string): string {
+  return `USD ${value}`;
+}
+
 
 function isHttpsUrl(value: unknown): value is string {
   if (typeof value !== "string") {
@@ -483,7 +487,7 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
 
   const price = value as Partial<InventoryPrice>;
   return (
-    price.currency === null &&
+    price.currency === "USD" &&
     (price.highest_buy === null ||
       (typeof price.highest_buy === "string" &&
         NONNEGATIVE_DECIMAL_PATTERN.test(price.highest_buy))) &&
@@ -562,7 +566,7 @@ function isGemCashContext(value: unknown): value is GemCashContext {
     (typeof context.highest_buy === "string" &&
       isCanonicalGemDecimal(context.highest_buy));
   return (
-    context.currency === null &&
+    context.currency === "USD" &&
     context.basis === "lowest_sell" &&
     context.market_hash_name === GEM_CASH_MARKET_HASH_NAME &&
     context.sack_gems === GEM_CASH_SACK_SIZE &&
@@ -1591,7 +1595,9 @@ function InventoryItemRow({
   const gemCashValueLabel =
     item.gem_key === null
       ? "Not applicable"
-      : gemCashValue ?? "Unavailable";
+      : gemCashValue === null
+        ? "Unavailable"
+        : formatUsdAmount(gemCashValue);
   const cardBorder =
     item.card_border === null
       ? null
@@ -1649,13 +1655,17 @@ function InventoryItemRow({
       <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Highest buy</span>
         <span>
-          {typeof highestBuy === "string" ? highestBuy : unavailableLabel}
+          {typeof highestBuy === "string"
+            ? formatUsdAmount(highestBuy)
+            : unavailableLabel}
         </span>
       </td>
       <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Lowest sell</span>
         <span>
-          {typeof lowestSell === "string" ? lowestSell : unavailableLabel}
+          {typeof lowestSell === "string"
+            ? formatUsdAmount(lowestSell)
+            : unavailableLabel}
         </span>
       </td>
       <td className="inventory-item-field inventory-observed-at">
@@ -2242,7 +2252,7 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
       <p className="booster-coverage-copy">
         Gem cost is derived from the public normal-card set size. Every Steam
         booster pack contains three cards. Market prices are read-only SteamApis
-        order-book values, and this feed does not identify the currency.
+        order-book values denominated in USD.
       </p>
       <div className="booster-grid">
         {boosters.map((booster) => {
@@ -2271,11 +2281,19 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
               <dl className="booster-summary">
                 <div>
                   <dt>Lowest sell</dt>
-                  <dd>{lowestSell ?? "Unavailable"}</dd>
+                  <dd>
+                    {typeof lowestSell === "string"
+                      ? formatUsdAmount(lowestSell)
+                      : "Unavailable"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Highest buy</dt>
-                  <dd>{highestBuy ?? "Unavailable"}</dd>
+                  <dd>
+                    {typeof highestBuy === "string"
+                      ? formatUsdAmount(highestBuy)
+                      : "Unavailable"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Gem cost</dt>
@@ -2669,8 +2687,8 @@ function InventoryFaq({
             </p>
             <p>{inventoryPriceCoverageMessage(inventory)}</p>
             <p>
-              SteamApis does not specify the market feed currency. Values are
-              shown exactly as received, without a currency symbol.
+              SteamApis market prices are USD decimal amounts. Numeric values
+              are preserved exactly as received and labeled USD.
             </p>
             {inventory.price_message.trim().length > 0 && (
               <p>
@@ -2698,16 +2716,17 @@ function InventoryFaq({
               </p>
             )}
             <p>
-              Gem cash value uses the SteamApis{" "}
+              Gem cash value uses the SteamApis USD{" "}
               {GEM_CASH_BASIS_FEED_LABELS[gemCashBasis]} basis for{" "}
-              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed
-              has unknown currency. Each value is a per-item replacement-cost
-              estimate.
+              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). Each
+              value is a per-item replacement-cost estimate.
             </p>
             {gemCashContext !== null && (
               <p>
                 Current sack price ({GEM_CASH_BASIS_LABELS[gemCashBasis]}):{" "}
-                {selectedSackPrice ?? "Unavailable"}
+                {selectedSackPrice === null
+                  ? "Unavailable"
+                  : formatUsdAmount(selectedSackPrice)}
                 {gemCashContext.observed_at !== null &&
                   gemCashContext.observed_at.length > 0 && (
                     <>
@@ -3692,8 +3711,8 @@ function FaqPage() {
           <section id="market-prices">
             <h2>Where do market prices come from?</h2>
             <p>
-              Market snapshots come from SteamApis and are shown exactly as
-              received. The feed does not identify its currency, and values are
+              Market snapshots come from SteamApis as USD decimal amounts. The
+              numeric values are preserved exactly as received and provide
               context—not sale offers.
             </p>
           </section>
