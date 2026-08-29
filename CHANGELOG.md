@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+
+## Unreleased
+
+### Features
+- Let users choose lowest-sell or highest-buy gem cash valuation.
+
 ## v0.7.2
 
 

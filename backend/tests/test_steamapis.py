@@ -580,11 +580,26 @@ def test_live_provider_market_buckets_resolve_exact_gem_values() -> None:
     assert result.gem_status == "complete"
     assert result.gem_priceable_item_count == 4
     assert result.gem_priced_item_count == 4
+    assert result.gem_cash_context is not None
+    assert result.gem_cash_context.currency == "USD"
     by_name = {item.name: item for item in result.items}
+    assert result.gem_cash_context is not None
+    assert result.gem_cash_context.sack_price == "0.2"
+    assert result.gem_cash_context.highest_buy == "0.1"
     for _, name, _, _, key, gem_yield, _, gem_cash_value in cases:
         assert by_name[name].gem_key == key
         assert by_name[name].gem_yield == gem_yield
         assert by_name[name].gem_cash_value == gem_cash_value
+
+
+def test_gem_cash_context_supports_highest_buy_without_lowest_sell() -> None:
+    context = steam_gateway._gem_cash_context(
+        steam_gateway.InventoryPrice(highest_buy="0.10", lowest_sell=None)
+    )
+
+    assert context is not None
+    assert context.sack_price is None
+    assert context.highest_buy == "0.1"
 
 
 @pytest.mark.parametrize(
@@ -993,7 +1008,7 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
     assert result.items[2].price is not None
     assert result.items[2].price.highest_buy == "0.12"
     assert result.items[2].price.lowest_sell == "0.13"
-    assert result.items[2].price.currency is None
+    assert result.items[2].price.currency == "USD"
     assert result.items[2].price.observed_at == "2026-08-27T00:00:00Z"
     assert client.stream_calls[0]["headers"] is None
     stream_url = client.stream_calls[0]["url"]

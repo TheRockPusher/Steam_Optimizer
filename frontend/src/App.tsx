@@ -31,6 +31,7 @@ type VisibilityCheck = {
 type PriceStatus = "complete" | "partial" | "unavailable";
 
 type GemStatus = "complete" | "partial" | "unavailable";
+type GemCashBasis = "lowest_sell" | "highest_buy";
 
 type ItemType =
   | "badge"
@@ -61,7 +62,7 @@ type GemKey = {
 };
 
 type InventoryPrice = {
-  currency: null;
+  currency: "USD";
   highest_buy: string | null;
   lowest_sell: string | null;
   observed_at: string | null;
@@ -78,11 +79,12 @@ type BoosterInfo = {
 };
 
 type GemCashContext = {
-  currency: null;
+  currency: "USD";
   basis: "lowest_sell";
   market_hash_name: "753-Sack of Gems";
   sack_gems: 1000;
-  sack_price: string;
+  sack_price: string | null;
+  highest_buy: string | null;
   observed_at: string | null;
 };
 
@@ -374,6 +376,14 @@ const GEM_STATUS_LABELS: Record<GemStatus, string> = {
 };
 const GEM_CASH_MARKET_HASH_NAME = "753-Sack of Gems";
 const GEM_CASH_SACK_SIZE = 1000;
+const GEM_CASH_BASIS_LABELS: Record<GemCashBasis, string> = {
+  lowest_sell: "Lowest sell",
+  highest_buy: "Highest buy"
+};
+const GEM_CASH_BASIS_FEED_LABELS: Record<GemCashBasis, string> = {
+  lowest_sell: "lowest-sell",
+  highest_buy: "highest-buy"
+};
 
 const INVENTORY_COLUMNS: ReadonlyArray<{
   field: InventorySortField;
@@ -449,6 +459,25 @@ function gemCashValueForYield(gemYield: number, sackPrice: string): string {
   return decimal.length > 0 ? `${whole}.${decimal}` : whole;
 }
 
+function gemCashValueForItem(
+  item: InventoryItem,
+  context: GemCashContext | null,
+  basis: GemCashBasis
+): string | null {
+  if (item.gem_key === null || item.gem_yield === null || context === null) {
+    return null;
+  }
+  const sackPrice =
+    basis === "lowest_sell" ? context.sack_price : context.highest_buy;
+  return sackPrice === null
+    ? null
+    : gemCashValueForYield(item.gem_yield, sackPrice);
+}
+
+function formatUsdAmount(value: string): string {
+  return `USD ${value}`;
+}
+
 
 function isHttpsUrl(value: unknown): value is string {
   if (typeof value !== "string") {
@@ -469,7 +498,7 @@ function isInventoryPrice(value: unknown): value is InventoryPrice {
 
   const price = value as Partial<InventoryPrice>;
   return (
-    price.currency === null &&
+    price.currency === "USD" &&
     (price.highest_buy === null ||
       (typeof price.highest_buy === "string" &&
         NONNEGATIVE_DECIMAL_PATTERN.test(price.highest_buy))) &&
@@ -539,13 +568,22 @@ function isGemCashContext(value: unknown): value is GemCashContext {
   }
 
   const context = value as Partial<GemCashContext>;
+  const hasValidSackPrice =
+    context.sack_price === null ||
+    (typeof context.sack_price === "string" &&
+      isCanonicalGemDecimal(context.sack_price));
+  const hasValidHighestBuy =
+    context.highest_buy === null ||
+    (typeof context.highest_buy === "string" &&
+      isCanonicalGemDecimal(context.highest_buy));
   return (
-    context.currency === null &&
+    context.currency === "USD" &&
     context.basis === "lowest_sell" &&
     context.market_hash_name === GEM_CASH_MARKET_HASH_NAME &&
     context.sack_gems === GEM_CASH_SACK_SIZE &&
-    typeof context.sack_price === "string" &&
-    isCanonicalGemDecimal(context.sack_price) &&
+    hasValidSackPrice &&
+    hasValidHighestBuy &&
+    (context.sack_price !== null || context.highest_buy !== null) &&
     (typeof context.observed_at === "string" || context.observed_at === null)
   );
 }
@@ -744,15 +782,19 @@ function isInventoryCheck(value: unknown): value is InventoryCheck {
         item.gem_yield !== null &&
         check.gem_cash_context !== null &&
         item.gem_cash_value !==
-        gemCashValueForYield(
-          item.gem_yield,
-          check.gem_cash_context.sack_price
-        )
+        (check.gem_cash_context.sack_price === null
+          ? null
+          : gemCashValueForYield(
+            item.gem_yield,
+            check.gem_cash_context.sack_price
+          ))
       ) {
         return false;
       }
       if (
-        (item.gem_yield === null || check.gem_cash_context === null) &&
+        (item.gem_yield === null ||
+          check.gem_cash_context === null ||
+          check.gem_cash_context.sack_price === null) &&
         item.gem_cash_value !== null
       ) {
         return false;
@@ -1050,16 +1092,14 @@ function mergeGemRefresh(
     if (typeof gemYield !== "number") {
       return item;
     }
+    const sackPrice = inventory.gem_cash_context?.sack_price ?? null;
     return {
       ...item,
       gem_yield: gemYield,
       gem_cash_value:
-        inventory.gem_cash_context === null
+        sackPrice === null
           ? null
-          : gemCashValueForYield(
-            gemYield,
-            inventory.gem_cash_context.sack_price
-          )
+          : gemCashValueForYield(gemYield, sackPrice)
     };
   });
   const boosters = inventory.boosters.map((booster) => {
@@ -1380,18 +1420,28 @@ function compareDecimalStrings(left: string, right: string): number {
     .localeCompare(rightFraction.padEnd(fractionLength, "0"));
 }
 
-function isWorthMoreAsGems(item: InventoryItem): boolean {
+function isWorthMoreAsGems(
+  item: InventoryItem,
+  gemCashContext: GemCashContext | null,
+  gemCashBasis: GemCashBasis
+): boolean {
   if (
     item.gem_key === null ||
     !item.marketable ||
-    item.gem_cash_value === null ||
     item.price === null ||
     item.price.lowest_sell === null
   ) {
     return false;
   }
-
-  return compareDecimalStrings(item.gem_cash_value, item.price.lowest_sell) > 0;
+  const gemCashValue = gemCashValueForItem(
+    item,
+    gemCashContext,
+    gemCashBasis
+  );
+  return (
+    gemCashValue !== null &&
+    compareDecimalStrings(gemCashValue, item.price.lowest_sell) > 0
+  );
 }
 
 function comparePriceTimestamps(left: string, right: string): number {
@@ -1429,7 +1479,9 @@ function compareNullableValues<T>(
 function compareInventoryItems(
   left: InventoryItem,
   right: InventoryItem,
-  sort: InventorySort
+  sort: InventorySort,
+  gemCashContext: GemCashContext | null,
+  gemCashBasis: GemCashBasis
 ): number {
   switch (sort.field) {
     case "name":
@@ -1483,8 +1535,8 @@ function compareInventoryItems(
       );
     case "gem_cash_value":
       return compareNullableValues(
-        left.gem_cash_value,
-        right.gem_cash_value,
+        gemCashValueForItem(left, gemCashContext, gemCashBasis),
+        gemCashValueForItem(right, gemCashContext, gemCashBasis),
         sort.direction,
         compareDecimalStrings
       );
@@ -1530,7 +1582,13 @@ function InventoryColumnHeader({
     </th>
   );
 }
-function InventoryItemRow({ item }: { item: InventoryItem }) {
+function InventoryItemRow({
+  item,
+  gemCashValue
+}: {
+  item: InventoryItem;
+  gemCashValue: string | null;
+}) {
   const unavailableLabel = item.marketable ? "Unavailable" : "Not applicable";
   const highestBuy = item.price?.highest_buy;
   const lowestSell = item.price?.lowest_sell;
@@ -1545,10 +1603,12 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
       : item.gem_yield === null
         ? "Unavailable"
         : INVENTORY_COUNT_FORMATTER.format(item.gem_yield);
-  const gemCashValue =
+  const gemCashValueLabel =
     item.gem_key === null
       ? "Not applicable"
-      : item.gem_cash_value ?? "Unavailable";
+      : gemCashValue === null
+        ? "Unavailable"
+        : formatUsdAmount(gemCashValue);
   const cardBorder =
     item.card_border === null
       ? null
@@ -1606,13 +1666,17 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
       <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Highest buy</span>
         <span>
-          {typeof highestBuy === "string" ? highestBuy : unavailableLabel}
+          {typeof highestBuy === "string"
+            ? formatUsdAmount(highestBuy)
+            : unavailableLabel}
         </span>
       </td>
       <td className="inventory-item-field inventory-price-value">
         <span className="inventory-field-label">Lowest sell</span>
         <span>
-          {typeof lowestSell === "string" ? lowestSell : unavailableLabel}
+          {typeof lowestSell === "string"
+            ? formatUsdAmount(lowestSell)
+            : unavailableLabel}
         </span>
       </td>
       <td className="inventory-item-field inventory-observed-at">
@@ -1629,7 +1693,7 @@ function InventoryItemRow({ item }: { item: InventoryItem }) {
       </td>
       <td className="inventory-item-field inventory-gem-cash-value">
         <span className="inventory-field-label">Gem cash value</span>
-        <span>{gemCashValue}</span>
+        <span>{gemCashValueLabel}</span>
       </td>
     </tr>
   );
@@ -1647,7 +1711,9 @@ type InventoryGroup = {
 
 function groupInventoryItems(
   items: InventoryItem[],
-  sort: InventorySort | null
+  sort: InventorySort | null,
+  gemCashContext: GemCashContext | null,
+  gemCashBasis: GemCashBasis
 ): InventoryGroup[] {
   const groupsByKey = new Map<string, InventoryGroup>();
 
@@ -1733,12 +1799,26 @@ function groupInventoryItems(
       sort === null
         ? group.items
         : [...group.items].sort((left, right) =>
-          compareInventoryItems(left, right, sort)
+          compareInventoryItems(
+            left,
+            right,
+            sort,
+            gemCashContext,
+            gemCashBasis
+          )
         )
   }));
 }
 
-function InventoryBrowser({ items }: { items: InventoryItem[] }) {
+function InventoryBrowser({
+  items,
+  gemCashContext,
+  gemCashBasis
+}: {
+  items: InventoryItem[];
+  gemCashContext: GemCashContext | null;
+  gemCashBasis: GemCashBasis;
+}) {
   const [requestedPageIndex, setRequestedPageIndex] = useState(0);
   const [knownPageCount, setKnownPageCount] = useState(() =>
     Math.max(1, Math.ceil(items.length / INVENTORY_PAGE_SIZE))
@@ -1754,8 +1834,11 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   const worthMoreAsGemsPanelRef = useRef<HTMLDivElement>(null);
   const focusWasWithinActivePanel = useRef(false);
   const worthMoreAsGemsItems = useMemo(
-    () => items.filter(isWorthMoreAsGems),
-    [items]
+    () =>
+      items.filter((item) =>
+        isWorthMoreAsGems(item, gemCashContext, gemCashBasis)
+      ),
+    [gemCashBasis, gemCashContext, items]
   );
   const activeItems =
     activeView === "all" ? items : worthMoreAsGemsItems;
@@ -1771,7 +1854,12 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
   const groupedItems = useMemo(
     () =>
       groupByGame
-        ? groupInventoryItems(activeItems, sort)
+        ? groupInventoryItems(
+          activeItems,
+          sort,
+          gemCashContext,
+          gemCashBasis
+        )
         : [
           {
             key: "all",
@@ -1782,11 +1870,17 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
               sort === null
                 ? activeItems
                 : [...activeItems].sort((left, right) =>
-                  compareInventoryItems(left, right, sort)
+                  compareInventoryItems(
+                    left,
+                    right,
+                    sort,
+                    gemCashContext,
+                    gemCashBasis
+                  )
                 )
           }
         ],
-    [activeItems, groupByGame, sort]
+    [activeItems, gemCashBasis, gemCashContext, groupByGame, sort]
   );
   const pageCount = Math.max(
     1,
@@ -1973,6 +2067,11 @@ function InventoryBrowser({ items }: { items: InventoryItem[] }) {
                   <InventoryItemRow
                     key={`${item.class_id}:${item.instance_id}`}
                     item={item}
+                    gemCashValue={gemCashValueForItem(
+                      item,
+                      gemCashContext,
+                      gemCashBasis
+                    )}
                   />
                 ))}
               </tbody>
@@ -2164,7 +2263,7 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
       <p className="booster-coverage-copy">
         Gem cost is derived from the public normal-card set size. Every Steam
         booster pack contains three cards. Market prices are read-only SteamApis
-        order-book values, and this feed does not identify the currency.
+        order-book values denominated in USD.
       </p>
       <div className="booster-grid">
         {boosters.map((booster) => {
@@ -2193,11 +2292,19 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
               <dl className="booster-summary">
                 <div>
                   <dt>Lowest sell</dt>
-                  <dd>{lowestSell ?? "Unavailable"}</dd>
+                  <dd>
+                    {typeof lowestSell === "string"
+                      ? formatUsdAmount(lowestSell)
+                      : "Unavailable"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Highest buy</dt>
-                  <dd>{highestBuy ?? "Unavailable"}</dd>
+                  <dd>
+                    {typeof highestBuy === "string"
+                      ? formatUsdAmount(highestBuy)
+                      : "Unavailable"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Gem cost</dt>
@@ -2238,11 +2345,15 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
 
 function InventoryPricingSummary({
   inventory,
+  gemCashBasis,
   isRefreshingGems,
+  onGemCashBasisChange,
   onRefreshGems
 }: {
   inventory: InventoryCheck;
+  gemCashBasis: GemCashBasis;
   isRefreshingGems: boolean;
+  onGemCashBasisChange: (basis: GemCashBasis) => void;
   onRefreshGems: () => void;
 }) {
   const marketStatusLabel = PRICE_STATUS_LABELS[inventory.price_status];
@@ -2290,6 +2401,25 @@ function InventoryPricingSummary({
           <dd>{gemPricingCount}</dd>
         </div>
       </dl>
+      {inventory.gem_priceable_item_count > 0 && (
+        <label className="gem-cash-basis-picker">
+          <span>Gem cash basis</span>
+          <select
+            aria-label="Gem cash basis"
+            value={gemCashBasis}
+            onChange={(event) => {
+              onGemCashBasisChange(
+                event.currentTarget.value === "highest_buy"
+                  ? "highest_buy"
+                  : "lowest_sell"
+              );
+            }}
+          >
+            <option value="lowest_sell">Lowest sell</option>
+            <option value="highest_buy">Highest buy</option>
+          </select>
+        </label>
+      )}
       <button
         className={`gem-refresh-button${isRefreshingGems ? " gem-refresh-button-active" : ""}`}
         type="button"
@@ -2333,18 +2463,22 @@ function InventoryResults({
   steamId,
   inventoryRefreshedAt,
   isInventoryLoading,
+  gemCashBasis,
   isRefreshingGems,
   refreshMessage,
   onRefreshInventory,
+  onGemCashBasisChange,
   onRefreshGems
 }: {
   inventory: InventoryCheck;
   steamId: string;
   inventoryRefreshedAt: string | null;
   isInventoryLoading: boolean;
+  gemCashBasis: GemCashBasis;
   isRefreshingGems: boolean;
   refreshMessage: string | null;
   onRefreshInventory: () => void;
+  onGemCashBasisChange: (basis: GemCashBasis) => void;
   onRefreshGems: () => void;
 }) {
   const isPublicInventory = inventory.status === "public";
@@ -2378,7 +2512,9 @@ function InventoryResults({
         </div>
         <InventoryPricingSummary
           inventory={inventory}
+          gemCashBasis={gemCashBasis}
           isRefreshingGems={isRefreshingGems}
+          onGemCashBasisChange={onGemCashBasisChange}
           onRefreshGems={onRefreshGems}
         />
       </div>
@@ -2458,6 +2594,8 @@ function InventoryResults({
           <InventoryBrowser
             key={inventory.unique_item_count}
             items={inventory.items}
+            gemCashContext={inventory.gem_cash_context}
+            gemCashBasis={gemCashBasis}
           />
         ) : (
           <div className="inventory-empty">
@@ -2513,17 +2651,25 @@ function InventoryResults({
     </section>
   );
 }
+
 function InventoryFaq({
   profile,
-  inventory
+  inventory,
+  gemCashBasis
 }: {
   profile: VisibilityCheck;
   inventory: InventoryCheck;
+  gemCashBasis: GemCashBasis;
 }) {
   const hasPrivateSurface =
     profile.status === "private" || inventory.status === "private";
   const gemCashContext = inventory.gem_cash_context;
-
+  const selectedSackPrice =
+    gemCashContext === null
+      ? null
+      : gemCashBasis === "lowest_sell"
+        ? gemCashContext.sack_price
+        : gemCashContext.highest_buy;
   return (
     <section className="inventory-faq" aria-labelledby="faq-title">
       <div className="inventory-faq-heading">
@@ -2582,8 +2728,8 @@ function InventoryFaq({
             </p>
             <p>{inventoryPriceCoverageMessage(inventory)}</p>
             <p>
-              SteamApis does not specify the market feed currency. Values are
-              shown exactly as received, without a currency symbol.
+              SteamApis market prices are USD decimal amounts. Numeric values
+              are preserved exactly as received and labeled USD.
             </p>
             {inventory.price_message.trim().length > 0 && (
               <p>
@@ -2611,14 +2757,17 @@ function InventoryFaq({
               </p>
             )}
             <p>
-              Gem cash value uses the SteamApis lowest-sell basis for{" "}
-              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). This feed
-              has unknown currency. Each value is a per-item replacement-cost
-              estimate.
+              Gem cash value uses the SteamApis USD{" "}
+              {GEM_CASH_BASIS_FEED_LABELS[gemCashBasis]} basis for{" "}
+              {GEM_CASH_MARKET_HASH_NAME} ({GEM_CASH_SACK_SIZE} gems). Each
+              value is a per-item replacement-cost estimate.
             </p>
             {gemCashContext !== null && (
               <p>
-                Current sack price: {gemCashContext.sack_price}
+                Current sack price ({GEM_CASH_BASIS_LABELS[gemCashBasis]}):{" "}
+                {selectedSackPrice === null
+                  ? "Unavailable"
+                  : formatUsdAmount(selectedSackPrice)}
                 {gemCashContext.observed_at !== null &&
                   gemCashContext.observed_at.length > 0 && (
                     <>
@@ -2684,6 +2833,8 @@ function SignedInView({
   onRefreshInventory: () => void;
   onRefreshGems: () => void;
 }) {
+  const [gemCashBasis, setGemCashBasis] =
+    useState<GemCashBasis>("lowest_sell");
   const isInventoryRefreshDisabled =
     isRefreshingInventory ||
     inventoryState.isLoading ||
@@ -2752,9 +2903,11 @@ function SignedInView({
           steamId={session.user.steam_id}
           inventoryRefreshedAt={inventoryState.refreshedAt}
           isInventoryLoading={inventoryState.isLoading}
+          gemCashBasis={gemCashBasis}
           isRefreshingGems={isRefreshingGems}
           refreshMessage={gemRefreshMessage}
           onRefreshInventory={onRefreshInventory}
+          onGemCashBasisChange={setGemCashBasis}
           onRefreshGems={onRefreshGems}
         />
       )}
@@ -2762,6 +2915,7 @@ function SignedInView({
         <InventoryFaq
           profile={session.checks.profile}
           inventory={inventoryState.inventory}
+          gemCashBasis={gemCashBasis}
         />
       )}
     </section>
@@ -3602,8 +3756,8 @@ function FaqPage() {
           <section id="market-prices">
             <h2>Where do market prices come from?</h2>
             <p>
-              Market snapshots come from SteamApis and are shown exactly as
-              received. The feed does not identify its currency, and values are
+              Market snapshots come from SteamApis as USD decimal amounts. The
+              numeric values are preserved exactly as received and provide
               context—not sale offers.
             </p>
           </section>
@@ -3612,15 +3766,15 @@ function FaqPage() {
             <h2>How are gem values calculated?</h2>
             <p>
               Steam Community provides the gem yield for eligible inventory
-              items. The cash estimate uses the SteamApis lowest-sell price for{" "}
-              {GEM_CASH_MARKET_HASH_NAME}, divided across{" "}
-              {INVENTORY_COUNT_FORMATTER.format(GEM_CASH_SACK_SIZE)} gems. It is
-              a per-item replacement-cost estimate.
+              items. The cash estimate uses the selected SteamApis lowest-sell
+              or highest-buy price for {GEM_CASH_MARKET_HASH_NAME}, divided
+              across {INVENTORY_COUNT_FORMATTER.format(GEM_CASH_SACK_SIZE)} gems.
+              It is a per-item replacement-cost estimate.
             </p>
             <p>
-              “Worth more as gems” compares that estimate with the item&apos;s
-              current lowest-sell market price. Items missing either value are
-              excluded.
+              “Worth more as gems” compares the selected estimate with the
+              item&apos;s current lowest-sell market price. Items missing either
+              value are excluded.
             </p>
           </section>
 

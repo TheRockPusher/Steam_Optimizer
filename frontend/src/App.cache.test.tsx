@@ -69,11 +69,12 @@ const privateInventory = {
 };
 
 const validGemCashContext = {
-  currency: null,
+  currency: "USD",
   basis: "lowest_sell",
   market_hash_name: "753-Sack of Gems",
   sack_gems: 1000,
   sack_price: "100.01",
+  highest_buy: "50.01",
   observed_at: null
 };
 
@@ -107,7 +108,7 @@ const publicInventory = {
       marketable: true,
       tradable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.10",
         lowest_sell: "0.20",
         observed_at: null
@@ -139,7 +140,7 @@ function jsonResponse(payload: unknown, status = 200) {
 
 function cacheRecord(inventory: unknown) {
   return {
-    schema_version: 2,
+    schema_version: 5,
     steam_id: steamId,
     refreshed_at: "2026-08-28T12:34:56.000Z",
     inventory

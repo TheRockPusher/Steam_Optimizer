@@ -19,11 +19,12 @@ For a public inventory, the inventory endpoint retrieves the complete AppID 753/
 through provider pagination, joins the global normalized AppID 753 market-price generation to
 marketable items, and reports explicit price coverage (`complete`, `partial`, or `unavailable`).
 It names every defined Steam Community item class, preserves independent game, rarity, and
-card-border metadata, and values any item carrying Steam's validated gem-conversion action. For
-each identified trading-card game, it also looks up the canonical booster market item and reports
-its provider-denominated order-book values plus Steam's fixed three-card booster-pack size. The
-React interface exposes all retrieved items, booster details, separate price and gem coverage, and
-the inventory cache refresh timestamp.
+card-border metadata, and values any item carrying Steam's validated gem-conversion action. Gem
+cache and refresh identity uses the exact application ID, numeric item type, and border color from
+that action. For each identified trading-card game, it also looks up the canonical booster market
+item and reports its provider-denominated order-book values plus Steam's fixed three-card
+booster-pack size. The React interface exposes all retrieved items, booster details, separate
+price and gem coverage, and the inventory cache refresh timestamp.
 
 The **Level-up optimization** tab is manual-activation and read-only. It aggregates a bounded
 normal-card ownership snapshot from the current browser inventory record, then sends that

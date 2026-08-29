@@ -80,9 +80,18 @@ The current connection, inventory, and read-only recommendation stage provides:
   Cache-clearing operations also advance a shared IndexedDB epoch so older in-flight requests
   cannot repopulate deleted records. Transient `unavailable` inventory results are not persisted
   and do not replace a prior good result.
+- A global normalized AppID 753 market-price generation persisted in a separate server-side SQLite
+  cache. It is fresh for 24 hours for inventory display, refreshes lazily, has no scheduled refresh
+  job, and keeps the last valid generation as a stale display fallback when refresh fails.
+- Current cached AppID 753 prices are joined to marketable inventory items with explicit
+  `complete`, `partial`, or `unavailable` price coverage.
+- Canonical names and independent game, rarity, and card-border metadata for every Steam Community
+  item class, with gem eligibility derived from Steam's validated conversion action rather than
+  inferred from the class.
 - A responsive inventory interface with separate Items and Boosters views, sortable and paginated
-  item data, game grouping, market-price coverage, and gem-conversion values derived from Steam's
-  validated conversion action.
+  item data, optional game grouping, selectable lowest-sell or highest-buy gem cash valuation, and
+  filtering for marketable gem-convertible items whose selected gem cash value exceeds their
+  current lowest-sell market price.
 - A third, manually activated **Level-up optimization** tab in the **Inventory and level-up
   planning** section. Items remains the default tab, and the optimizer does not request anything
   until the user opens this tab. It requires a public inventory and an eligible ownership
