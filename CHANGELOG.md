@@ -1,11 +1,30 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.8.0
 
-## Unreleased
+
+### Bug Fixes
+- Resolve gem valuation merge conflict
+
+
+### Documentation
+- Update changelog for v0.7.2
+
 
 ### Features
-- Let users choose lowest-sell or highest-buy gem cash valuation.
+- Add level-up swap recommendations
+- Support selectable gem cash valuation basis
+- Label SteamApis prices as USD
+
+
+### Maintenance
+- Merge main and resolve conflicts
+- Prepare release v0.8.0
+
+
+### Testing
+- Satisfy backend type checks
 
 ## v0.7.2
 
