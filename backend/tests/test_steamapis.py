@@ -562,10 +562,23 @@ def test_live_provider_market_buckets_resolve_exact_gem_values() -> None:
     assert result.gem_cash_context is not None
     assert result.gem_cash_context.currency == "USD"
     by_name = {item.name: item for item in result.items}
+    assert result.gem_cash_context is not None
+    assert result.gem_cash_context.sack_price == "0.2"
+    assert result.gem_cash_context.highest_buy == "0.1"
     for _, name, _, _, key, gem_yield, _, gem_cash_value in cases:
         assert by_name[name].gem_key == key
         assert by_name[name].gem_yield == gem_yield
         assert by_name[name].gem_cash_value == gem_cash_value
+
+
+def test_gem_cash_context_supports_highest_buy_without_lowest_sell() -> None:
+    context = steam_gateway._gem_cash_context(
+        steam_gateway.InventoryPrice(highest_buy="0.10", lowest_sell=None)
+    )
+
+    assert context is not None
+    assert context.sack_price is None
+    assert context.highest_buy == "0.1"
 
 
 @pytest.mark.parametrize(

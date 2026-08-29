@@ -90,8 +90,9 @@ The current connection and inventory stage provides:
   Community item class, with gem eligibility derived from Steam's validated conversion action
   rather than inferred from the class.
 - A responsive, sortable inventory interface that paginates all retrieved items, lets users switch
-  game grouping on or off, and filters marketable gem-convertible items whose exact per-item gem
-  cash value exceeds their current lowest-sell market price.
+  game grouping on or off, choose lowest-sell or highest-buy gem cash valuation, and filters
+  marketable gem-convertible items whose selected per-item gem cash value exceeds their current
+  lowest-sell market price.
 
 SteamApis is a third-party provider: inventory availability, response fields, and price snapshots
 depend on provider data and availability and may differ from Steam Community at a given time. A
