@@ -120,6 +120,7 @@ const validGemCashContext = {
   market_hash_name: "753-Sack of Gems",
   sack_gems: 1000,
   sack_price: "100.01",
+  highest_buy: "50.01",
   observed_at: null
 };
 
@@ -2071,6 +2072,7 @@ describe("App", () => {
           market_hash_name: "753-Sack of Gems",
           sack_gems: 1000,
           sack_price: "0.5",
+          highest_buy: "0.25",
           observed_at: "2026-08-27T08:15:00Z"
         }
       }
@@ -2216,6 +2218,98 @@ describe("App", () => {
       within(pendingRow as HTMLElement).getAllByText("Unavailable")
     ).toHaveLength(2);
   });
+
+  it("switches gem cash valuation between lowest sell and highest buy", async () => {
+    const card = tradingCardItem(1, {
+      marketable: true,
+      price: { ...validInventoryPrice, lowest_sell: "0.75" },
+      gem_cash_value: "1.0001"
+    });
+    const inventory = publicInventory([card], {
+      priceable_item_count: 1,
+      priced_item_count: 1,
+      price_status: "complete",
+      gem_status: "complete",
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_cash_context: validGemCashContext
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    await screen.findByRole("table", {
+      name: "Inventory items"
+    });
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    const basisSelect = within(pricingSummary).getByRole("combobox", {
+      name: "Gem cash basis"
+    });
+    const row = () => screen.getByText("Card 0001").closest("tr");
+
+    expect(basisSelect).toHaveValue("lowest_sell");
+    expect(within(row() as HTMLElement).getByText("1.0001")).toBeInTheDocument();
+
+    fireEvent.change(basisSelect, { target: { value: "highest_buy" } });
+
+    expect(basisSelect).toHaveValue("highest_buy");
+    expect(within(row() as HTMLElement).getByText("0.5001")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "About these results" }))
+        .getByText(/highest-buy basis/i)
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("tab", { name: /^Worth more as gems/ })
+    );
+    expect(screen.queryByRole("table", { name: "Inventory items" })).toBeNull();
+
+    fireEvent.change(basisSelect, { target: { value: "lowest_sell" } });
+
+    expect(
+      screen.getByRole("table", { name: "Inventory items" })
+    ).toBeInTheDocument();
+    expect(within(row() as HTMLElement).getByText("1.0001")).toBeInTheDocument();
+  });
+  it("does not use the other sack quote when selected basis is unavailable", async () => {
+    const card = tradingCardItem(1, {
+      gem_cash_value: "1.0001"
+    });
+    const inventory = publicInventory([card], {
+      gem_status: "complete",
+      gem_priceable_item_count: 1,
+      gem_priced_item_count: 1,
+      gem_cash_context: {
+        ...validGemCashContext,
+        highest_buy: null
+      }
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    const row = (await screen.findByText("Card 0001")).closest(
+      "tr"
+    ) as HTMLElement;
+    const pricingSummary = screen.getByLabelText("Inventory pricing summary");
+    const basisSelect = within(pricingSummary).getByRole("combobox", {
+      name: "Gem cash basis"
+    });
+
+    fireEvent.change(basisSelect, { target: { value: "highest_buy" } });
+
+    expect(within(row).getByText("Unavailable")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "About these results" }))
+        .getByText(/Current sack price \(Highest buy\): Unavailable/)
+    ).toBeInTheDocument();
+  });
+
+
   it("refreshes cached gem values without refetching the inventory", async () => {
     const normalCard = tradingCardItem(1, {
       gem_yield: 10,

@@ -55,6 +55,7 @@ STEAM_OPTIMIZER_USER_AGENT = (
     "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
 _CANONICAL_SACK_PRICE_ERROR = "Sack price must be a canonical decimal."
+_GEM_CASH_CONTEXT_QUOTE_ERROR = "At least one sack price quote is required."
 _CANONICAL_GEM_CASH_VALUE_ERROR = "Gem cash value must be a canonical decimal."
 _INVALID_ITEM_GEM_METADATA_ERROR = "Inventory item gem metadata is inconsistent."
 _INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
@@ -164,18 +165,30 @@ class GemCashContext(BaseModel):
     basis: Literal["lowest_sell"] = "lowest_sell"
     market_hash_name: Literal["753-Sack of Gems"] = SACK_OF_GEMS_MARKET_HASH_NAME
     sack_gems: Literal[1000] = 1000
-    sack_price: str = Field(
+    sack_price: str | None = Field(
+        default=None,
+        pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
+        max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
+    )
+    highest_buy: str | None = Field(
+        default=None,
         pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
         max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
     )
     observed_at: str | None = None
 
-    @field_validator("sack_price")
+    @field_validator("sack_price", "highest_buy")
     @classmethod
-    def require_canonical_sack_price(cls, value: str) -> str:
-        if canonical_decimal(value) != value:
+    def require_canonical_sack_price(cls, value: str | None) -> str | None:
+        if value is not None and canonical_decimal(value) != value:
             raise ValueError(_CANONICAL_SACK_PRICE_ERROR)
         return value
+
+    @model_validator(mode="after")
+    def require_sack_price_quote(self) -> GemCashContext:
+        if self.sack_price is None and self.highest_buy is None:
+            raise ValueError(_GEM_CASH_CONTEXT_QUOTE_ERROR)
+        return self
 
 
 class InventoryItem(BaseModel):
@@ -718,12 +731,21 @@ def _gem_status_for_items(
 
 
 def _gem_cash_context(price: InventoryPrice | None) -> GemCashContext | None:
-    if price is None or price.lowest_sell is None:
+    if price is None:
         return None
-    sack_price = canonical_decimal(price.lowest_sell)
-    if sack_price is None:
+    sack_price = (
+        canonical_decimal(price.lowest_sell) if price.lowest_sell is not None else None
+    )
+    highest_buy = (
+        canonical_decimal(price.highest_buy) if price.highest_buy is not None else None
+    )
+    if sack_price is None and highest_buy is None:
         return None
-    return GemCashContext(sack_price=sack_price, observed_at=price.observed_at)
+    return GemCashContext(
+        sack_price=sack_price,
+        highest_buy=highest_buy,
+        observed_at=price.observed_at,
+    )
 
 
 def _gem_group_representatives(

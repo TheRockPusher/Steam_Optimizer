@@ -568,6 +568,28 @@ h3 {
   justify-content: flex-end;
   gap: var(--space-3);
 }
+.gem-cash-basis-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-ink-soft);
+  font-size: var(--text-sm);
+}
+
+.gem-cash-basis-picker select {
+  min-height: var(--control-min-height);
+  padding: var(--space-2) var(--space-5) var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-line);
+  border-radius: var(--radius-sm);
+  color: var(--color-ink);
+  background: var(--color-surface);
+  font: inherit;
+}
+
+.gem-cash-basis-picker select:focus-visible {
+  outline: var(--space-1) solid var(--color-focus);
+  outline-offset: var(--space-1);
+}
 
 .inventory-pricing-metrics {
   display: flex;
