@@ -108,14 +108,14 @@ function tradingCardItem(
 
 }
 const validInventoryPrice = {
-  currency: null,
+  currency: "USD",
   highest_buy: "0.10",
   lowest_sell: "0.20",
   observed_at: null
 };
 
 const validGemCashContext = {
-  currency: null,
+  currency: "USD",
   basis: "lowest_sell",
   market_hash_name: "753-Sack of Gems",
   sack_gems: 1000,
@@ -349,7 +349,7 @@ describe("App", () => {
       marketable: true,
       tradable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.12",
         lowest_sell: "1.005",
         observed_at: "2026-08-27T08:15:00Z"
@@ -398,10 +398,9 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(
       within(faq).getByText(
-        "SteamApis does not specify the market feed currency. Values are shown exactly as received, without a currency symbol."
+        "SteamApis market prices are USD decimal amounts. Numeric values are preserved exactly as received and labeled USD."
       )
     ).toBeInTheDocument();
-    expect(faq).not.toHaveTextContent("USD");
 
     const inventoryTable = screen.getByRole("table", { name: "Inventory items" });
     const pricedRow = within(inventoryTable)
@@ -416,8 +415,8 @@ describe("App", () => {
     expect(
       within(pricedRow as HTMLElement).getByText("Marketable")
     ).toBeInTheDocument();
-    expect(within(pricedRow as HTMLElement).getByText("0.12")).toBeInTheDocument();
-    expect(within(pricedRow as HTMLElement).getByText("1.005")).toBeInTheDocument();
+    expect(within(pricedRow as HTMLElement).getByText("USD 0.12")).toBeInTheDocument();
+    expect(within(pricedRow as HTMLElement).getByText("USD 1.005")).toBeInTheDocument();
     expect(pricedRow).not.toHaveTextContent("$");
     expect(
       within(pricedRow as HTMLElement).getByText(/Aug 27, 2026/)
@@ -932,7 +931,7 @@ describe("App", () => {
           card_set_size: 8,
           gem_cost: 750,
           price: {
-            currency: null,
+            currency: "USD",
             highest_buy: "0.11",
             lowest_sell: "0.13",
             observed_at: "2026-08-27T00:00:00Z"
@@ -954,8 +953,8 @@ describe("App", () => {
     const boosterCard = within(section).getByRole("article", {
       name: "Team Fortress 2"
     });
-    expect(within(boosterCard).getByText("0.13")).toBeInTheDocument();
-    expect(within(boosterCard).getByText("0.11")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("USD 0.13")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("USD 0.11")).toBeInTheDocument();
     expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
     expect(within(boosterCard).getByText("750", { selector: "dd" })).toBeInTheDocument();
     expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
@@ -1000,8 +999,8 @@ describe("App", () => {
     expect(within(boosterCard).getByText("Gem cost")).toBeInTheDocument();
     expect(within(boosterCard).getByText("Cards in set")).toBeInTheDocument();
     expect(within(boosterCard).getAllByText("Unavailable")).toHaveLength(2);
-    expect(within(boosterCard).getByText("0.20")).toBeInTheDocument();
-    expect(within(boosterCard).getByText("0.10")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("USD 0.20")).toBeInTheDocument();
+    expect(within(boosterCard).getByText("USD 0.10")).toBeInTheDocument();
   });
   it("switches between item and booster result panels with manual keyboard activation", async () => {
     const inventory = publicInventory([tradingCardItem(10)], {
@@ -1119,7 +1118,7 @@ describe("App", () => {
       quantity: 2,
       marketable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.10",
         lowest_sell: "0.30",
         observed_at: "2026-08-27T12:00:00Z"
@@ -1137,7 +1136,7 @@ describe("App", () => {
       quantity: 1,
       marketable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.02",
         lowest_sell: "0.20",
         observed_at: "2026-08-26T12:00:00Z"
@@ -1236,8 +1235,8 @@ describe("App", () => {
 
   it.each([
     {
-      label: "a known currency",
-      price: { ...validInventoryPrice, currency: "USD" }
+      label: "an unsupported currency",
+      price: { ...validInventoryPrice, currency: "EUR" }
     },
     {
       label: "a missing currency field",
@@ -1250,7 +1249,7 @@ describe("App", () => {
     {
       label: "a missing highest buy field",
       price: {
-        currency: null,
+        currency: "USD",
         lowest_sell: "0.20",
         observed_at: null
       }
@@ -1258,7 +1257,7 @@ describe("App", () => {
     {
       label: "a missing lowest sell field",
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.10",
         observed_at: null
       }
@@ -1282,7 +1281,7 @@ describe("App", () => {
     {
       label: "legacy minor-unit fields",
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy_minor: 10,
         lowest_sell_minor: 20,
         observed_at: null
@@ -1441,7 +1440,7 @@ describe("App", () => {
       market_hash_name: "Item 0001",
       marketable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "1.00",
         lowest_sell: "1.25",
         observed_at: "2026-08-27T08:15:00Z"
@@ -2066,7 +2065,7 @@ describe("App", () => {
         gem_priceable_item_count: 3,
         gem_priced_item_count: 3,
         gem_cash_context: {
-          currency: null,
+          currency: "USD",
           basis: "lowest_sell",
           market_hash_name: "753-Sack of Gems",
           sack_gems: 1000,
@@ -2097,7 +2096,7 @@ describe("App", () => {
     const faq = screen.getByRole("region", { name: "About these results" });
     expect(
       within(faq).getByText(
-        "Gem cash value uses the SteamApis lowest-sell basis for 753-Sack of Gems (1000 gems). This feed has unknown currency. Each value is a per-item replacement-cost estimate."
+        "Gem cash value uses the SteamApis USD lowest-sell basis for 753-Sack of Gems (1000 gems). Each value is a per-item replacement-cost estimate."
       )
     ).toBeInTheDocument();
     expect(
@@ -2205,8 +2204,8 @@ describe("App", () => {
       within(faq).getByText(/rate-limiting gem lookups/i)
     ).toHaveTextContent("try again in 30s");
     expect(
-      within(faq).getByText(/lowest-sell basis/i)
-    ).toHaveTextContent(/unknown currency/i);
+      within(faq).getByText(/USD lowest-sell basis/i)
+    ).toBeInTheDocument();
     const pricedRow = screen.getByText("Card 0001").closest("tr");
     expect(pricedRow).not.toBeNull();
     expect(within(pricedRow as HTMLElement).getByText("0")).toBeInTheDocument();

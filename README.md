@@ -99,9 +99,9 @@ market-price generation can therefore be up to 24 hours old, and a previous vali
 remain in use when a lazy refresh fails. The UI classifies price coverage as `complete` when all
 priceable rows are priced, `partial` when some but not all priceable rows are priced, and
 `unavailable` when zero priceable rows are priced or no usable provider generation exists. SteamApis
-omits currency metadata from its bulk feed. Order-book values are preserved exactly as
-provider-denominated decimals and displayed without a currency symbol. Optimization must not treat
-them as monetary values until an authoritative currency contract or explicit configuration exists.
+price-list order-book decimals are treated as USD major-unit amounts. Numeric values are preserved
+exactly and displayed with an explicit USD label. The endpoint omits currency metadata, so this
+integration contract must be revisited if SteamApis changes its USD source behavior.
 The provider feed is streamed and discarded after normalization; the raw feed, API key, and redirect
 URL are not persisted.
 
@@ -261,10 +261,10 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   price snapshots are provider/data-source caveats rather than Valve guarantees. Price coverage is
   `complete` when all priceable rows are priced, `partial` when some but not all priceable rows are
   priced, and `unavailable` when zero priceable rows are priced or no usable provider generation
-  exists. SteamApis omits currency metadata from its bulk feed: order-book values are preserved
-  exactly as provider-denominated decimals and displayed without a currency symbol. Optimization
-  must not treat them as monetary values until an authoritative currency contract or explicit
-  configuration exists. The 100,000-call daily term in [Valve's API terms](https://steamcommunity.com/dev/apiterms)
+  exists. SteamApis price-list order-book decimals are treated as USD major-unit amounts. Numeric
+  values are preserved exactly and displayed with an explicit USD label. The endpoint omits currency
+  metadata, so this integration contract must be revisited if SteamApis changes its USD source behavior.
+  The 100,000-call daily term in [Valve's API terms](https://steamcommunity.com/dev/apiterms)
   describes the Web API, not a documented quota for SteamApis.
 - Deployment caveat: both Railway services run in exact EU-West region `europe-west4-drams3a`. The
   backend attaches the `backend-data` volume at `/data` and uses the literal
@@ -309,10 +309,10 @@ was last updated on 2026-08-28.
   priceable rows are priced, `partial` when some but not all priceable rows are priced, and
   `unavailable` when zero priceable rows are priced or no usable provider generation exists. Null
   prices remain visible as such.
-- Currency and upstream caveats: SteamApis omits currency metadata from its bulk feed. Order-book
-  values are preserved exactly as provider-denominated decimals and displayed without a currency
-  symbol. Optimization must not treat them as monetary values until an authoritative currency
-  contract or explicit configuration exists. SteamApis controls upstream availability, pagination,
+- Currency and upstream caveats: SteamApis price-list order-book decimals are treated as USD
+  major-unit amounts, preserved exactly, and displayed with an explicit USD label. The endpoint omits
+  currency metadata, so this contract must be revisited if SteamApis changes its USD source behavior.
+  SteamApis controls upstream availability, pagination,
   response fields, and price freshness; a cached generation may be stale after a failed refresh.
   A public Steam inventory remains required, and provider failures can leave inventory or price
   coverage unavailable without implying that the account is private.

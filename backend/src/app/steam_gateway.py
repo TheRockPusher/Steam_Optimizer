@@ -123,7 +123,7 @@ class ProfileCheck(CheckResult):
 
 
 class InventoryPrice(BaseModel):
-    currency: Literal[None] = None
+    currency: Literal["USD"] = "USD"
     highest_buy: str | None = Field(
         default=None,
         max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
@@ -160,7 +160,7 @@ class BoosterInfo(BaseModel):
 
 
 class GemCashContext(BaseModel):
-    currency: Literal[None] = None
+    currency: Literal["USD"] = "USD"
     basis: Literal["lowest_sell"] = "lowest_sell"
     market_hash_name: Literal["753-Sack of Gems"] = SACK_OF_GEMS_MARKET_HASH_NAME
     sack_gems: Literal[1000] = 1000

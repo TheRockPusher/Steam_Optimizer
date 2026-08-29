@@ -69,7 +69,7 @@ const privateInventory = {
 };
 
 const validGemCashContext = {
-  currency: null,
+  currency: "USD",
   basis: "lowest_sell",
   market_hash_name: "753-Sack of Gems",
   sack_gems: 1000,
@@ -107,7 +107,7 @@ const publicInventory = {
       marketable: true,
       tradable: true,
       price: {
-        currency: null,
+        currency: "USD",
         highest_buy: "0.10",
         lowest_sell: "0.20",
         observed_at: null
