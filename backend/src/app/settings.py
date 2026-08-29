@@ -3,13 +3,34 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import lru_cache
 from secrets import token_urlsafe
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.market_fees import MarketFeeContract
 from app.steam_openid import callback_url
 
+_LEVEL_UP_DEFAULT_MAX_QUOTE_AGE_SECONDS = 900
+_LEVEL_UP_DEFAULT_MAX_INVENTORY_AGE_SECONDS = 3_600
+_LEVEL_UP_FIELD_NAMES = (
+    "level_up_currency_code",
+    "level_up_currency_minor_digits",
+    "level_up_price_basis",
+    "level_up_steam_fee_bps",
+    "level_up_publisher_fee_bps",
+    "level_up_min_fee_minor",
+    "level_up_max_quote_age_seconds",
+    "level_up_max_inventory_age_seconds",
+)
+_LEVEL_UP_INTEGER_FIELD_NAMES = (
+    "level_up_currency_minor_digits",
+    "level_up_steam_fee_bps",
+    "level_up_publisher_fee_bps",
+    "level_up_min_fee_minor",
+    "level_up_max_quote_age_seconds",
+    "level_up_max_inventory_age_seconds",
+)
 _MIN_SIGNING_SECRET_LENGTH = 32
 _PLACEHOLDER_SECRET_MARKERS = (
     "change-me",
@@ -42,6 +63,7 @@ _WEAK_SIGNING_MESSAGE = (
     "outside development."
 )
 _INSECURE_NONE_COOKIE_ERROR = "COOKIE_SAMESITE=none requires COOKIE_SECURE=true."
+_LEVEL_UP_INTEGER_SETTINGS_ERROR = "LEVEL_UP integer settings must be integer values."
 
 
 def _looks_like_placeholder(secret: str) -> bool:
@@ -77,6 +99,18 @@ class Settings(BaseSettings):
     steam_bulk_timeout_seconds: float = 120.0
     gem_price_cache_path: str = ".cache/steam-optimizer/gem_prices.sqlite3"
     steamapis_price_cache_path: str = ".cache/steam-optimizer/steamapis_prices.sqlite3"
+    # The complete group is optional, but it is atomic when enabled.  The
+    # freshness defaults apply only when the other six values are supplied.
+    level_up_currency_code: str | None = None
+    level_up_currency_minor_digits: int | None = None
+    level_up_price_basis: Literal["buyer_total"] | None = None
+    level_up_steam_fee_bps: int | None = None
+    level_up_publisher_fee_bps: int | None = None
+    level_up_min_fee_minor: int | None = None
+    level_up_max_quote_age_seconds: int | None = _LEVEL_UP_DEFAULT_MAX_QUOTE_AGE_SECONDS
+    level_up_max_inventory_age_seconds: int | None = (
+        _LEVEL_UP_DEFAULT_MAX_INVENTORY_AGE_SECONDS
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -140,6 +174,52 @@ class Settings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_level_up_group(cls, data: object) -> object:
+        """Make an absent or partial optional group fail closed.
+
+        Pydantic would otherwise reject an invalid integer in a partial
+        environment configuration before we can determine that the feature
+        should simply be disabled. Complete groups are left untouched so
+        normal typed validation and the contract's bounds remain effective.
+        """
+
+        if not isinstance(data, Mapping):
+            return data
+        values = dict(data)
+        saw_group_value = False
+        for name in _LEVEL_UP_FIELD_NAMES:
+            if name not in values:
+                continue
+            saw_group_value = True
+            value = values[name]
+            if isinstance(value, str) and not value.strip():
+                values[name] = None
+
+        defaults = {
+            "level_up_max_quote_age_seconds": _LEVEL_UP_DEFAULT_MAX_QUOTE_AGE_SECONDS,
+            "level_up_max_inventory_age_seconds": (
+                _LEVEL_UP_DEFAULT_MAX_INVENTORY_AGE_SECONDS
+            ),
+        }
+        complete = True
+        for name in _LEVEL_UP_FIELD_NAMES:
+            value = values[name] if name in values else defaults.get(name)
+            if value is None:
+                complete = False
+                break
+
+        if complete:
+            for name in _LEVEL_UP_INTEGER_FIELD_NAMES:
+                value = values.get(name, defaults.get(name))
+                if isinstance(value, bool) or not isinstance(value, (int, str)):
+                    raise ValueError(_LEVEL_UP_INTEGER_SETTINGS_ERROR)  # noqa: TRY004
+        if saw_group_value and not complete:
+            for name in _LEVEL_UP_FIELD_NAMES:
+                values[name] = None
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def generate_development_secret(cls, data: object) -> object:
         if not isinstance(data, Mapping):
             return data
@@ -157,6 +237,30 @@ class Settings(BaseSettings):
         return values
 
     @model_validator(mode="after")
+    def validate_level_up_settings(self) -> Settings:
+        values = tuple(getattr(self, name) for name in _LEVEL_UP_FIELD_NAMES)
+        if any(value is None for value in values):
+            return self
+        try:
+            MarketFeeContract(
+                currency_code=cast("str", self.level_up_currency_code),
+                minor_digits=cast("int", self.level_up_currency_minor_digits),
+                price_basis=cast("Literal['buyer_total']", self.level_up_price_basis),
+                steam_fee_bps=cast("int", self.level_up_steam_fee_bps),
+                publisher_fee_bps=cast("int", self.level_up_publisher_fee_bps),
+                min_fee_minor=cast("int", self.level_up_min_fee_minor),
+                max_quote_age_seconds=cast("int", self.level_up_max_quote_age_seconds),
+                max_inventory_age_seconds=cast(
+                    "int", self.level_up_max_inventory_age_seconds
+                ),
+            )
+        except ValueError as error:
+            # Keep this message value-free; Settings hides field inputs, and
+            # credentials must never be echoed through a model-level error.
+            raise ValueError(str(error)) from None
+        return self
+
+    @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
         if self.environment.strip().casefold() != "development":
             secret = self.signing_secret.strip()
@@ -167,6 +271,24 @@ class Settings(BaseSettings):
         if self.cookie_samesite == "none" and not self.cookie_secure:
             raise ValueError(_INSECURE_NONE_COOKIE_ERROR)
         return self
+
+    @property
+    def level_up_money_contract(self) -> MarketFeeContract | None:
+        values = tuple(getattr(self, name) for name in _LEVEL_UP_FIELD_NAMES)
+        if any(value is None for value in values):
+            return None
+        return MarketFeeContract(
+            currency_code=cast("str", self.level_up_currency_code),
+            minor_digits=cast("int", self.level_up_currency_minor_digits),
+            price_basis=cast("Literal['buyer_total']", self.level_up_price_basis),
+            steam_fee_bps=cast("int", self.level_up_steam_fee_bps),
+            publisher_fee_bps=cast("int", self.level_up_publisher_fee_bps),
+            min_fee_minor=cast("int", self.level_up_min_fee_minor),
+            max_quote_age_seconds=cast("int", self.level_up_max_quote_age_seconds),
+            max_inventory_age_seconds=cast(
+                "int", self.level_up_max_inventory_age_seconds
+            ),
+        )
 
     @property
     def callback_url(self) -> str:

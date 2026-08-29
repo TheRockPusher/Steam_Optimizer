@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Mapping
+    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 
     from httpx2 import Response
 
@@ -23,6 +23,7 @@ from app.cookies import (
     SignedCookieCodec,
 )
 from app.gem_pricing import GemKey, GemResolution, GemScanResult
+from app.level_up_optimizer import Holding, LevelUpOptimizationResponse
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -62,11 +63,23 @@ class FakeGateway:
         *,
         inventory_retry_after_seconds: int | None = None,
         inventory_error: Exception | None = None,
+        level_up_result: LevelUpOptimizationResponse | None = None,
+        level_up_error: Exception | None = None,
     ) -> None:
         self.inventory_retry_after_seconds = inventory_retry_after_seconds
         self.inventory_error = inventory_error
+        self.level_up_result = level_up_result
+        self.level_up_error = level_up_error
         self.profile_calls = 0
         self.inventory_calls = 0
+        self.level_up_calls: list[
+            tuple[
+                str,
+                Sequence[Holding],
+                datetime | str | int,
+                datetime | str | int | None,
+            ]
+        ] = []
         self.gem_refresh_calls: list[list[GemKey]] = []
         self.booster_refresh_calls: list[tuple[str, ...]] = []
 
@@ -89,6 +102,29 @@ class FakeGateway:
             status="private",
             message="inventory private",
             retry_after_seconds=self.inventory_retry_after_seconds,
+        )
+
+    async def check_level_up(
+        self,
+        steam_id: str,
+        holdings: Sequence[Holding],
+        inventory_refreshed_at: datetime | str | int,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> LevelUpOptimizationResponse:
+        self.level_up_calls.append((steam_id, holdings, inventory_refreshed_at, now))
+        if self.level_up_error is not None:
+            raise self.level_up_error
+        if self.level_up_result is not None:
+            return self.level_up_result
+        return LevelUpOptimizationResponse(
+            status="unavailable",
+            reason="badge_data_unavailable",
+            generated_at=NOW,
+            inventory_refreshed_at=NOW,
+            catalog_total_sets=0,
+            catalog_resolved_sets=0,
+            catalog_pending_sets=0,
         )
 
     async def refresh_gems(
@@ -472,6 +508,233 @@ def test_inventory_gateway_exception_returns_unavailable_result() -> None:
     assert gateway.inventory_calls == 1
 
 
+def _valid_level_up_payload() -> dict[str, object]:
+    return {
+        "inventory_refreshed_at": NOW.isoformat().replace("+00:00", "Z"),
+        "cards": [
+            {
+                "market_hash_name": "440-Test Card (Trading Card)",
+                "owned_quantity": 2,
+                "sellable_quantity": 1,
+            }
+        ],
+    }
+
+
+def test_level_up_requires_session_and_matching_expected_account() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        unauthenticated = client.post(
+            "/api/auth/level-up",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_level_up_payload(),
+        )
+        _authenticate(client, settings)
+        mismatched = client.post(
+            "/api/auth/level-up",
+            headers={"X-Expected-Steam-ID": "76561198000000001"},
+            json=_valid_level_up_payload(),
+        )
+
+    assert unauthenticated.status_code == 401
+    assert mismatched.status_code == 401
+    assert unauthenticated.headers["cache-control"] == "no-store"
+    assert mismatched.headers["cache-control"] == "no-store"
+    assert gateway.level_up_calls == []
+    assert gateway.inventory_calls == 0
+
+
+def test_level_up_forwards_one_bounded_snapshot_without_inventory_fetch() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/level-up",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_level_up_payload(),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["status"] == "unavailable"
+    assert response.json()["reason"] == "badge_data_unavailable"
+    assert len(gateway.level_up_calls) == 1
+    steam_id, holdings, refreshed_at, called_at = gateway.level_up_calls[0]
+    assert steam_id == AUTHENTICATED_STEAM_ID
+    assert refreshed_at == "2026-08-26T12:00:00Z"
+    assert called_at is None
+    assert len(holdings) == 1
+    assert holdings[0].market_hash_name == "440-Test Card (Trading Card)"
+    assert holdings[0].owned_quantity == 2
+    assert holdings[0].sellable_quantity == 1
+    assert gateway.inventory_calls == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
+            "cards": [
+                {
+                    "market_hash_name": "440-Test Card (Trading Card)",
+                    "owned_quantity": 1,
+                    "sellable_quantity": 1,
+                },
+                {
+                    "market_hash_name": "440-Test Card (Trading Card)",
+                    "owned_quantity": 1,
+                    "sellable_quantity": 1,
+                },
+            ],
+        },
+        {
+            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
+            "cards": [
+                {
+                    "market_hash_name": "440-Test Card (Trading Card)",
+                    "owned_quantity": True,
+                    "sellable_quantity": 1,
+                }
+            ],
+        },
+        {
+            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
+            "cards": [
+                {
+                    "market_hash_name": "440-Test Card (Trading Card)",
+                    "owned_quantity": 1,
+                    "sellable_quantity": 2,
+                }
+            ],
+        },
+        {
+            "inventory_refreshed_at": "not-a-timestamp",
+            "cards": [],
+        },
+        {
+            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
+            "cards": [],
+            "unknown": True,
+        },
+        {
+            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
+            "cards": [
+                {
+                    "market_hash_name": "440-Test Card (Trading Card)",
+                    "owned_quantity": 1,
+                    "sellable_quantity": 1,
+                    "unknown": True,
+                }
+            ],
+        },
+    ],
+)
+def test_level_up_rejects_invalid_snapshot_contract(
+    payload: dict[str, object],
+) -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/level-up",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.level_up_calls == []
+    assert gateway.inventory_calls == 0
+
+
+def test_level_up_rejects_oversize_and_excessively_nested_json() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+    nested = "[" * 1100 + "0" + "]" * 1100
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        too_large = client.post(
+            "/api/auth/level-up",
+            headers={
+                "Content-Type": "application/json",
+                "X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID,
+            },
+            content=" " * (2 * 1024 * 1024 + 1),
+        )
+        too_deep = client.post(
+            "/api/auth/level-up",
+            headers={
+                "Content-Type": "application/json",
+                "X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID,
+            },
+            content=nested,
+        )
+
+    assert too_large.status_code == 413
+    assert too_deep.status_code == 422
+    assert too_large.headers["cache-control"] == "no-store"
+    assert too_deep.headers["cache-control"] == "no-store"
+    assert gateway.level_up_calls == []
+    assert gateway.inventory_calls == 0
+
+
+def test_level_up_gateway_type_error_is_isolated_without_retry() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(level_up_error=TypeError("implementation failure"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/level-up",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_level_up_payload(),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["status"] == "unavailable"
+    assert len(gateway.level_up_calls) == 1
+    assert gateway.inventory_calls == 0
+
+
 def test_gem_refresh_requires_authenticated_session() -> None:
     settings = make_settings()
     gateway = FakeGateway()
@@ -709,11 +972,12 @@ class FakeStreamMixin:
         method: str,
         url: str,
         *,
+        params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
     ) -> AsyncIterator[FakeResponse]:
-        del method, url, headers, follow_redirects, timeout
+        del method, url, params, headers, follow_redirects, timeout
         yield FakeResponse(500, {})
 
 

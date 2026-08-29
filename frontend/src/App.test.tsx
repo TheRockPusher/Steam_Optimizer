@@ -151,6 +151,34 @@ function publicInventory(
     ...overrides
   };
 }
+function levelUpNoOpportunityResponse(
+  reason: "no_complete_sellable_set" | "no_positive_xp_swap" = "no_complete_sellable_set",
+  inventoryRefreshedAt = "2026-08-29T11:30:00Z"
+) {
+  return {
+    status: "no_opportunity",
+    reason,
+    generated_at: "2026-08-29T12:00:00Z",
+    inventory_refreshed_at: inventoryRefreshedAt,
+    catalog_total_sets: 0,
+    catalog_resolved_sets: 0,
+    catalog_pending_sets: 0,
+    currency_code: "USD",
+    minor_digits: 2,
+    price_basis: "instant_top_of_book",
+    steam_fee_bps: 500,
+    publisher_fee_bps: 1_000,
+    min_fee_minor: 1,
+    taxes_included: false,
+    scope_limited: false,
+    valid_until: null,
+    player: null,
+    source: null,
+    destinations: [],
+    totals: null
+  };
+}
+
 
 
 function jsonResponse(payload: unknown, status = 200) {
@@ -378,7 +406,7 @@ describe("App", () => {
     render(<App />);
 
     const inventoryRegion = await screen.findByRole("region", {
-      name: "Items and boosters"
+      name: "Inventory and level-up planning"
     });
     const pricingSummary = within(inventoryRegion).getByLabelText(
       "Inventory pricing summary"
@@ -1021,10 +1049,10 @@ describe("App", () => {
         }
       ]
     });
-    vi.spyOn(globalThis, "fetch")
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory));
-
     render(<App />);
 
     const tablist = await screen.findByRole("tablist", {
@@ -1083,6 +1111,246 @@ describe("App", () => {
       screen.getByRole("table", { name: "Inventory items" })
     ).toBeInTheDocument();
     expect(groupByGame).not.toBeChecked();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("adds a lazy level-up tab with stable ARIA wiring and manual activation", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse())
+      );
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    const itemsTab = within(tablist).getByRole("tab", { name: "Items" });
+    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
+    const levelUpTab = within(tablist).getByRole("tab", {
+      name: "Level-up optimization"
+    });
+    const itemsPanel = document.getElementById("inventory-results-panel-items");
+    const boostersPanel = document.getElementById(
+      "inventory-results-panel-boosters"
+    );
+    const levelUpPanel = document.getElementById(
+      "level-up-optimization-panel"
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith("/api/auth/level-up")
+      )
+    ).toBe(false);
+    expect(itemsTab).toHaveAttribute("id", "inventory-results-tab-items");
+    expect(itemsTab).toHaveAttribute(
+      "aria-controls",
+      "inventory-results-panel-items"
+    );
+    expect(boostersTab).toHaveAttribute("id", "inventory-results-tab-boosters");
+    expect(boostersTab).toHaveAttribute(
+      "aria-controls",
+      "inventory-results-panel-boosters"
+    );
+    expect(levelUpTab).toHaveAttribute("id", "level-up-optimization-tab");
+    expect(levelUpTab).toHaveAttribute(
+      "aria-controls",
+      "level-up-optimization-panel"
+    );
+    expect(levelUpTab).toHaveAttribute("aria-selected", "false");
+    expect(levelUpTab).toHaveAttribute("tabindex", "-1");
+    expect(levelUpPanel).toHaveAttribute("role", "tabpanel");
+    expect(levelUpPanel).toHaveAttribute(
+      "aria-labelledby",
+      "level-up-optimization-tab"
+    );
+    expect(levelUpPanel).toHaveAttribute("hidden");
+    expect(itemsPanel).not.toBeNull();
+    expect(boostersPanel).not.toBeNull();
+
+    itemsTab.focus();
+    fireEvent.keyDown(itemsTab, { key: "ArrowLeft" });
+    expect(levelUpTab).toHaveFocus();
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(levelUpTab, { key: "Home" });
+    expect(itemsTab).toHaveFocus();
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(itemsTab, { key: "End" });
+    expect(levelUpTab).toHaveFocus();
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(levelUpTab, { key: "Enter" });
+    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
+    expect(itemsTab).toHaveAttribute("aria-selected", "false");
+    expect(levelUpPanel).not.toHaveAttribute("hidden");
+    expect(
+      await screen.findByText(/No complete sellable normal-card set/)
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(itemsTab);
+    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(levelUpPanel).toHaveAttribute("hidden");
+    levelUpTab.focus();
+    fireEvent.keyDown(levelUpTab, { key: " " });
+    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
+    expect(levelUpPanel).not.toHaveAttribute("hidden");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fireEvent.keyDown(levelUpTab, { key: "ArrowRight" });
+    expect(itemsTab).toHaveFocus();
+    fireEvent.keyDown(itemsTab, { key: "ArrowLeft" });
+    expect(levelUpTab).toHaveFocus();
+  });
+
+  it("reaches private inventory recovery without requesting level-up data", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    const levelUpTab = within(tablist).getByRole("tab", {
+      name: "Level-up optimization"
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fireEvent.click(levelUpTab);
+
+    expect(
+      await screen.findByText(/Make your Steam inventory public/)
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith("/api/auth/level-up")
+      )
+    ).toBe(false);
+  });
+
+  it("invalidates a cached recommendation when ownership is refreshed", async () => {
+    const initialInventory = publicInventory([inventoryItem(1)]);
+    const refreshedInventory = publicInventory([inventoryItem(2)]);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(initialInventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse("no_complete_sellable_set"))
+      )
+      .mockResolvedValueOnce(jsonResponse(refreshedInventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse("no_positive_xp_swap"))
+      );
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    const levelUpTab = within(tablist).getByRole("tab", {
+      name: "Level-up optimization"
+    });
+    fireEvent.click(levelUpTab);
+    expect(
+      await screen.findByText(/No complete sellable normal-card set/)
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh inventory" })
+    );
+
+    expect(
+      await screen.findByText(/Every self-funded swap would provide no more XP/)
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(
+      screen.queryByText(/No complete sellable normal-card set/)
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not expose a prior-account recommendation after the session changes", async () => {
+    const changedSteamId = "76561198000000002";
+    const changedSession = {
+      ...signedInSession,
+      user: {
+        ...signedInSession.user,
+        steam_id: changedSteamId,
+        display_name: "Barney"
+      }
+    };
+    const initialInventory = publicInventory([inventoryItem(1)]);
+    const changedInventory = publicInventory([inventoryItem(2)]);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(initialInventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse("no_complete_sellable_set"))
+      )
+      .mockResolvedValueOnce(jsonResponse(changedSession))
+      .mockResolvedValueOnce(jsonResponse(changedInventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse("no_positive_xp_swap"))
+      );
+
+    render(<App />);
+
+    let tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(
+      within(tablist).getByRole("tab", { name: "Level-up optimization" })
+    );
+    expect(
+      await screen.findByText(/No complete sellable normal-card set/)
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Recheck Steam profile" })
+    );
+    expect(
+      await screen.findByText(/Account changed\. Steam profile: Public\./)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/No complete sellable normal-card set/)
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Connected Steam account: Barney")
+    ).toBeInTheDocument();
+
+    tablist = screen.getByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(
+      within(tablist).getByRole("tab", { name: "Level-up optimization" })
+    );
+    expect(
+      await screen.findByText(/Every self-funded swap would provide no more XP/)
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      "/api/auth/level-up",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Expected-Steam-ID": changedSteamId
+        })
+      })
+    );
   });
 
   it("keeps an empty booster view selectable and explains the missing data", async () => {
@@ -1662,7 +1930,7 @@ describe("App", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Items and boosters" });
+    await screen.findByRole("heading", { name: "Inventory and level-up planning" });
     fireEvent.click(
       screen.getByRole("button", { name: "Refresh inventory" })
     );

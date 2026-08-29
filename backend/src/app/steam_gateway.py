@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +19,7 @@ from ijson.common import IncompleteJSONError, JSONError
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 from app.booster_pricing import (
+    BoosterMetadataState,
     BoosterPricingService,
     BoosterResolution,
     BoosterScanResult,
@@ -33,8 +36,30 @@ from app.gem_pricing import (
     gem_cash_value,
     parse_item_metadata,
 )
+from app.json_parsing import reject_duplicate_object_keys
+from app.level_up_optimizer import (
+    MAX_APP_ID,
+    MAX_NORMAL_SET_SIZE,
+    MAX_QUOTE_QUANTITY,
+    MIN_NORMAL_SET_SIZE,
+    BadgeState,
+    CatalogCard,
+    CatalogSet,
+    Holding,
+    LevelUpOptimizationResponse,
+    OptimizerInputError,
+    ResolvedCatalog,
+    optimize_level_up,
+    parse_normal_card_hash,
+)
+from app.market_fees import (
+    MarketFeeContract,
+    decimal_to_minor,
+    seller_receipt_from_buyer_total,
+)
 from app.steamapis_price_cache import (
     CachedPrice,
+    NormalCardCatalogRead,
     PriceCacheRead,
     SteamApisPriceCache,
     SteamApisPriceRefresh,
@@ -75,6 +100,12 @@ _PRIVATE_INVENTORY_MESSAGE = (
 MAX_RETRY_AFTER_SECONDS = 900
 BOOSTER_CARD_COUNT = 3
 
+BADGES_ENDPOINT = "https://api.steampowered.com/IPlayerService/GetBadges/v1/"
+LEVEL_UP_PRICE_MAX_AGE_SECONDS = 15 * 60
+MAX_BADGE_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_BADGE_RECORDS = 10_000
+MAX_LEVEL_UP_CATALOG_ROWS = 250_000
+MAX_LEVEL_UP_METADATA_APPS = 128
 
 # Inventory pages are normally 2,000 assets.  These bounds leave room for
 # unusually large inventories while stopping provider-controlled amplification.
@@ -95,6 +126,9 @@ MAX_INVENTORY_QUANTITY = 1_000_000_000
 MAX_PRICE_AMOUNT = Decimal(10000000000)
 MAX_PRICE_DECIMAL_DIGITS = 64
 MAX_OBSERVED_AT_MILLISECONDS = 253_402_300_799_999
+MAX_PRICE_QUANTITY = MAX_QUOTE_QUANTITY
+MAX_PRICE_DEPTH_ROWS = 10
+MAX_PRICE_DEPTH_TOTAL_QUANTITY = MAX_PRICE_QUANTITY
 MAX_PRICE_STREAM_BYTES = 512 * 1024 * 1024
 MAX_PRICE_STREAM_NESTING = 64
 MAX_PRICE_STREAM_TOKENS = 100_000_000
@@ -107,6 +141,20 @@ _BULK_STREAM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BULK_STREAMS)
 _PRICE_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
 _MAX_OBSERVED_AT_DECIMAL = Decimal(MAX_OBSERVED_AT_MILLISECONDS)
 _PRICE_STREAM_JSON_ERRORS = (IncompleteJSONError, JSONError)
+_PRICE_STREAM_SEMANTIC_KEYS = {
+    "marketHashName": "market_hash_name",
+    "market_hash_name": "market_hash_name",
+    "highestBuy": "highest_buy",
+    "highest_buy": "highest_buy",
+    "lowestSell": "lowest_sell",
+    "lowest_sell": "lowest_sell",
+    "updatedAt": "updated_at",
+    "updated_at": "updated_at",
+    "buyOrdersTop10": "buy_orders_top10",
+    "buy_orders_top10": "buy_orders_top10",
+    "sellOrdersTop10": "sell_orders_top10",
+    "sell_orders_top10": "sell_orders_top10",
+}
 
 
 class InvalidSteamApisPayloadError(ValueError):
@@ -134,6 +182,16 @@ class InventoryPrice(BaseModel):
         default=None,
         max_length=MAX_PRICE_STREAM_SCALAR_LENGTH,
         pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
+    )
+    highest_buy_quantity: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_PRICE_QUANTITY,
+    )
+    lowest_sell_quantity: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_PRICE_QUANTITY,
     )
     observed_at: str | None = None
 
@@ -270,6 +328,17 @@ class SteamGatewayProtocol(Protocol):
         """Fetch and price a Steam inventory."""
         ...
 
+    async def check_level_up(
+        self,
+        steam_id: str,
+        holdings: Sequence[Holding],
+        inventory_refreshed_at: datetime | str | int,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> LevelUpOptimizationResponse:
+        """Calculate a read-only level-up recommendation without inventory I/O."""
+        ...
+
     async def refresh_gems(
         self,
         keys: Iterable[GemKey],
@@ -289,13 +358,35 @@ def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _canonical_market_hash_name(value: object) -> str | None:
+    """Decode one provider market hash and return its canonical spelling."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_PRICE_STREAM_SCALAR_LENGTH
+        or "\x00" in value
+        or re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None
+    ):
+        return None
+    try:
+        decoded = unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if (
+        not decoded
+        or len(decoded) > MAX_PRICE_STREAM_SCALAR_LENGTH
+        or "\x00" in decoded
+    ):
+        return None
+    return decoded
+
+
 def _is_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _is_private_inventory_error(value: Mapping[str, object]) -> bool:
-    """Recognize only SteamApis' verified private-inventory response."""
-
     error = value.get("error")
     return isinstance(error, str) and error.strip() == _PRIVATE_INVENTORY_MESSAGE
 
@@ -472,7 +563,9 @@ def _parse_inventory_page(payload: object) -> _InventoryPage | None:
             market_hash_name = raw_description.get("market_hash_name")
         if market_hash_name is not None and (
             not isinstance(market_hash_name, str)
-            or len(market_hash_name) > MAX_INVENTORY_TEXT_LENGTH
+            or not market_hash_name
+            or len(market_hash_name) > MAX_PRICE_STREAM_SCALAR_LENGTH
+            or "\x00" in market_hash_name
         ):
             return None
         marketable = _flag(raw_description.get("marketable"))
@@ -594,6 +687,424 @@ def _response_content_length_within(
     return int(normalized) <= maximum
 
 
+def _append_bounded_bytes(
+    body: bytearray,
+    chunk: object,
+    maximum: int,
+) -> None:
+    if not isinstance(chunk, (bytes, bytearray, memoryview)):
+        raise InvalidSteamApisPayloadError
+    view = memoryview(chunk)
+    if len(body) + len(view) > maximum:
+        raise InvalidSteamApisPayloadError
+    body.extend(view)
+
+
+def _level_up_timestamp(value: object) -> datetime | None:
+    """Parse one bounded timestamp used by the optimizer boundary."""
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(UTC)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        try:
+            if abs(value) >= 100_000_000_000:
+                seconds, milliseconds = divmod(value, 1000)
+                return datetime.fromtimestamp(seconds, UTC).replace(
+                    microsecond=milliseconds * 1000
+                )
+            return datetime.fromtimestamp(value, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_INVENTORY_TEXT_LENGTH
+    ):
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _badge_integer(value: object, *, minimum: int, maximum: int) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        return None
+    return value
+
+
+def _parse_badges_payload(payload: object) -> BadgeState:
+    """Parse Valve's bounded GetBadges response into immutable badge state."""
+
+    if _bounded_json_size(payload, MAX_BADGE_RESPONSE_BYTES) is None:
+        raise InvalidSteamApisPayloadError
+    if not isinstance(payload, Mapping):
+        raise InvalidSteamApisPayloadError
+    response = payload.get("response")
+    if not isinstance(response, Mapping):
+        raise InvalidSteamApisPayloadError
+    player_xp = _badge_integer(
+        response.get("player_xp"),
+        minimum=0,
+        maximum=10**12,
+    )
+    player_level = _badge_integer(
+        response.get("player_level"),
+        minimum=0,
+        maximum=100_000,
+    )
+    records = response.get("badges")
+    if player_xp is None or player_level is None or not isinstance(records, list):
+        raise InvalidSteamApisPayloadError
+    if len(records) > MAX_BADGE_RECORDS:
+        raise InvalidSteamApisPayloadError
+    levels: dict[int, int] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise InvalidSteamApisPayloadError
+        raw_app_id = record.get("appid")
+        # Valve includes non-game badge records (typically appid 0).  They
+        # carry no game-level semantics, so ignore them before validating the
+        # game-only border and level fields.
+        if raw_app_id is None or raw_app_id == 0:
+            continue
+        border_color = _badge_integer(record.get("border_color"), minimum=0, maximum=1)
+        if border_color is None:
+            raise InvalidSteamApisPayloadError
+        # Foil records are deliberately ignored.
+        if border_color != 0:
+            continue
+        app_id = _badge_integer(raw_app_id, minimum=1, maximum=MAX_APP_ID)
+        if app_id is None:
+            raise InvalidSteamApisPayloadError
+        level = _badge_integer(record.get("level"), minimum=0, maximum=5)
+        if level is None or app_id in levels:
+            raise InvalidSteamApisPayloadError
+        levels[app_id] = level
+    try:
+        return BadgeState(
+            player_xp=player_xp,
+            player_level=player_level,
+            normal_badge_levels=levels,
+        )
+    except (OptimizerInputError, TypeError, ValueError, ArithmeticError) as error:
+        raise InvalidSteamApisPayloadError from error
+
+
+def _catalog_groups(
+    catalog_read: NormalCardCatalogRead,
+) -> dict[int, tuple[CatalogCard, ...]]:
+    """Turn cache rows into strict, unique normal-card groups."""
+
+    groups: dict[int, tuple[CatalogCard, ...]] = {}
+    for raw_app_id, entries in sorted(catalog_read.groups.items()):
+        if (
+            isinstance(raw_app_id, bool)
+            or not isinstance(raw_app_id, int)
+            or not 0 < raw_app_id <= MAX_APP_ID
+            or not isinstance(entries, Sequence)
+            or not entries
+        ):
+            continue
+        cards: list[CatalogCard] = []
+        seen: set[str] = set()
+        valid = True
+        for entry in entries:
+            if not isinstance(entry, CachedPrice):
+                valid = False
+                break
+            parsed = parse_normal_card_hash(entry.market_hash_name)
+            if (
+                parsed is None
+                or parsed[0] != raw_app_id
+                or entry.normal_card_app_id != raw_app_id
+                or entry.normal_card_name != parsed[1]
+            ):
+                valid = False
+                break
+            observed_at = _level_up_timestamp(entry.observed_at)
+            if entry.observed_at is not None and observed_at is None:
+                valid = False
+                break
+            try:
+                card = CatalogCard(
+                    market_hash_name=entry.market_hash_name,
+                    app_id=raw_app_id,
+                    card_name=parsed[1],
+                    highest_buy=entry.highest_buy,
+                    lowest_sell=entry.lowest_sell,
+                    highest_buy_quantity=entry.highest_buy_quantity,
+                    lowest_sell_quantity=entry.lowest_sell_quantity,
+                    observed_at=observed_at,
+                )
+            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+                valid = False
+                break
+            if card.market_hash_name in seen:
+                valid = False
+                break
+            seen.add(card.market_hash_name)
+            cards.append(card)
+        if valid and MIN_NORMAL_SET_SIZE <= len(cards) <= MAX_NORMAL_SET_SIZE:
+            cards.sort(key=lambda card: card.market_hash_name)
+            groups[raw_app_id] = tuple(cards)
+    return groups
+
+
+def _set_purchase_cost(
+    cards: Sequence[CatalogCard],
+    contract: MarketFeeContract,
+) -> int | None:
+    total = 0
+    for card in cards:
+        if card.lowest_sell is None:
+            return None
+        amount = decimal_to_minor(card.lowest_sell, contract.minor_digits)
+        if amount is None:
+            return None
+        total += amount
+        if total > 2**63 - 1:
+            return None
+    return total
+
+
+def _source_proceeds_upper_bound(
+    cards: Sequence[CatalogCard],
+    contract: MarketFeeContract,
+) -> int | None:
+    total = 0
+    for card in cards:
+        if card.highest_buy is None or card.highest_buy_quantity is None:
+            return None
+        amount = decimal_to_minor(card.highest_buy, contract.minor_digits)
+        if amount is None or card.highest_buy_quantity < 1:
+            return None
+        receipt = seller_receipt_from_buyer_total(amount, contract)
+        if receipt is None:
+            return None
+        total += receipt
+        if total > 2**63 - 1:
+            return None
+    return total
+
+
+def _catalog_quote_issue(
+    cards: Sequence[CatalogCard],
+    *,
+    side: Literal["buy", "sell"],
+    now: datetime,
+    quote_window: int,
+    contract: MarketFeeContract,
+    require_depth: bool = True,
+) -> str | None:
+    """Validate every quote needed by a potentially actionable set.
+
+    A row with a missing top-of-book value, a non-exact amount, or required
+    quantity is unavailable. A present row outside the configured window is
+    stale. The distinction matters because stale generations and unavailable
+    depth have different recovery actions at the API boundary.
+    """
+
+    stale = False
+    depth_unavailable = False
+    for card in cards:
+        if side == "buy":
+            price = card.highest_buy
+            quantity = card.highest_buy_quantity
+        else:
+            price = card.lowest_sell
+            quantity = card.lowest_sell_quantity
+        timestamp = _level_up_timestamp(card.observed_at)
+        if timestamp is None:
+            depth_unavailable = True
+            continue
+        if timestamp > now or now - timestamp > timedelta(seconds=quote_window):
+            stale = True
+            continue
+        if price is None:
+            depth_unavailable = True
+            continue
+        if require_depth and (
+            isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1
+        ):
+            depth_unavailable = True
+            continue
+        amount = decimal_to_minor(price, contract.minor_digits)
+        if amount is None:
+            depth_unavailable = True
+            continue
+        if side == "buy" and seller_receipt_from_buyer_total(amount, contract) is None:
+            depth_unavailable = True
+    if stale:
+        return "price_generation_stale"
+    if depth_unavailable:
+        return "quote_depth_unavailable"
+    return None
+
+
+def _level_up_snapshot_issue(
+    *,
+    current: datetime,
+    inventory_time: datetime,
+    generated_at: datetime,
+    inventory_limit: int,
+    quote_limit: int,
+) -> str | None:
+    try:
+        if current < inventory_time or current - inventory_time > timedelta(
+            seconds=inventory_limit
+        ):
+            return "inventory_snapshot_too_old"
+        if current < generated_at:
+            return "price_generation_unavailable"
+        if current - generated_at > timedelta(seconds=quote_limit):
+            return "price_generation_stale"
+    except (OverflowError, TypeError, ValueError, ArithmeticError):
+        return "price_generation_unavailable"
+    return None
+
+
+def _strict_catalog_candidates(
+    groups: Mapping[int, tuple[CatalogCard, ...]],
+    holdings: Mapping[str, Holding],
+    badges: BadgeState,
+    *,
+    now: datetime,
+    quote_window: int,
+    contract: MarketFeeContract,
+    qualified_source_ids: frozenset[int],
+) -> tuple[list[int], list[int], list[tuple[int, int]], str | None]:
+    """Price qualified sources and identify fresh, affordable destinations."""
+
+    source_ids: list[int] = []
+    source_proceeds: list[int] = []
+    for app_id, cards in groups.items():
+        if app_id not in qualified_source_ids:
+            continue
+        if badges.level_for_game(app_id) >= 5:
+            continue
+        if not all(
+            (
+                (holding := holdings.get(card.market_hash_name)) is not None
+                and holding.owned_quantity >= 1
+                and holding.sellable_quantity >= 1
+            )
+            for card in cards
+        ):
+            continue
+        issue = _catalog_quote_issue(
+            cards,
+            side="buy",
+            now=now,
+            quote_window=quote_window,
+            contract=contract,
+        )
+        if issue is not None:
+            return source_ids, source_proceeds, [], issue
+        proceeds = _source_proceeds_upper_bound(cards, contract)
+        if proceeds is None:
+            return source_ids, source_proceeds, [], "quote_depth_unavailable"
+        source_ids.append(app_id)
+        source_proceeds.append(proceeds)
+
+    if not source_ids:
+        return source_ids, source_proceeds, [], None
+
+    max_proceeds = max(source_proceeds)
+    owned_games = {
+        parsed[0]
+        for market_hash_name in holdings
+        if (parsed := parse_normal_card_hash(market_hash_name)) is not None
+    }
+    destination_costs: list[tuple[int, int]] = []
+    for app_id, cards in groups.items():
+        if app_id in owned_games or badges.level_for_game(app_id) >= 5:
+            continue
+        issue = _catalog_quote_issue(
+            cards,
+            side="sell",
+            now=now,
+            quote_window=quote_window,
+            contract=contract,
+            require_depth=False,
+        )
+        if issue is not None:
+            return source_ids, source_proceeds, [], issue
+        cost = _set_purchase_cost(cards, contract)
+        if cost is None:
+            # Without an exact subtotal we cannot prove that this destination
+            # is unaffordable, so fail closed instead of warming metadata for
+            # an ambiguous candidate.
+            return source_ids, source_proceeds, [], "quote_depth_unavailable"
+        if cost > max_proceeds:
+            continue
+        destination_costs.append((cost, app_id))
+    destination_costs.sort(key=lambda value: (value[0], value[1]))
+    return source_ids, source_proceeds, destination_costs, None
+
+
+def _level_up_response(
+    *,
+    status: Literal["unavailable", "warming", "no_opportunity"],
+    reason: str,
+    now: datetime,
+    inventory_time: datetime,
+    contract: MarketFeeContract | None,
+    total_sets: int = 0,
+    resolved_sets: int = 0,
+    pending_sets: int = 0,
+) -> LevelUpOptimizationResponse:
+    currency_code = contract.currency_code if contract is not None else None
+    minor_digits = contract.minor_digits if contract is not None else None
+    price_basis = "instant_top_of_book" if contract is not None else None
+    steam_fee_bps = contract.steam_fee_bps if contract is not None else None
+    publisher_fee_bps = contract.publisher_fee_bps if contract is not None else None
+    min_fee_minor = contract.min_fee_minor if contract is not None else None
+    taxes_included = False if contract is not None else None
+    bounded_total = max(0, total_sets)
+    bounded_pending = max(0, min(pending_sets, bounded_total))
+    bounded_resolved = max(0, min(resolved_sets, bounded_total))
+    if bounded_pending == 0 and bounded_resolved < bounded_total:
+        bounded_pending = bounded_total - bounded_resolved
+    else:
+        bounded_resolved = bounded_total - bounded_pending
+    return LevelUpOptimizationResponse(
+        status=status,
+        reason=reason,
+        generated_at=now,
+        inventory_refreshed_at=inventory_time,
+        catalog_total_sets=bounded_total,
+        catalog_resolved_sets=bounded_resolved,
+        catalog_pending_sets=bounded_pending,
+        scope_limited=False,
+        valid_until=None,
+        player=None,
+        source=None,
+        destinations=(),
+        totals=None,
+        currency_code=currency_code,
+        minor_digits=minor_digits,
+        price_basis=price_basis,
+        steam_fee_bps=steam_fee_bps,
+        publisher_fee_bps=publisher_fee_bps,
+        min_fee_minor=min_fee_minor,
+        taxes_included=taxes_included,
+    )
+
+
 def _validated_bulk_redirect(response: HTTPResponse, api_key: str) -> str:
     if response.status_code not in (301, 302, 303, 307, 308):
         raise InvalidSteamApisPayloadError
@@ -637,8 +1148,15 @@ def _validate_bulk_response(response: HTTPResponse) -> None:
         raise InvalidSteamApisPayloadError
 
 
-def _validate_price_generation(refresh: SteamApisPriceRefresh) -> None:
-    if refresh.accepted_count == 0:
+def _validate_price_generation(
+    refresh: SteamApisPriceRefresh,
+    summary: _PriceStreamSummary,
+) -> None:
+    if (
+        refresh.accepted_count == 0
+        or refresh.accepted_count != summary.parsed_item_count
+        or not summary.complete
+    ):
         raise InvalidSteamApisPayloadError
 
 
@@ -805,11 +1323,6 @@ def _booster_infos(
     resolved = resolutions or {}
     boosters: list[BoosterInfo] = []
     for game_app_id, game_name in games:
-        market_hash_name = (
-            _booster_market_hash_name(game_app_id, game_name)
-            if game_name is not None
-            else None
-        )
         resolution = resolved.get(game_app_id)
         try:
             is_valid_resolution = isinstance(
@@ -821,10 +1334,28 @@ def _booster_infos(
             is_valid_resolution = False
         if not is_valid_resolution:
             resolution = None
+        candidate_game_name = (
+            resolution.game_name
+            if resolution is not None
+            and isinstance(resolution.game_name, str)
+            and resolution.game_name.strip()
+            and len(resolution.game_name) <= MAX_INVENTORY_TEXT_LENGTH
+            and "\x00" not in resolution.game_name
+            else None
+        )
+        # Existing inventory metadata owns the ordinary booster identity and
+        # its price join.  Optimizer metadata supplies a name only when the
+        # inventory row did not provide one.
+        resolved_game_name = game_name or candidate_game_name
+        market_hash_name = (
+            _booster_market_hash_name(game_app_id, resolved_game_name)
+            if resolved_game_name is not None
+            else None
+        )
         boosters.append(
             BoosterInfo(
                 game_app_id=game_app_id,
-                game_name=game_name,
+                game_name=resolved_game_name,
                 market_hash_name=market_hash_name,
                 card_count=BOOSTER_CARD_COUNT,
                 card_set_size=resolution.card_set_size if resolution else None,
@@ -873,14 +1404,45 @@ class _PriceLookup:
     used_stale_cache: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _PriceStreamSummary:
+    app_id: int | None
+    declared_item_count: int | None
+    parsed_item_count: int
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.app_id == 753
+            and self.declared_item_count is not None
+            and self.declared_item_count == self.parsed_item_count
+        )
+
+
 @dataclass(slots=True)
 class _PriceFrame:
     parent_key: str | None
     pending_key: str | None = None
+    seen_keys: set[str] = field(default_factory=set)
     market_hash_name: str | None = None
     highest_buy: object = None
     lowest_sell: object = None
     observed_at: object = None
+    highest_buy_quantity: int | None = None
+    market_hash_seen: bool = False
+    lowest_sell_quantity: int | None = None
+    depth_kind: Literal["buy", "sell"] | None = None
+    depth_price: object = None
+    depth_quantity: object = None
+    depth_invalid: bool = False
+    buy_depth_present: bool = False
+    sell_depth_present: bool = False
+    buy_depth_invalid: bool = False
+    sell_depth_invalid: bool = False
+    buy_depth_rows: int = 0
+    sell_depth_rows: int = 0
+    buy_depth_totals: dict[str, int] = field(default_factory=dict)
+    sell_depth_totals: dict[str, int] = field(default_factory=dict)
 
 
 class _AsyncByteReader:
@@ -977,6 +1539,147 @@ def _provider_amount(value: object) -> str | None:
     return fixed if len(fixed) <= MAX_PRICE_STREAM_SCALAR_LENGTH else None
 
 
+def _provider_quantity(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        quantity = value
+    elif isinstance(value, str) and _ASCII_DIGITS.fullmatch(value):
+        try:
+            quantity = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return quantity if 0 <= quantity <= MAX_PRICE_QUANTITY else None
+
+
+def _depth_kind_for_prefix(prefix: str) -> Literal["buy", "sell"] | None:
+    parts = prefix.split(".")
+    if len(parts) < 2 or parts[-1] != "item":
+        return None
+    if parts[-2] in ("buyOrdersTop10", "buy_orders_top10"):
+        return "buy"
+    if parts[-2] in ("sellOrdersTop10", "sell_orders_top10"):
+        return "sell"
+    return None
+
+
+def _depth_kind_for_key(value: object) -> Literal["buy", "sell"] | None:
+    if value in ("buyOrdersTop10", "buy_orders_top10"):
+        return "buy"
+    if value in ("sellOrdersTop10", "sell_orders_top10"):
+        return "sell"
+    return None
+
+
+def _depth_price_key(value: object) -> str | None:
+    normalized = _provider_amount(value)
+    if normalized is None:
+        return None
+    try:
+        return format(Decimal(normalized).normalize(), "f")
+    except (ArithmeticError, ValueError, TypeError):
+        return None
+
+
+def _mark_depth_invalid(
+    frame: _PriceFrame,
+    kind: Literal["buy", "sell"],
+) -> None:
+    if kind == "buy":
+        frame.buy_depth_invalid = True
+    else:
+        frame.sell_depth_invalid = True
+
+
+def _start_depth_array(
+    frame: _PriceFrame,
+    kind: Literal["buy", "sell"],
+) -> None:
+    if kind == "buy":
+        if frame.buy_depth_present:
+            frame.buy_depth_invalid = True
+        frame.buy_depth_present = True
+    else:
+        if frame.sell_depth_present:
+            frame.sell_depth_invalid = True
+        frame.sell_depth_present = True
+
+
+def _record_depth_row(
+    order_book: _PriceFrame,
+    row: _PriceFrame,
+) -> None:
+    kind = row.depth_kind
+    if kind is None:
+        return
+    if row.depth_invalid:
+        _mark_depth_invalid(order_book, kind)
+        return
+    price = _depth_price_key(row.depth_price)
+    quantity = _provider_quantity(row.depth_quantity)
+    if price is None or quantity is None:
+        _mark_depth_invalid(order_book, kind)
+        return
+    if kind == "buy":
+        order_book.buy_depth_rows += 1
+        if order_book.buy_depth_rows > MAX_PRICE_DEPTH_ROWS:
+            order_book.buy_depth_invalid = True
+            return
+        totals = order_book.buy_depth_totals
+    else:
+        order_book.sell_depth_rows += 1
+        if order_book.sell_depth_rows > MAX_PRICE_DEPTH_ROWS:
+            order_book.sell_depth_invalid = True
+            return
+        totals = order_book.sell_depth_totals
+    previous = totals.get(price, 0)
+    total = previous + quantity
+    if total > MAX_PRICE_DEPTH_TOTAL_QUANTITY:
+        _mark_depth_invalid(order_book, kind)
+        return
+    totals[price] = total
+
+
+def _depth_extreme_price(
+    totals: Mapping[str, int],
+    *,
+    kind: Literal["buy", "sell"],
+) -> str | None:
+    if not totals:
+        return None
+    try:
+        prices = (Decimal(value) for value in totals)
+        extreme = max(prices) if kind == "buy" else min(prices)
+        return format(extreme.normalize(), "f")
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+
+
+def _finish_depth(order_book: _PriceFrame) -> None:
+    if order_book.buy_depth_present and not order_book.buy_depth_invalid:
+        top_price = _depth_price_key(order_book.highest_buy)
+        if top_price is not None and top_price == _depth_extreme_price(
+            order_book.buy_depth_totals,
+            kind="buy",
+        ):
+            order_book.highest_buy_quantity = order_book.buy_depth_totals.get(top_price)
+        else:
+            order_book.buy_depth_invalid = True
+    if order_book.sell_depth_present and not order_book.sell_depth_invalid:
+        top_price = _depth_price_key(order_book.lowest_sell)
+        if top_price is not None and top_price == _depth_extreme_price(
+            order_book.sell_depth_totals,
+            kind="sell",
+        ):
+            order_book.lowest_sell_quantity = order_book.sell_depth_totals.get(
+                top_price
+            )
+        else:
+            order_book.sell_depth_invalid = True
+
+
 def _observed_at(value: object) -> str | None:
     if isinstance(value, str):
         if len(value) > MAX_INVENTORY_TEXT_LENGTH:
@@ -1015,6 +1718,8 @@ def _price_from_frame(frame: _PriceFrame) -> InventoryPrice:
     return InventoryPrice(
         highest_buy=_provider_amount(frame.highest_buy),
         lowest_sell=_provider_amount(frame.lowest_sell),
+        highest_buy_quantity=frame.highest_buy_quantity,
+        lowest_sell_quantity=frame.lowest_sell_quantity,
         observed_at=_observed_at(frame.observed_at),
     )
 
@@ -1027,21 +1732,6 @@ def _merge_price(
 ) -> None:
     if price.highest_buy is None and price.lowest_sell is None:
         return
-    previous = prices.get(name)
-    if previous is not None:
-        price = InventoryPrice(
-            highest_buy=(
-                previous.highest_buy
-                if previous.highest_buy is not None
-                else price.highest_buy
-            ),
-            lowest_sell=(
-                previous.lowest_sell
-                if previous.lowest_sell is not None
-                else price.lowest_sell
-            ),
-            observed_at=previous.observed_at or price.observed_at,
-        )
     prices[name] = price
     priced_names.add(name)
 
@@ -1057,12 +1747,12 @@ def _price_lookup_from_cache(
             continue
         entry: CachedPrice | None = cache_read.prices.get(requested_name)
         if entry is None:
-            entry = cache_read.prices.get(unquote(requested_name))
-        if entry is None:
             continue
         prices[requested_name] = InventoryPrice(
             highest_buy=entry.highest_buy,
             lowest_sell=entry.lowest_sell,
+            highest_buy_quantity=entry.highest_buy_quantity,
+            lowest_sell_quantity=entry.lowest_sell_quantity,
             observed_at=entry.observed_at,
         )
         priced_names.add(requested_name)
@@ -1101,13 +1791,17 @@ async def _stream_prices(
     response: HTTPResponse,
     requested_names: frozenset[str],
     on_price: Callable[[str, InventoryPrice], None] | None = None,
-) -> tuple[dict[str, InventoryPrice], set[str]]:
+) -> tuple[dict[str, InventoryPrice], set[str], _PriceStreamSummary]:
     prices: dict[str, InventoryPrice] = {}
     priced_names: set[str] = set()
     stack: list[_PriceFrame] = []
     nesting = 0
     token_count = 0
     saw_items_array = False
+    metadata_app_id: int | None = None
+    declared_item_count: int | None = None
+    parsed_item_count = 0
+    seen_item_hashes: set[str] = set()
 
     async for prefix, event, value in ijson.parse_async(
         _AsyncByteReader(
@@ -1127,37 +1821,59 @@ async def _stream_prices(
                 raise InvalidSteamApisPayloadError
             parent = stack[-1] if stack else None
             parent_key = parent.pending_key if parent is not None else None
+            malformed_depth = (
+                _depth_kind_for_key(parent_key)
+                if parent is not None and parent.parent_key in ("orderBook", None)
+                else None
+            )
             if parent is not None:
                 parent.pending_key = None
-            stack.append(_PriceFrame(parent_key=parent_key))
+                if malformed_depth is not None:
+                    _start_depth_array(parent, malformed_depth)
+                    _mark_depth_invalid(parent, malformed_depth)
+            stack.append(
+                _PriceFrame(
+                    parent_key=parent_key,
+                    depth_kind=_depth_kind_for_prefix(prefix),
+                )
+            )
             continue
         if event == "end_map":
             if not stack:
                 raise InvalidSteamApisPayloadError
             frame = stack.pop()
             nesting -= 1
-            if frame.parent_key == "orderBook" and stack:
+            if frame.depth_kind is not None:
+                if not stack:
+                    raise InvalidSteamApisPayloadError
+                _record_depth_row(stack[-1], frame)
+            elif frame.parent_key == "orderBook" and stack:
                 parent = stack[-1]
+                _finish_depth(frame)
                 if frame.highest_buy is not None:
                     parent.highest_buy = frame.highest_buy
                 if frame.lowest_sell is not None:
                     parent.lowest_sell = frame.lowest_sell
-            if prefix == "items.item" and frame.market_hash_name:
-                raw_name = frame.market_hash_name
-                decoded_name = unquote(raw_name)
-                matches = (
-                    (raw_name,)
-                    if decoded_name == raw_name
-                    else (raw_name, decoded_name)
-                )
-                matched_names = tuple(
-                    candidate for candidate in matches if candidate in requested_names
+                if frame.highest_buy_quantity is not None:
+                    parent.highest_buy_quantity = frame.highest_buy_quantity
+                if frame.lowest_sell_quantity is not None:
+                    parent.lowest_sell_quantity = frame.lowest_sell_quantity
+                if frame.observed_at is not None:
+                    parent.observed_at = frame.observed_at
+            if prefix == "items.item":
+                _finish_depth(frame)
+                decoded_name = _canonical_market_hash_name(frame.market_hash_name)
+                if decoded_name is None or decoded_name in seen_item_hashes:
+                    raise InvalidSteamApisPayloadError
+                seen_item_hashes.add(decoded_name)
+                parsed_item_count += 1
+                matched_names = (
+                    (decoded_name,) if decoded_name in requested_names else ()
                 )
                 price: InventoryPrice | None = None
                 if on_price is not None:
                     price = _price_from_frame(frame)
-                    if price.highest_buy is not None or price.lowest_sell is not None:
-                        on_price(decoded_name, price)
+                    on_price(decoded_name, price)
                 # Do not parse numbers or allocate an InventoryPrice for the
                 # hundreds of thousands of unrequested feed entries unless a
                 # cache refresh is actively persisting this complete feed.
@@ -1170,28 +1886,78 @@ async def _stream_prices(
         if event == "map_key":
             if not stack or not isinstance(value, str):
                 raise InvalidSteamApisPayloadError
-            stack[-1].pending_key = value
+            frame = stack[-1]
+            semantic_key = _PRICE_STREAM_SEMANTIC_KEYS.get(value, value)
+            if semantic_key in frame.seen_keys:
+                raise InvalidSteamApisPayloadError
+            frame.seen_keys.add(semantic_key)
+            frame.pending_key = value
             continue
         if event == "start_array":
+            if prefix == "items.item":
+                raise InvalidSteamApisPayloadError
             if prefix == "items":
                 saw_items_array = True
+            malformed_depth_kind = _depth_kind_for_prefix(prefix)
+            if malformed_depth_kind is not None:
+                if not stack:
+                    raise InvalidSteamApisPayloadError
+                _mark_depth_invalid(stack[-1], malformed_depth_kind)
             nesting += 1
             if nesting > MAX_PRICE_STREAM_NESTING:
                 raise InvalidSteamApisPayloadError
             if stack:
-                stack[-1].pending_key = None
+                frame = stack[-1]
+                if frame.parent_key in ("orderBook", None):
+                    depth_kind = _depth_kind_for_key(frame.pending_key)
+                    if depth_kind is not None:
+                        _start_depth_array(frame, depth_kind)
+                frame.pending_key = None
             continue
         if event == "end_array":
             nesting -= 1
             if nesting < 0:
                 raise InvalidSteamApisPayloadError
             continue
+        if prefix == "items.item":
+            raise InvalidSteamApisPayloadError
         if not stack:
             continue
         frame = stack[-1]
         key = frame.pending_key
         frame.pending_key = None
-        if key in ("marketHashName", "market_hash_name") and event == "string":
+        depth_kind = _depth_kind_for_prefix(prefix)
+        if frame.depth_kind is not None:
+            if key == "price" and event in ("number", "string"):
+                if frame.depth_price is not None:
+                    frame.depth_invalid = True
+                frame.depth_price = value
+            elif key == "quantity" and event in ("number", "string"):
+                if frame.depth_quantity is not None:
+                    frame.depth_invalid = True
+                frame.depth_quantity = value
+            elif key in ("price", "quantity"):
+                frame.depth_invalid = True
+        elif depth_kind is not None:
+            # A scalar member in a top-ten array is not a verified row.
+            _mark_depth_invalid(frame, depth_kind)
+        elif prefix == "metadata.appId" and event == "number":
+            if metadata_app_id is not None or not _is_integer(value):
+                raise InvalidSteamApisPayloadError
+            metadata_app_id = value
+        elif prefix == "metadata.itemCount" and event == "number":
+            if (
+                declared_item_count is not None
+                or not _is_integer(value)
+                or value < 0
+                or value > MAX_PRICE_STREAM_TOKENS
+            ):
+                raise InvalidSteamApisPayloadError
+            declared_item_count = value
+        elif key in ("marketHashName", "market_hash_name"):
+            if frame.market_hash_seen or event != "string":
+                raise InvalidSteamApisPayloadError
+            frame.market_hash_seen = True
             frame.market_hash_name = value
         elif key in ("highestBuy", "highest_buy") and frame.parent_key == "orderBook":
             frame.highest_buy = value
@@ -1199,10 +1965,26 @@ async def _stream_prices(
             frame.lowest_sell = value
         elif key in ("updatedAt", "updated_at") and event in ("number", "string"):
             frame.observed_at = value
+        elif (
+            frame.parent_key in ("orderBook", None)
+            and _depth_kind_for_key(key) is not None
+        ):
+            malformed_kind = _depth_kind_for_key(key)
+            if malformed_kind is not None:
+                _start_depth_array(frame, malformed_kind)
+                _mark_depth_invalid(frame, malformed_kind)
 
     if not token_count or not saw_items_array or stack or nesting:
         raise InvalidSteamApisPayloadError
-    return prices, priced_names
+    return (
+        prices,
+        priced_names,
+        _PriceStreamSummary(
+            app_id=metadata_app_id,
+            declared_item_count=declared_item_count,
+            parsed_item_count=parsed_item_count,
+        ),
+    )
 
 
 class SteamApisClient:
@@ -1634,9 +2416,6 @@ class SteamApisClient:
             )
 
         cache_names: set[str] = set(requested_names)
-        cache_names.update(
-            unquote(name) for name in requested_names if isinstance(name, str)
-        )
         cache_read = self.price_cache.read(cache_names)
         if self._api_headers() is None:
             return _price_lookup_from_cache(cache_read, requested_names)
@@ -1656,6 +2435,56 @@ class SteamApisClient:
         cache_read = self.price_cache.read(cache_names)
         return _price_lookup_from_cache(cache_read, requested_names)
 
+    def read_price_catalog(
+        self,
+        *,
+        max_rows: int | None = None,
+    ) -> NormalCardCatalogRead:
+        if max_rows is None:
+            return self.price_cache.read_catalog()
+        return self.price_cache.read_catalog(max_rows=max_rows)
+
+    async def ensure_price_catalog_fresh(
+        self,
+        *,
+        max_age_seconds: int = LEVEL_UP_PRICE_MAX_AGE_SECONDS,
+    ) -> bool:
+        """Ensure the global generation is fresh under a caller's contract."""
+
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, int)
+            or max_age_seconds <= 0
+        ):
+            return False
+        for _ in range(2):
+            cache_read = self.price_cache.read()
+            if (
+                cache_read.has_generation
+                and cache_read.generation_age_seconds is not None
+                and cache_read.generation_age_seconds <= max_age_seconds
+            ):
+                return True
+            if self._api_headers() is None or cache_read.retry_suppressed:
+                return False
+            task = self._price_refresh_task
+            if task is None:
+                task = asyncio.create_task(
+                    self._refresh_prices(max_age_seconds=max_age_seconds)
+                )
+                self._price_refresh_task = task
+                task.add_done_callback(self._discard_price_refresh_task)
+            try:
+                await asyncio.shield(task)
+            finally:
+                self._discard_price_refresh_task(task)
+        refreshed = self.price_cache.read()
+        return (
+            refreshed.has_generation
+            and refreshed.generation_age_seconds is not None
+            and refreshed.generation_age_seconds <= max_age_seconds
+        )
+
     def _discard_price_refresh_task(
         self,
         task: asyncio.Future[bool],
@@ -1663,11 +2492,21 @@ class SteamApisClient:
         if task.done() and self._price_refresh_task is task:
             self._price_refresh_task = None
 
-    async def _refresh_prices(self) -> bool:
+    async def _refresh_prices(
+        self,
+        *,
+        max_age_seconds: int = 86_400,
+    ) -> bool:
         lock = _price_refresh_lock(self.price_cache)
         async with lock:
             cache_read = self.price_cache.read()
-            if cache_read.fresh or cache_read.retry_suppressed:
+            if (
+                cache_read.has_generation
+                and cache_read.generation_age_seconds is not None
+                and cache_read.generation_age_seconds <= max_age_seconds
+            ):
+                return True
+            if cache_read.retry_suppressed:
                 return True
             return await self._refresh_prices_uncached()
 
@@ -1697,7 +2536,7 @@ class SteamApisClient:
                 _validate_bulk_response(cdn_response)
                 refresh_session = self.price_cache.begin_refresh()
                 refresh = refresh_session
-                await _stream_prices(
+                _, _, stream_summary = await _stream_prices(
                     cdn_response,
                     frozenset(),
                     on_price=lambda name, price: refresh_session.add(
@@ -1705,10 +2544,12 @@ class SteamApisClient:
                         price.highest_buy,
                         price.lowest_sell,
                         price.observed_at,
+                        price.highest_buy_quantity,
+                        price.lowest_sell_quantity,
                     ),
                 )
-            _validate_price_generation(refresh_session)
-            refresh_session.commit()
+            _validate_price_generation(refresh_session, stream_summary)
+            refresh_session.commit(optimizer_complete=True)
         except _PRICE_STREAM_JSON_ERRORS:
             pass
         except (
@@ -1848,6 +2689,585 @@ class SteamGateway:
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         return await self.steamapis.fetch_inventory(steam_id)
+
+    async def _fetch_badge_state(self, steam_id: str) -> BadgeState:
+        api_key = self.settings.steam_web_api_key
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise InvalidSteamApisPayloadError
+        if (
+            not isinstance(steam_id, str)
+            or not steam_id
+            or len(steam_id) > 20
+            or not _ASCII_DIGITS.fullmatch(steam_id)
+        ):
+            raise InvalidSteamApisPayloadError
+        params = {"key": api_key.strip(), "steamid": steam_id}
+        async with self.http_client.stream(
+            "GET",
+            BADGES_ENDPOINT,
+            params=params,
+            follow_redirects=False,
+        ) as response:
+            if (
+                not 200 <= response.status_code < 300
+                or not _response_content_length_within(
+                    response, MAX_BADGE_RESPONSE_BYTES
+                )
+            ):
+                raise InvalidSteamApisPayloadError
+            body = bytearray()
+            try:
+                async for chunk in response.aiter_bytes():
+                    _append_bounded_bytes(body, chunk, MAX_BADGE_RESPONSE_BYTES)
+            except InvalidSteamApisPayloadError:
+                raise
+            except (TypeError, ValueError, OSError, RuntimeError) as error:
+                raise InvalidSteamApisPayloadError from error
+        try:
+            payload = json.loads(
+                bytes(body).decode("utf-8"),
+                object_pairs_hook=reject_duplicate_object_keys,
+            )
+        except (TypeError, UnicodeDecodeError, ValueError, RecursionError):
+            raise InvalidSteamApisPayloadError from None
+        return _parse_badges_payload(payload)
+
+    async def check_level_up(
+        self,
+        steam_id: str,
+        holdings: Sequence[Holding],
+        inventory_refreshed_at: datetime | str | int,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> LevelUpOptimizationResponse:
+        """Return one read-only recommendation without touching inventory APIs."""
+
+        current = _level_up_timestamp(now) if now is not None else datetime.now(UTC)
+        if current is None:
+            current = datetime.now(UTC)
+        inventory_time = _level_up_timestamp(inventory_refreshed_at)
+        safe_inventory_time = inventory_time or current
+        try:
+            contract = self.settings.level_up_money_contract
+        except (AttributeError, TypeError, ValueError, ArithmeticError):
+            contract = None
+        if not holdings:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=contract,
+            )
+        if contract is None:
+            return _level_up_response(
+                status="unavailable",
+                reason="currency_contract_missing",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=None,
+            )
+        api_key = self.settings.steam_web_api_key
+        if not isinstance(api_key, str) or not api_key.strip():
+            return _level_up_response(
+                status="unavailable",
+                reason="steam_web_api_key_missing",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=contract,
+            )
+        if inventory_time is None or current < inventory_time:
+            return _level_up_response(
+                status="unavailable",
+                reason="inventory_snapshot_too_old",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=contract,
+            )
+        try:
+            inventory_age = current - inventory_time
+            inventory_limit = contract.max_inventory_age_seconds
+            inventory_valid = inventory_age <= timedelta(seconds=inventory_limit)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            inventory_valid = False
+        if not inventory_valid:
+            return _level_up_response(
+                status="unavailable",
+                reason="inventory_snapshot_too_old",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=contract,
+            )
+        quote_limit = getattr(contract, "max_quote_age_seconds", None)
+        if (
+            isinstance(quote_limit, bool)
+            or not isinstance(quote_limit, int)
+            or quote_limit <= 0
+        ):
+            return _level_up_response(
+                status="unavailable",
+                reason="price_generation_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+
+        try:
+            price_ready = await self.steamapis.ensure_price_catalog_fresh(
+                max_age_seconds=quote_limit
+            )
+            catalog_read = self.steamapis.read_price_catalog(
+                max_rows=MAX_LEVEL_UP_CATALOG_ROWS
+            )
+        except (
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+            ArithmeticError,
+            RuntimeError,
+            sqlite3.Error,
+        ):
+            price_ready = False
+            catalog_read = NormalCardCatalogRead(0, None, {})
+        if now is None:
+            current = datetime.now(UTC)
+        if not price_ready:
+            reason = (
+                "price_generation_stale"
+                if catalog_read.has_generation
+                else "price_generation_unavailable"
+            )
+            return _level_up_response(
+                status="unavailable",
+                reason=reason,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        if (
+            catalog_read.generation <= 0
+            or catalog_read.refreshed_at is None
+            or catalog_read.truncated
+            or not catalog_read.optimizer_complete
+        ):
+            return _level_up_response(
+                status="unavailable",
+                reason="price_generation_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        try:
+            generated_at = datetime.fromtimestamp(catalog_read.refreshed_at, UTC)
+        except (OverflowError, OSError, ValueError, TypeError):
+            return _level_up_response(
+                status="unavailable",
+                reason="price_generation_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        freshness_issue = _level_up_snapshot_issue(
+            current=current,
+            inventory_time=inventory_time,
+            generated_at=generated_at,
+            inventory_limit=contract.max_inventory_age_seconds,
+            quote_limit=quote_limit,
+        )
+        if freshness_issue is not None:
+            return _level_up_response(
+                status="unavailable",
+                reason=freshness_issue,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+
+        try:
+            badge_state = await self._fetch_badge_state(steam_id)
+        except (
+            InvalidSteamApisPayloadError,
+            httpx2.HTTPError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+            ArithmeticError,
+            RuntimeError,
+        ):
+            return _level_up_response(
+                status="unavailable",
+                reason="badge_data_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        if now is None:
+            current = datetime.now(UTC)
+        freshness_issue = _level_up_snapshot_issue(
+            current=current,
+            inventory_time=inventory_time,
+            generated_at=generated_at,
+            inventory_limit=contract.max_inventory_age_seconds,
+            quote_limit=quote_limit,
+        )
+        if freshness_issue is not None:
+            return _level_up_response(
+                status="unavailable",
+                reason=freshness_issue,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+
+        groups = _catalog_groups(catalog_read)
+        if not groups:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        if not all(isinstance(holding, Holding) for holding in holdings):
+            return _level_up_response(
+                status="unavailable",
+                reason="quote_depth_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        normalized_holdings = tuple(holdings)
+        holdings_by_hash = {
+            holding.market_hash_name: holding for holding in normalized_holdings
+        }
+        apparent_source_ids = tuple(
+            app_id
+            for app_id, cards in groups.items()
+            if badge_state.level_for_game(app_id) < 5
+            and all(
+                (
+                    (holding := holdings_by_hash.get(card.market_hash_name)) is not None
+                    and holding.owned_quantity >= 1
+                    and holding.sellable_quantity >= 1
+                )
+                for card in cards
+            )
+        )
+        if not apparent_source_ids:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(groups),
+            )
+
+        provider = self.steamapis.booster_pricing
+
+        async def resolve_metadata(
+            candidate_ids: tuple[str, ...],
+        ) -> tuple[dict[str, BoosterResolution], tuple[str, ...]]:
+            if not candidate_ids:
+                return {}, ()
+
+            def read_metadata_state() -> tuple[
+                dict[str, BoosterResolution], tuple[str, ...]
+            ]:
+                state = provider.read_metadata_state(candidate_ids)
+                if not isinstance(state, BoosterMetadataState):
+                    return {}, candidate_ids
+                values = {
+                    str(key): value
+                    for key, value in state.values.items()
+                    if str(key) in candidate_ids
+                }
+                pending = tuple(
+                    app_id
+                    for app_id in state.pending_app_ids
+                    if app_id in candidate_ids
+                )
+                return values, pending
+
+            try:
+                fresh_values, pending_ids = read_metadata_state()
+            except (
+                AttributeError,
+                OSError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+            ):
+                fresh_values, pending_ids = {}, candidate_ids
+            if pending_ids:
+                shortlist = pending_ids[:MAX_LEVEL_UP_METADATA_APPS]
+                with suppress(
+                    AttributeError,
+                    OSError,
+                    TimeoutError,
+                    TypeError,
+                    ValueError,
+                    ArithmeticError,
+                    RuntimeError,
+                ):
+                    await provider.resolve(
+                        shortlist,
+                        require_game_name=True,
+                    )
+                with suppress(
+                    AttributeError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    ArithmeticError,
+                    RuntimeError,
+                ):
+                    fresh_values, pending_ids = read_metadata_state()
+            return fresh_values, pending_ids
+
+        def qualified_resolution(
+            app_id: int,
+            values: dict[str, BoosterResolution],
+        ) -> BoosterResolution | None:
+            resolution = values.get(str(app_id))
+            if not isinstance(resolution, BoosterResolution):
+                return None
+            cards = groups[app_id]
+            if (
+                resolution.card_set_size != len(cards)
+                or not isinstance(resolution.game_name, str)
+                or not resolution.game_name.strip()
+            ):
+                return None
+            return resolution
+
+        source_candidate_ids = tuple(str(app_id) for app_id in apparent_source_ids)
+        source_values, pending_ids = await resolve_metadata(source_candidate_ids)
+        if now is None:
+            current = datetime.now(UTC)
+        freshness_issue = _level_up_snapshot_issue(
+            current=current,
+            inventory_time=inventory_time,
+            generated_at=generated_at,
+            inventory_limit=contract.max_inventory_age_seconds,
+            quote_limit=quote_limit,
+        )
+        if freshness_issue is not None:
+            return _level_up_response(
+                status="unavailable",
+                reason=freshness_issue,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(source_values),
+            )
+        if pending_ids:
+            total_sets = len(source_candidate_ids)
+            pending = len(pending_ids)
+            return _level_up_response(
+                status="warming",
+                reason="catalog_warming",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=total_sets,
+                resolved_sets=max(0, total_sets - pending),
+                pending_sets=pending,
+            )
+        qualified_resolutions = {
+            app_id: resolution
+            for app_id in apparent_source_ids
+            if (resolution := qualified_resolution(app_id, source_values)) is not None
+        }
+        if not qualified_resolutions:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(source_candidate_ids),
+                resolved_sets=len(source_candidate_ids),
+            )
+
+        (
+            source_ids,
+            _source_proceeds,
+            destination_costs,
+            quote_issue,
+        ) = _strict_catalog_candidates(
+            groups,
+            holdings_by_hash,
+            badge_state,
+            now=current,
+            quote_window=quote_limit,
+            contract=contract,
+            qualified_source_ids=frozenset(qualified_resolutions),
+        )
+        if quote_issue is not None:
+            return _level_up_response(
+                status="unavailable",
+                reason=quote_issue,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(qualified_resolutions),
+            )
+        if not source_ids:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(qualified_resolutions),
+            )
+
+        destination_ids = tuple(str(app_id) for _, app_id in destination_costs)
+        destination_values, pending_ids = await resolve_metadata(destination_ids)
+        if now is None:
+            current = datetime.now(UTC)
+        freshness_issue = _level_up_snapshot_issue(
+            current=current,
+            inventory_time=inventory_time,
+            generated_at=generated_at,
+            inventory_limit=contract.max_inventory_age_seconds,
+            quote_limit=quote_limit,
+        )
+        if freshness_issue is not None:
+            return _level_up_response(
+                status="unavailable",
+                reason=freshness_issue,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(qualified_resolutions),
+            )
+        if pending_ids:
+            total_sets = len(source_ids) + len(destination_ids)
+            pending = len(pending_ids)
+            return _level_up_response(
+                status="warming",
+                reason="catalog_warming",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=total_sets,
+                resolved_sets=max(0, total_sets - pending),
+                pending_sets=pending,
+            )
+        for app_id in source_ids:
+            quote_issue = _catalog_quote_issue(
+                groups[app_id],
+                side="buy",
+                now=current,
+                quote_window=quote_limit,
+                contract=contract,
+            )
+            if quote_issue is not None:
+                return _level_up_response(
+                    status="unavailable",
+                    reason=quote_issue,
+                    now=current,
+                    inventory_time=inventory_time,
+                    contract=contract,
+                    total_sets=len(groups),
+                    resolved_sets=len(qualified_resolutions),
+                )
+        for _, app_id in destination_costs:
+            resolution = qualified_resolution(app_id, destination_values)
+            if resolution is None:
+                continue
+            quote_issue = _catalog_quote_issue(
+                groups[app_id],
+                side="sell",
+                now=current,
+                quote_window=quote_limit,
+                contract=contract,
+            )
+            if quote_issue is not None:
+                return _level_up_response(
+                    status="unavailable",
+                    reason=quote_issue,
+                    now=current,
+                    inventory_time=inventory_time,
+                    contract=contract,
+                    total_sets=len(groups),
+                    resolved_sets=len(qualified_resolutions),
+                )
+            qualified_resolutions[app_id] = resolution
+
+        resolved_sets: list[CatalogSet] = []
+        for app_id, resolution in qualified_resolutions.items():
+            cards = groups[app_id]
+            game_name = resolution.game_name
+            if not isinstance(game_name, str) or not game_name.strip():
+                continue
+            try:
+                resolved_sets.append(
+                    CatalogSet(
+                        app_id=app_id,
+                        game_name=game_name.strip(),
+                        cards=cards,
+                        set_size=resolution.card_set_size,
+                        resolved=True,
+                    )
+                )
+            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+                continue
+        complete_catalog = ResolvedCatalog(
+            generation=catalog_read.generation,
+            generated_at=generated_at,
+            sets=tuple(resolved_sets),
+            complete=True,
+        )
+        catalog_hashes = {
+            card.market_hash_name
+            for current_set in complete_catalog.sets
+            for card in current_set.cards
+        }
+        filtered_holdings = tuple(
+            holding
+            for holding in normalized_holdings
+            if holding.market_hash_name in catalog_hashes
+        )
+        try:
+            return optimize_level_up(
+                complete_catalog,
+                filtered_holdings,
+                badge_state,
+                inventory_time,
+                current,
+                contract,
+            )
+        except OptimizerInputError as error:
+            reason = error.reason
+            if reason not in {
+                "inventory_snapshot_too_old",
+                "price_generation_unavailable",
+                "price_generation_stale",
+                "quote_depth_unavailable",
+                "badge_data_unavailable",
+                "currency_contract_missing",
+            }:
+                reason = "quote_depth_unavailable"
+            return _level_up_response(
+                status="unavailable",
+                reason=reason,
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(resolved_sets),
+            )
 
     async def refresh_gems(
         self,

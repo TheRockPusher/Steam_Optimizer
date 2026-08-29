@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-PRICE_CACHE_SCHEMA_VERSION = 1
+PRICE_CACHE_SCHEMA_VERSION = 3
 PRICE_CACHE_TTL_SECONDS = 86_400
 PRICE_REFRESH_RETRY_BASE_SECONDS = 60
 PRICE_REFRESH_RETRY_MAX_SECONDS = 3_600
@@ -22,24 +22,38 @@ MAX_PRICE_AMOUNT = Decimal(10000000000)
 MAX_PRICE_DECIMAL_DIGITS = 64
 MAX_PRICE_TEXT_LENGTH = 16_384
 MAX_OBSERVED_AT_TEXT_LENGTH = 8_192
+MAX_PRICE_QUANTITY = 1_000_000_000
+MAX_NORMAL_CARD_APP_ID = 2**63 - 1
+MAX_NORMAL_CARD_NAME_LENGTH = MAX_PRICE_TEXT_LENGTH
+MAX_NORMAL_CARD_CATALOG_ROWS = 250_000
 _MAX_OBSERVED_AT_MILLISECONDS = Decimal(253402300799999)
 _MAX_GENERATION = 2**63 - 1
 _MAX_FAILURE_COUNT = 16
 _BATCH_SIZE = 512
 
 _PRICE_AMOUNT_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_NORMAL_CARD_PATTERN = re.compile(r"^([1-9][0-9]*)-(.+) \(Trading Card\)$")
 
 _PRICE_TABLE_NAME = "steamapis_price_cache"
 _PRICE_META_TABLE_NAME = "steamapis_price_cache_meta"
+_PRICE_INDEX_NAME = "steamapis_price_cache_generation_app_id_idx"
 _PRICE_TABLE_SQL = """
 CREATE TABLE steamapis_price_cache (
     generation INTEGER NOT NULL,
     market_hash_name TEXT NOT NULL,
     highest_buy TEXT,
     lowest_sell TEXT,
+    highest_buy_quantity INTEGER,
+    lowest_sell_quantity INTEGER,
+    normal_card_app_id INTEGER,
+    normal_card_name TEXT,
     observed_at TEXT,
     PRIMARY KEY (generation, market_hash_name)
 )
+"""
+_PRICE_INDEX_SQL = f"""
+CREATE INDEX {_PRICE_INDEX_NAME}
+    ON {_PRICE_TABLE_NAME} (generation, normal_card_app_id)
 """
 _PRICE_META_TABLE_SQL = """
 CREATE TABLE steamapis_price_cache_meta (
@@ -48,7 +62,8 @@ CREATE TABLE steamapis_price_cache_meta (
     refreshed_at REAL NOT NULL,
     failed_at REAL,
     retry_until REAL NOT NULL,
-    failure_count INTEGER NOT NULL
+    failure_count INTEGER NOT NULL,
+    optimizer_complete INTEGER NOT NULL CHECK (optimizer_complete IN (0, 1))
 )
 """
 _PRICE_TABLE_INFO = (
@@ -56,6 +71,10 @@ _PRICE_TABLE_INFO = (
     ("market_hash_name", "TEXT", 1, None, 2),
     ("highest_buy", "TEXT", 0, None, 0),
     ("lowest_sell", "TEXT", 0, None, 0),
+    ("highest_buy_quantity", "INTEGER", 0, None, 0),
+    ("lowest_sell_quantity", "INTEGER", 0, None, 0),
+    ("normal_card_app_id", "INTEGER", 0, None, 0),
+    ("normal_card_name", "TEXT", 0, None, 0),
     ("observed_at", "TEXT", 0, None, 0),
 )
 _PRICE_META_TABLE_INFO = (
@@ -65,6 +84,11 @@ _PRICE_META_TABLE_INFO = (
     ("failed_at", "REAL", 0, None, 0),
     ("retry_until", "REAL", 1, None, 0),
     ("failure_count", "INTEGER", 1, None, 0),
+    ("optimizer_complete", "INTEGER", 1, None, 0),
+)
+_PRICE_INDEX_INFO = (
+    (0, "generation"),
+    (1, "normal_card_app_id"),
 )
 _CACHE_CONNECTION_ERROR = "SQLite connection was not created."
 _CACHE_READ_ONLY_REPLACE_ERROR = "Cannot replace a read-only or missing SQLite cache."
@@ -72,6 +96,7 @@ _CACHE_SCHEMA_VERSION_TYPE_ERROR = "schema_version must be an integer."
 _CACHE_SCHEMA_VERSION_VALUE_ERROR = "schema_version must be positive."
 _CACHE_USER_VERSION_UNAVAILABLE_ERROR = "SQLite user_version is unavailable."
 _PRICE_REFRESH_CLOSED_ERROR = "Price refresh is closed."
+_DUPLICATE_MARKET_HASH_ERROR = "Duplicate market hash in price generation."
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +105,56 @@ class CachedPrice:
     highest_buy: str | None
     lowest_sell: str | None
     observed_at: str | None
+    highest_buy_quantity: int | None = None
+    lowest_sell_quantity: int | None = None
+    normal_card_app_id: int | None = None
+    normal_card_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NormalCardCatalogRead:
+    """The bounded, current-generation normal-card catalog."""
+
+    generation: int
+    refreshed_at: float | None
+    groups: dict[int, tuple[CachedPrice, ...]]
+    row_count: int = 0
+    truncated: bool = False
+    optimizer_complete: bool = False
+
+    @property
+    def fresh(self) -> bool:
+        return (
+            self.generation > 0
+            and self.refreshed_at is not None
+            and time.time() < self.refreshed_at + PRICE_CACHE_TTL_SECONDS
+        )
+
+    @property
+    def has_generation(self) -> bool:
+        return self.generation > 0 and self.refreshed_at is not None
+
+    @property
+    def generation_age_seconds(self) -> float | None:
+        if self.refreshed_at is None:
+            return None
+        return max(0.0, time.time() - self.refreshed_at)
+
+    @property
+    def cards(self) -> dict[int, tuple[CachedPrice, ...]]:
+        return self.groups
+
+    @property
+    def by_app_id(self) -> dict[int, tuple[CachedPrice, ...]]:
+        return self.groups
+
+    @property
+    def rows(self) -> tuple[CachedPrice, ...]:
+        return tuple(entry for entries in self.groups.values() for entry in entries)
+
+    @property
+    def prices(self) -> dict[str, CachedPrice]:
+        return {entry.market_hash_name: entry for entry in self.rows}
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +164,7 @@ class PriceCacheRead:
     retry_until: float
     failure_count: int
     prices: dict[str, CachedPrice]
+    optimizer_complete: bool = False
 
     @property
     def fresh(self) -> bool:
@@ -106,6 +182,12 @@ class PriceCacheRead:
     def has_generation(self) -> bool:
         return self.generation > 0 and self.refreshed_at is not None
 
+    @property
+    def generation_age_seconds(self) -> float | None:
+        if self.refreshed_at is None:
+            return None
+        return max(0.0, time.time() - self.refreshed_at)
+
 
 @dataclass(slots=True)
 class _CacheMeta:
@@ -114,6 +196,7 @@ class _CacheMeta:
     failed_at: float | None
     retry_until: float
     failure_count: int
+    optimizer_complete: bool
 
 
 class SteamApisPriceCache:
@@ -236,6 +319,45 @@ class SteamApisPriceCache:
         ).fetchone()
         return row[0] if row is not None and isinstance(row[0], str) else None
 
+    @staticmethod
+    def _index_signature(
+        connection: sqlite3.Connection,
+        index_name: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        rows = connection.execute(f"PRAGMA index_info({index_name})").fetchall()
+        return tuple((row[0], row[2]) for row in rows)
+
+    @staticmethod
+    def _index_sql(
+        connection: sqlite3.Connection,
+        index_name: str,
+    ) -> str | None:
+        row = connection.execute(
+            """
+            SELECT sql
+              FROM sqlite_master
+             WHERE type = 'index' AND name = ? COLLATE NOCASE
+            """,
+            (index_name,),
+        ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], str) else None
+
+    @classmethod
+    def _is_compatible_index(
+        cls,
+        connection: sqlite3.Connection,
+        index_name: str,
+        expected_info: tuple[tuple[object, ...], ...],
+        expected_sql: str,
+    ) -> bool:
+        index_sql = cls._index_sql(connection, index_name)
+        return (
+            cls._object_type(connection, index_name) == "index"
+            and cls._index_signature(connection, index_name) == expected_info
+            and index_sql is not None
+            and cls._normalized_sql(index_sql) == cls._normalized_sql(expected_sql)
+        )
+
     @classmethod
     def _is_compatible_table(
         cls,
@@ -282,12 +404,13 @@ class SteamApisPriceCache:
     def _schema_state(
         self,
         connection: sqlite3.Connection,
-    ) -> tuple[int, bool, bool, str | None, str | None]:
+    ) -> tuple[int, bool, bool, bool, str | None, str | None, str | None]:
         row = connection.execute("PRAGMA user_version").fetchone()
         if row is None or not isinstance(row[0], int):
             raise sqlite3.DatabaseError(_CACHE_USER_VERSION_UNAVAILABLE_ERROR)
         price_object = self._object_type(connection, _PRICE_TABLE_NAME)
         meta_object = self._object_type(connection, _PRICE_META_TABLE_NAME)
+        index_object = self._object_type(connection, _PRICE_INDEX_NAME)
         price_compatible = price_object == "table" and self._is_compatible_table(
             connection,
             _PRICE_TABLE_NAME,
@@ -300,28 +423,69 @@ class SteamApisPriceCache:
             _PRICE_META_TABLE_INFO,
             _PRICE_META_TABLE_SQL,
         )
-        return row[0], price_compatible, meta_compatible, price_object, meta_object
+        index_compatible = price_compatible and self._is_compatible_index(
+            connection,
+            _PRICE_INDEX_NAME,
+            _PRICE_INDEX_INFO,
+            _PRICE_INDEX_SQL,
+        )
+        return (
+            row[0],
+            price_compatible,
+            meta_compatible,
+            index_compatible,
+            price_object,
+            meta_object,
+            index_object,
+        )
 
     def _initialize(self, connection: sqlite3.Connection) -> None:
-        initial_version, initial_price, initial_meta, _, _ = self._schema_state(
-            connection
-        )
-        if initial_version == self.schema_version and initial_price and initial_meta:
+        (
+            initial_version,
+            initial_price,
+            initial_meta,
+            initial_index,
+            _,
+            _,
+            _,
+        ) = self._schema_state(connection)
+        if (
+            initial_version == self.schema_version
+            and initial_price
+            and initial_meta
+            and initial_index
+        ):
             return
         try:
             connection.execute("BEGIN IMMEDIATE")
-            version, price_compatible, meta_compatible, price_object, meta_object = (
-                self._schema_state(connection)
-            )
-            if version == self.schema_version and price_compatible and meta_compatible:
+            (
+                version,
+                price_compatible,
+                meta_compatible,
+                index_compatible,
+                price_object,
+                meta_object,
+                index_object,
+            ) = self._schema_state(connection)
+            if (
+                version == self.schema_version
+                and price_compatible
+                and meta_compatible
+                and index_compatible
+            ):
                 connection.commit()
                 return
             if version == 0 and price_compatible and meta_compatible:
+                if not index_compatible:
+                    self._drop_object(connection, _PRICE_INDEX_NAME, index_object)
+                    connection.execute(_PRICE_INDEX_SQL)
                 connection.execute(f"PRAGMA user_version = {self.schema_version}")
             else:
                 self._drop_object(connection, _PRICE_TABLE_NAME, price_object)
                 self._drop_object(connection, _PRICE_META_TABLE_NAME, meta_object)
+                self._drop_object(connection, _PRICE_INDEX_NAME, index_object)
                 connection.execute(_PRICE_TABLE_SQL)
+                connection.execute(_PRICE_INDEX_SQL)
                 connection.execute(_PRICE_META_TABLE_SQL)
                 connection.execute(f"PRAGMA user_version = {self.schema_version}")
             connection.commit()
@@ -331,6 +495,7 @@ class SteamApisPriceCache:
                 initial_version == 0
                 and initial_price
                 and initial_meta
+                and initial_index
                 and self._is_read_only(error)
             ):
                 return
@@ -447,6 +612,42 @@ class SteamApisPriceCache:
         return value
 
     @staticmethod
+    def _normalize_quantity(value: object) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            try:
+                parsed = int(value)
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed if 0 <= parsed <= MAX_PRICE_QUANTITY else None
+
+    @staticmethod
+    def _normal_card_metadata(value: object) -> tuple[int, str] | None:
+        if not isinstance(value, str):
+            return None
+        match = _NORMAL_CARD_PATTERN.fullmatch(value)
+        if match is None:
+            return None
+        try:
+            app_id = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        card_name = match.group(2)
+        if (
+            not 0 < app_id <= MAX_NORMAL_CARD_APP_ID
+            or not card_name
+            or len(card_name) > MAX_NORMAL_CARD_NAME_LENGTH
+            or "\x00" in card_name
+        ):
+            return None
+        return app_id, card_name
+
+    @staticmethod
     def _normalize_amount(value: object) -> str | None:
         if value is None or isinstance(value, bool):
             return None
@@ -501,27 +702,52 @@ class SteamApisPriceCache:
         return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
     @classmethod
-    def _entry(cls, row: tuple[object, ...]) -> CachedPrice | None:
-        if len(row) != 5:
+    def _entry(
+        cls,
+        row: tuple[object, ...],
+        *,
+        allow_empty_prices: bool = False,
+    ) -> CachedPrice | None:
+        if len(row) != 9:
             return None
         generation = cls._sqlite_integer(row[0])
         name = cls._normalize_market_hash_name(row[1])
         highest_buy = cls._normalize_amount(row[2])
         lowest_sell = cls._normalize_amount(row[3])
-        observed_at = cls._normalize_observed_at(row[4]) if row[4] is not None else None
+        highest_buy_quantity = cls._normalize_quantity(row[4])
+        lowest_sell_quantity = cls._normalize_quantity(row[5])
+        normal_card_app_id: int | None = None
+        normal_card_name: str | None = None
+        metadata = cls._normal_card_metadata(name)
+        if metadata is not None:
+            normal_card_app_id, normal_card_name = metadata
+        observed_at = cls._normalize_observed_at(row[8]) if row[8] is not None else None
+        if highest_buy is None:
+            highest_buy_quantity = None
+        if lowest_sell is None:
+            lowest_sell_quantity = None
         if (
             generation is None
             or generation <= 0
             or generation > _MAX_GENERATION
             or name is None
-            or (highest_buy is None and lowest_sell is None)
+            or (not allow_empty_prices and highest_buy is None and lowest_sell is None)
         ):
             return None
-        return CachedPrice(name, highest_buy, lowest_sell, observed_at)
+        return CachedPrice(
+            name,
+            highest_buy,
+            lowest_sell,
+            observed_at,
+            highest_buy_quantity,
+            lowest_sell_quantity,
+            normal_card_app_id,
+            normal_card_name,
+        )
 
     @classmethod
     def _meta(cls, row: tuple[object, ...] | None) -> _CacheMeta | None:
-        if row is None or len(row) != 6:
+        if row is None or len(row) != 7:
             return None
         singleton = cls._sqlite_integer(row[0])
         generation = cls._sqlite_integer(row[1])
@@ -529,6 +755,7 @@ class SteamApisPriceCache:
         failed_at = cls._sqlite_real(row[3]) if row[3] is not None else None
         retry_until = cls._sqlite_real(row[4])
         failure_count = cls._sqlite_integer(row[5])
+        optimizer_complete = cls._sqlite_integer(row[6])
         if (
             singleton != 1
             or generation is None
@@ -540,6 +767,7 @@ class SteamApisPriceCache:
             or retry_until < 0
             or failure_count is None
             or not 0 <= failure_count <= _MAX_FAILURE_COUNT
+            or optimizer_complete not in (0, 1)
         ):
             return None
         return _CacheMeta(
@@ -548,6 +776,7 @@ class SteamApisPriceCache:
             failed_at,
             retry_until,
             failure_count,
+            optimizer_complete == 1,
         )
 
     @staticmethod
@@ -565,7 +794,7 @@ class SteamApisPriceCache:
             meta_row = connection.execute(
                 """
                 SELECT singleton, generation, refreshed_at, failed_at,
-                       retry_until, failure_count
+                       retry_until, failure_count, optimizer_complete
                   FROM steamapis_price_cache_meta
                  WHERE singleton = 1
                 """
@@ -582,7 +811,9 @@ class SteamApisPriceCache:
                     placeholders = ",".join("?" for _ in batch)
                     query = f"""
                         SELECT generation, market_hash_name, highest_buy,
-                               lowest_sell, observed_at
+                               lowest_sell, highest_buy_quantity,
+                               lowest_sell_quantity, normal_card_app_id,
+                               normal_card_name, observed_at
                           FROM steamapis_price_cache
                          WHERE generation = ?
                            AND market_hash_name IN ({placeholders})
@@ -600,6 +831,7 @@ class SteamApisPriceCache:
                 refreshed_at=meta.refreshed_at if meta.generation > 0 else None,
                 retry_until=meta.retry_until,
                 failure_count=meta.failure_count,
+                optimizer_complete=meta.optimizer_complete,
                 prices=prices,
             )
             connection.commit()
@@ -613,6 +845,102 @@ class SteamApisPriceCache:
         finally:
             if connection is not None:
                 self._close(connection)
+
+    def read_catalog(
+        self,
+        *,
+        max_rows: int = MAX_NORMAL_CARD_CATALOG_ROWS,
+    ) -> NormalCardCatalogRead:
+        """Read only bounded normal-card rows from the active generation."""
+
+        if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 0:
+            return NormalCardCatalogRead(0, None, {})
+        max_rows = min(max_rows, MAX_NORMAL_CARD_CATALOG_ROWS)
+        if max_rows == 0:
+            return NormalCardCatalogRead(0, None, {})
+        connection: sqlite3.Connection | None = None
+        transaction_started = False
+        try:
+            connection = self._connect()
+            connection.execute("BEGIN")
+            transaction_started = True
+            meta_row = connection.execute(
+                """
+                SELECT singleton, generation, refreshed_at, failed_at,
+                       retry_until, failure_count, optimizer_complete
+                  FROM steamapis_price_cache_meta
+                 WHERE singleton = 1
+                """
+            ).fetchone()
+            meta = self._meta(meta_row)
+            if meta is None or meta.generation <= 0:
+                connection.commit()
+                transaction_started = False
+                return NormalCardCatalogRead(0, None, {})
+            cursor = connection.execute(
+                """
+                SELECT generation, market_hash_name, highest_buy,
+                       lowest_sell, highest_buy_quantity,
+                       lowest_sell_quantity, normal_card_app_id,
+                       normal_card_name, observed_at
+                  FROM steamapis_price_cache
+                 WHERE generation = ?
+                   AND normal_card_app_id IS NOT NULL
+                   AND normal_card_name IS NOT NULL
+                 ORDER BY normal_card_app_id, market_hash_name
+                 LIMIT ?
+                """,
+                (meta.generation, max_rows + 1),
+            )
+            grouped: dict[int, list[CachedPrice]] = {}
+            row_count = 0
+            raw_count = 0
+            truncated = False
+            while True:
+                batch_size = min(_BATCH_SIZE, max_rows + 1)
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    raw_count += 1
+                    if raw_count > max_rows:
+                        truncated = True
+                        break
+                    entry = self._entry(row, allow_empty_prices=True)
+                    if entry is None or entry.normal_card_app_id is None:
+                        continue
+                    grouped.setdefault(entry.normal_card_app_id, []).append(entry)
+                    row_count += 1
+                if truncated:
+                    break
+                if len(rows) < batch_size:
+                    break
+            result = NormalCardCatalogRead(
+                generation=meta.generation,
+                refreshed_at=meta.refreshed_at,
+                groups={app_id: tuple(entries) for app_id, entries in grouped.items()},
+                row_count=row_count,
+                truncated=truncated,
+                optimizer_complete=meta.optimizer_complete,
+            )
+            connection.commit()
+            transaction_started = False
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            if connection is not None and transaction_started:
+                connection.rollback()
+            return NormalCardCatalogRead(0, None, {})
+        else:
+            return result
+        finally:
+            if connection is not None:
+                self._close(connection)
+
+    def read_normal_card_catalog(
+        self,
+        *,
+        max_rows: int = MAX_NORMAL_CARD_CATALOG_ROWS,
+    ) -> NormalCardCatalogRead:
+        return self.read_catalog(max_rows=max_rows)
 
     def begin_refresh(self) -> SteamApisPriceRefresh:
         connection: sqlite3.Connection | None = None
@@ -642,7 +970,7 @@ class SteamApisPriceCache:
             row = connection.execute(
                 """
                 SELECT singleton, generation, refreshed_at, failed_at,
-                       retry_until, failure_count
+                       retry_until, failure_count, optimizer_complete
                   FROM steamapis_price_cache_meta
                  WHERE singleton = 1
                 """
@@ -666,14 +994,15 @@ class SteamApisPriceCache:
                     """
                     INSERT INTO steamapis_price_cache_meta (
                         singleton, generation, refreshed_at, failed_at,
-                        retry_until, failure_count
-                    ) VALUES (1, 0, 0, ?, ?, ?)
+                        retry_until, failure_count, optimizer_complete
+                    ) VALUES (1, 0, 0, ?, ?, ?, 0)
                     ON CONFLICT(singleton) DO UPDATE SET
                         generation = 0,
                         refreshed_at = 0,
                         failed_at = excluded.failed_at,
                         retry_until = excluded.retry_until,
-                        failure_count = excluded.failure_count
+                        failure_count = excluded.failure_count,
+                        optimizer_complete = 0
                     """,
                     failure_values,
                 )
@@ -702,6 +1031,7 @@ class SteamApisPriceRefresh:
 
     __slots__ = (
         "_accepted_count",
+        "_accepted_hashes",
         "_batch",
         "_cache",
         "_closed",
@@ -719,7 +1049,19 @@ class SteamApisPriceRefresh:
         self._connection = connection
         self._generation = generation
         self._accepted_count = 0
-        self._batch: list[tuple[str, str | None, str | None, str | None]] = []
+        self._accepted_hashes: set[str] = set()
+        self._batch: list[
+            tuple[
+                str,
+                str | None,
+                str | None,
+                int | None,
+                int | None,
+                int | None,
+                str | None,
+                str | None,
+            ]
+        ] = []
         self._closed = False
 
     @property
@@ -736,20 +1078,46 @@ class SteamApisPriceRefresh:
         highest_buy: object,
         lowest_sell: object,
         observed_at: object,
+        highest_buy_quantity: object = None,
+        lowest_sell_quantity: object = None,
     ) -> None:
         if self._closed:
             raise RuntimeError(_PRICE_REFRESH_CLOSED_ERROR)
         name = self._cache._normalize_market_hash_name(market_hash_name)
         highest = self._cache._normalize_amount(highest_buy)
         lowest = self._cache._normalize_amount(lowest_sell)
+        highest_quantity = self._cache._normalize_quantity(highest_buy_quantity)
+        lowest_quantity = self._cache._normalize_quantity(lowest_sell_quantity)
         observed = (
             self._cache._normalize_observed_at(observed_at)
             if observed_at is not None
             else None
         )
-        if name is None or (highest is None and lowest is None):
+        if name is None:
             return
-        self._batch.append((name, highest, lowest, observed))
+        if name in self._accepted_hashes:
+            raise ValueError(_DUPLICATE_MARKET_HASH_ERROR)
+        self._accepted_hashes.add(name)
+        if highest is None:
+            highest_quantity = None
+        if lowest is None:
+            lowest_quantity = None
+        metadata = self._cache._normal_card_metadata(name)
+        normal_card_app_id, normal_card_name = (
+            metadata if metadata is not None else (None, None)
+        )
+        self._batch.append(
+            (
+                name,
+                highest,
+                lowest,
+                highest_quantity,
+                lowest_quantity,
+                normal_card_app_id,
+                normal_card_name,
+                observed,
+            )
+        )
         self._accepted_count += 1
         if len(self._batch) >= _BATCH_SIZE:
             self._flush()
@@ -760,27 +1128,21 @@ class SteamApisPriceRefresh:
         self._connection.executemany(
             """
             INSERT INTO steamapis_price_cache (
-                generation, market_hash_name, highest_buy, lowest_sell, observed_at
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(generation, market_hash_name) DO UPDATE SET
-                highest_buy = COALESCE(
-                    excluded.highest_buy,
-                    steamapis_price_cache.highest_buy
-                ),
-                lowest_sell = COALESCE(
-                    excluded.lowest_sell,
-                    steamapis_price_cache.lowest_sell
-                ),
-                observed_at = COALESCE(
-                    steamapis_price_cache.observed_at,
-                    excluded.observed_at
-                )
+                generation, market_hash_name, highest_buy, lowest_sell,
+                highest_buy_quantity, lowest_sell_quantity,
+                normal_card_app_id, normal_card_name, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [(self._generation, *row) for row in self._batch],
         )
         self._batch.clear()
 
-    def commit(self, *, now: float | None = None) -> None:
+    def commit(
+        self,
+        *,
+        now: float | None = None,
+        optimizer_complete: bool = False,
+    ) -> None:
         if self._closed:
             return
         timestamp = time.time() if now is None else now
@@ -796,16 +1158,17 @@ class SteamApisPriceRefresh:
                 """
                 INSERT INTO steamapis_price_cache_meta (
                     singleton, generation, refreshed_at, failed_at,
-                    retry_until, failure_count
-                ) VALUES (1, ?, ?, NULL, 0, 0)
+                    retry_until, failure_count, optimizer_complete
+                ) VALUES (1, ?, ?, NULL, 0, 0, ?)
                 ON CONFLICT(singleton) DO UPDATE SET
                     generation = excluded.generation,
                     refreshed_at = excluded.refreshed_at,
                     failed_at = NULL,
                     retry_until = 0,
-                    failure_count = 0
+                    failure_count = 0,
+                    optimizer_complete = excluded.optimizer_complete
                 """,
-                (self._generation, timestamp),
+                (self._generation, timestamp, int(optimizer_complete is True)),
             )
             self._connection.commit()
         except BaseException:
