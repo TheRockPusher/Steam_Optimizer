@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from typing import Literal, cast
 
 import pytest
 
@@ -14,8 +15,8 @@ from app.market_fees import (
 )
 
 
-def contract(**overrides: object) -> MarketFeeContract:
-    values: dict[str, object] = {
+def contract(**overrides: str | int) -> MarketFeeContract:
+    values: dict[str, str | int] = {
         "currency_code": "USD",
         "minor_digits": 2,
         "price_basis": "buyer_total",
@@ -26,7 +27,19 @@ def contract(**overrides: object) -> MarketFeeContract:
         "max_inventory_age_seconds": 3_600,
     }
     values.update(overrides)
-    return MarketFeeContract(**values)
+    return MarketFeeContract(
+        currency_code=cast("str", values["currency_code"]),
+        minor_digits=cast("int", values["minor_digits"]),
+        price_basis=cast('Literal["buyer_total"]', values["price_basis"]),
+        steam_fee_bps=cast("int", values["steam_fee_bps"]),
+        publisher_fee_bps=cast("int", values["publisher_fee_bps"]),
+        min_fee_minor=cast("int", values["min_fee_minor"]),
+        max_quote_age_seconds=cast("int", values["max_quote_age_seconds"]),
+        max_inventory_age_seconds=cast(
+            "int",
+            values["max_inventory_age_seconds"],
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -116,8 +129,9 @@ def test_plan_example_uses_per_card_inverse_and_exact_recomposition() -> None:
     configured = contract()
     cards = [seller_receipt_from_buyer_total(15, configured) for _ in range(5)]
     assert cards == [13, 13, 13, 13, 13]
+    receipts = [receipt for receipt in cards if receipt is not None]
 
-    breakdowns = [calculate_item_fees(receipt, configured) for receipt in cards]
+    breakdowns = [calculate_item_fees(receipt, configured) for receipt in receipts]
     assert all(breakdown is not None for breakdown in breakdowns)
     assert sum(breakdown.steam_fee_minor for breakdown in breakdowns if breakdown) == 5
     assert (
@@ -134,7 +148,7 @@ def test_plan_example_uses_per_card_inverse_and_exact_recomposition() -> None:
     # Applying fees once to a set total is observably different and forbidden.
     set_total = seller_receipt_from_buyer_total(75, configured)
     assert set_total == 66
-    assert set_total != sum(cards)
+    assert set_total != sum(receipts)
 
 
 def test_inverse_rejects_unrepresentable_buyer_totals_and_recomposes() -> None:

@@ -49,7 +49,7 @@ class Breakdown:
 
 def _decimal_to_minor(value: object, digits: int) -> int | None:
     try:
-        scaled = Decimal(value) * (10**digits)
+        scaled = Decimal(str(value)) * (10**digits)
     except (
         ArithmeticError,
         TypeError,
@@ -256,6 +256,7 @@ def test_exact_budget_and_cheapest_first_maximize_destination_count() -> None:
         catalog(source, expensive, cheap_one, cheap_two), holdings_for(source)
     )
     assert result.status == "ready"
+    assert result.totals is not None
     assert [item.app_id for item in result.destinations] == [442, 443]
     assert result.totals.purchase_total == result.totals.seller_receipt_total
     assert result.totals.unspent_swap_proceeds == 0
@@ -274,6 +275,7 @@ def test_five_destination_cap_has_an_affordable_sixth_proof() -> None:
     destinations = tuple(game(app_id, sell="0.10") for app_id in range(441, 447))
     result = run_optimizer(catalog(source, *destinations), holdings_for(source))
     assert result.status == "ready"
+    assert result.totals is not None
     assert result.totals.destination_count == 5
     assert result.scope_limited is True
     assert result.totals.scope_limited is True
@@ -292,6 +294,8 @@ def test_source_and_destination_ties_are_input_order_independent() -> None:
         catalog(destination_a, source_low, destination_b, source_high),
         holdings_for(source_high, source_low),
     )
+    assert first.source is not None
+    assert second.source is not None
     assert first.source.app_id == second.source.app_id == 440
     assert [item.app_id for item in first.destinations] == [442, 443]
     assert [item.app_id for item in second.destinations] == [442, 443]
@@ -305,6 +309,8 @@ def test_each_row_drives_totals_and_valid_until() -> None:
         catalog(source, first_destination, second_destination), holdings_for(source)
     )
     assert result.status == "ready"
+    assert result.totals is not None
+    assert result.source is not None
     assert result.totals.source_buyer_total == sum(
         row.buyer_total for row in result.source.rows
     )
@@ -356,6 +362,7 @@ def test_source_ranking_prefers_xp_then_unspent_then_freshness_actions_and_app_i
         holdings_for(source_low, source_high),
     )
     assert result.status == "ready"
+    assert result.source is not None
     assert result.source.app_id == 441
 
 

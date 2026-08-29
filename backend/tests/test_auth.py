@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Mapping
+    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 
     from httpx2 import Response
 
@@ -23,7 +23,7 @@ from app.cookies import (
     SignedCookieCodec,
 )
 from app.gem_pricing import GemKey, GemResolution, GemScanResult
-from app.level_up_optimizer import LevelUpOptimizationResponse
+from app.level_up_optimizer import Holding, LevelUpOptimizationResponse
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -72,7 +72,14 @@ class FakeGateway:
         self.level_up_error = level_up_error
         self.profile_calls = 0
         self.inventory_calls = 0
-        self.level_up_calls: list[tuple[str, object, object, object]] = []
+        self.level_up_calls: list[
+            tuple[
+                str,
+                Sequence[Holding],
+                datetime | str | int,
+                datetime | str | int | None,
+            ]
+        ] = []
         self.gem_refresh_calls: list[list[GemKey]] = []
         self.booster_refresh_calls: list[tuple[str, ...]] = []
 
@@ -100,10 +107,10 @@ class FakeGateway:
     async def check_level_up(
         self,
         steam_id: str,
-        holdings: object,
-        inventory_refreshed_at: object,
+        holdings: Sequence[Holding],
+        inventory_refreshed_at: datetime | str | int,
         *,
-        now: object = None,
+        now: datetime | str | int | None = None,
     ) -> LevelUpOptimizationResponse:
         self.level_up_calls.append((steam_id, holdings, inventory_refreshed_at, now))
         if self.level_up_error is not None:

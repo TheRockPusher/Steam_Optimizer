@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -2753,11 +2753,16 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
         )
     )
     payload = result.to_dict()
+    source_payload = cast("dict[str, object]", payload["source"])
+    destination_payloads = cast(
+        "list[dict[str, object]]",
+        payload["destinations"],
+    )
 
     assert result.status == "ready", (result.status, result.reason)
-    assert payload["source"]["app_id"] == "440"
-    assert [value["app_id"] for value in payload["destinations"]] == ["10", "20"]
-    assert set(payload["source"]) == {
+    assert source_payload["app_id"] == "440"
+    assert [value["app_id"] for value in destination_payloads] == ["10", "20"]
+    assert set(source_payload) == {
         "app_id",
         "game_name",
         "badge_level",
