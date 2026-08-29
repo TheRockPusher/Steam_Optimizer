@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hmac
+import json
+import re
 import secrets
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Literal, cast
 
@@ -10,10 +13,16 @@ if TYPE_CHECKING:
     from app.settings import Settings
     from app.steam_gateway import SteamGatewayProtocol
     from app.steam_openid import SteamOpenIDVerifier
-
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from app.booster_pricing import (
     BoosterResolution,
@@ -22,6 +31,13 @@ from app.booster_pricing import (
 )
 from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
 from app.gem_pricing import GemBorderColor, GemKey
+from app.json_parsing import DuplicateJSONKeyError, reject_duplicate_object_keys
+from app.level_up_optimizer import (
+    Holding,
+    LevelUpOptimizationResponse,
+    OptimizerInputError,
+    parse_normal_card_hash,
+)
 from app.steam_gateway import InventoryCheck, ProfileCheck
 from app.steam_openid import (
     OpenIDValidationError,
@@ -41,7 +57,21 @@ _GEM_REFRESH_UNAVAILABLE_MESSAGE = "Gem value refresh is unavailable."
 _DUPLICATE_GEM_REFRESH_GROUP_ERROR = "Gem refresh groups must be unique."
 _DUPLICATE_BOOSTER_REFRESH_GROUP_ERROR = "Booster refresh game AppIDs must be unique."
 _INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
+MAX_LEVEL_UP_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_LEVEL_UP_CARD_ROWS = 10_000
+MAX_LEVEL_UP_HASH_LENGTH = 512
+MAX_LEVEL_UP_CARD_QUANTITY = 1_000_000
+_LEVEL_UP_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+_LEVEL_UP_BODY_TOO_LARGE_MESSAGE = "Level-up request body is too large."
+_LEVEL_UP_INVALID_JSON_MESSAGE = "Level-up request body is invalid JSON."
+_LEVEL_UP_INVALID_REQUEST_MESSAGE = "Level-up request is invalid."
 _INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
+_LEVEL_UP_SELLABLE_QUANTITY_ERROR = "sellable quantity exceeds owned quantity"
+_LEVEL_UP_NORMAL_CARD_ERROR = "market hash is not a normal trading card"
+_LEVEL_UP_TIMESTAMP_ERROR = "inventory timestamp is invalid"
+_LEVEL_UP_DUPLICATE_HASH_ERROR = "card hashes must be unique"
 
 Clock = Callable[[], datetime]
 
@@ -131,6 +161,62 @@ class BoosterRefreshValue(BaseModel):
         return self
 
 
+def _valid_level_up_timestamp(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or _LEVEL_UP_TIMESTAMP_RE.fullmatch(value) is None
+    ):
+        return False
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+class LevelUpCardOwnership(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    market_hash_name: str = Field(
+        min_length=1,
+        max_length=MAX_LEVEL_UP_HASH_LENGTH,
+    )
+    owned_quantity: StrictInt = Field(
+        ge=1,
+        le=MAX_LEVEL_UP_CARD_QUANTITY,
+    )
+    sellable_quantity: StrictInt = Field(
+        ge=0,
+        le=MAX_LEVEL_UP_CARD_QUANTITY,
+    )
+
+    @model_validator(mode="after")
+    def validate_sellable_quantity(self) -> LevelUpCardOwnership:
+        if self.sellable_quantity > self.owned_quantity:
+            raise ValueError(_LEVEL_UP_SELLABLE_QUANTITY_ERROR)
+        if parse_normal_card_hash(self.market_hash_name) is None:
+            raise ValueError(_LEVEL_UP_NORMAL_CARD_ERROR)
+        return self
+
+
+class LevelUpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inventory_refreshed_at: str = Field(min_length=1, max_length=64)
+    cards: list[LevelUpCardOwnership] = Field(max_length=MAX_LEVEL_UP_CARD_ROWS)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> LevelUpRequest:
+        if not _valid_level_up_timestamp(self.inventory_refreshed_at):
+            raise ValueError(_LEVEL_UP_TIMESTAMP_ERROR)
+        hashes = {parse_normal_card_hash(card.market_hash_name) for card in self.cards}
+        if None in hashes or len(hashes) != len(self.cards):
+            raise ValueError(_LEVEL_UP_DUPLICATE_HASH_ERROR)
+        return self
+
+
 class GemRefreshResponse(BaseModel):
     values: list[GemRefreshValue]
     pending_group_count: int = Field(ge=0)
@@ -154,6 +240,44 @@ def _cookie_path(purpose: str) -> str:
     return "/"
 
 
+class _RequestBodyTooLargeError(ValueError):
+    pass
+
+
+async def _read_level_up_json(request: Request) -> object:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        normalized = content_length.strip()
+        significant = normalized.lstrip("0")
+        if (
+            not normalized.isascii()
+            or not normalized
+            or not normalized.isdecimal()
+            or len(significant) > len(str(MAX_LEVEL_UP_REQUEST_BYTES))
+            or (significant and int(significant) > MAX_LEVEL_UP_REQUEST_BYTES)
+        ):
+            raise _RequestBodyTooLargeError
+    body = bytearray()
+    async for chunk in request.stream():
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError
+        body.extend(chunk)
+        if len(body) > MAX_LEVEL_UP_REQUEST_BYTES:
+            raise _RequestBodyTooLargeError
+    try:
+        return json.loads(
+            bytes(body).decode("utf-8"),
+            object_pairs_hook=reject_duplicate_object_keys,
+        )
+    except (
+        DuplicateJSONKeyError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ):
+        raise ValueError from None
+
+
 def _cookie_name(settings: Settings, purpose: str) -> str:
     return (
         settings.login_state_cookie_name
@@ -173,11 +297,10 @@ def _cookie_samesite(
 def _delete_cookie(response: Response, settings: Settings, purpose: str) -> None:
     response.delete_cookie(
         _cookie_name(settings, purpose),
-        path=_cookie_path(purpose),
-        domain=None,
-        secure=settings.cookie_secure,
         httponly=True,
+        secure=settings.cookie_secure,
         samesite=_cookie_samesite(settings, purpose),
+        path=_cookie_path(purpose),
     )
 
 
@@ -244,6 +367,7 @@ def _callback_state(
     state_token = request.cookies.get(settings.login_state_cookie_name)
     if not state_token:
         raise OpenIDValidationError
+
     state_payload = codec.decode(
         state_token,
         STATE_PURPOSE,
@@ -266,6 +390,43 @@ def _callback_state(
     if not hmac.compare_digest(state_value, expected_state):
         raise OpenIDValidationError
     return state_value, pairs
+
+
+def _level_up_unavailable_response(
+    settings: Settings,
+    *,
+    now: datetime,
+    inventory_refreshed_at: str,
+    reason: str,
+) -> LevelUpOptimizationResponse:
+    try:
+        text = (
+            inventory_refreshed_at[:-1] + "+00:00"
+            if inventory_refreshed_at.endswith("Z")
+            else inventory_refreshed_at
+        )
+        inventory_time = datetime.fromisoformat(text).astimezone(UTC)
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        inventory_time = now
+    contract = None
+    with suppress(AttributeError, TypeError, ValueError):
+        contract = settings.level_up_money_contract
+    return LevelUpOptimizationResponse(
+        status="unavailable",
+        reason=reason,
+        generated_at=now,
+        inventory_refreshed_at=inventory_time,
+        catalog_total_sets=0,
+        catalog_resolved_sets=0,
+        catalog_pending_sets=0,
+        currency_code=getattr(contract, "currency_code", None),
+        minor_digits=getattr(contract, "minor_digits", None),
+        price_basis="instant_top_of_book" if contract is not None else None,
+        steam_fee_bps=getattr(contract, "steam_fee_bps", None),
+        publisher_fee_bps=getattr(contract, "publisher_fee_bps", None),
+        min_fee_minor=getattr(contract, "min_fee_minor", None),
+        taxes_included=False if contract is not None else None,
+    )
 
 
 def _session_steam_id(
@@ -459,6 +620,102 @@ def create_auth_router(
             return await steam_gateway.check_inventory(steam_id)
         except Exception:  # noqa: BLE001 - map gateway failures to unavailable
             return _unavailable_inventory()
+
+    @router.post(
+        "/api/auth/level-up",
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def auth_level_up(request: Request, response: Response) -> Response:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            steam_id = _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        if request.headers.get("x-expected-steam-id") != steam_id:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            raw_payload = await _read_level_up_json(request)
+        except _RequestBodyTooLargeError as error:
+            raise HTTPException(
+                status_code=413,
+                detail=_LEVEL_UP_BODY_TOO_LARGE_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_LEVEL_UP_INVALID_JSON_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            payload = LevelUpRequest.model_validate(raw_payload)
+        except (TypeError, ValidationError, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_LEVEL_UP_INVALID_REQUEST_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            holdings = tuple(
+                Holding(
+                    market_hash_name=card.market_hash_name,
+                    owned_quantity=card.owned_quantity,
+                    sellable_quantity=card.sellable_quantity,
+                )
+                for card in payload.cards
+            )
+        except (TypeError, ValueError, OptimizerInputError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_LEVEL_UP_INVALID_REQUEST_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            result = await steam_gateway.check_level_up(
+                steam_id,
+                holdings,
+                inventory_refreshed_at=payload.inventory_refreshed_at,
+            )
+        except Exception:  # noqa: BLE001 - recommendation failures are isolated
+            fallback_now = current_time()
+            result = _level_up_unavailable_response(
+                settings,
+                now=fallback_now,
+                inventory_refreshed_at=payload.inventory_refreshed_at,
+                reason="badge_data_unavailable",
+            )
+        if not isinstance(result, LevelUpOptimizationResponse):
+            fallback_now = current_time()
+            result = _level_up_unavailable_response(
+                settings,
+                now=fallback_now,
+                inventory_refreshed_at=payload.inventory_refreshed_at,
+                reason="badge_data_unavailable",
+            )
+        return JSONResponse(
+            content=result.to_dict(),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @router.post(
         "/api/auth/gems",

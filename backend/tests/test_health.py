@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 from app import main as main_module
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import GemKey, GemScanResult
+from app.level_up_optimizer import LevelUpOptimizationResponse
 from app.main import app, create_app
 from app.settings import Settings
 from app.steam_gateway import InventoryCheck, ProfileCheck
@@ -34,6 +36,25 @@ class LifecycleGateway:
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         del steam_id
         return InventoryCheck(status="unavailable", message="unused")
+
+    async def check_level_up(
+        self,
+        steam_id: str,
+        holdings: object,
+        inventory_refreshed_at: object,
+        *,
+        now: object = None,
+    ) -> LevelUpOptimizationResponse:
+        del steam_id, holdings, inventory_refreshed_at, now
+        return LevelUpOptimizationResponse(
+            status="unavailable",
+            reason="badge_data_unavailable",
+            generated_at=datetime.now(UTC),
+            inventory_refreshed_at=datetime.now(UTC),
+            catalog_total_sets=0,
+            catalog_resolved_sets=0,
+            catalog_pending_sets=0,
+        )
 
     async def refresh_gems(
         self,

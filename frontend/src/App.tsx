@@ -8,6 +8,11 @@ import {
 } from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
 import {
+  LEVEL_UP_OPTIMIZATION_PANEL_ID,
+  LEVEL_UP_OPTIMIZATION_TAB_ID,
+  LevelUpOptimizationPanel
+} from "./LevelUpOptimizationPanel";
+import {
   clearInventoryCache,
   clearInventoryCacheExcept,
   readInventoryCache,
@@ -126,7 +131,7 @@ type InventoryViewDefinition = {
   tabId: string;
   panelId: string;
 };
-type InventoryResultView = "items" | "boosters";
+type InventoryResultView = "items" | "boosters" | "level-up";
 
 type InventoryResultViewDefinition = {
   key: InventoryResultView;
@@ -331,6 +336,12 @@ const INVENTORY_RESULT_VIEWS: ReadonlyArray<InventoryResultViewDefinition> = [
     label: "Boosters",
     tabId: "inventory-results-tab-boosters",
     panelId: "inventory-results-panel-boosters"
+  },
+  {
+    key: "level-up",
+    label: "Level-up optimization",
+    tabId: LEVEL_UP_OPTIMIZATION_TAB_ID,
+    panelId: LEVEL_UP_OPTIMIZATION_PANEL_ID
   }
 ];
 
@@ -2319,22 +2330,32 @@ function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
 
 function InventoryResults({
   inventory,
+  steamId,
+  inventoryRefreshedAt,
+  isInventoryLoading,
   isRefreshingGems,
   refreshMessage,
+  onRefreshInventory,
   onRefreshGems
 }: {
   inventory: InventoryCheck;
+  steamId: string;
+  inventoryRefreshedAt: string | null;
+  isInventoryLoading: boolean;
   isRefreshingGems: boolean;
   refreshMessage: string | null;
+  onRefreshInventory: () => void;
   onRefreshGems: () => void;
 }) {
+  const isPublicInventory = inventory.status === "public";
   const [activeResultView, setActiveResultView] =
     useState<InventoryResultView>("items");
   const resultTabRefs = useRef<
     Record<InventoryResultView, HTMLButtonElement | null>
   >({
     items: null,
-    boosters: null
+    boosters: null,
+    "level-up": null
   });
 
   function activateResultView(
@@ -2353,7 +2374,7 @@ function InventoryResults({
       <div className="inventory-results-heading">
         <div>
           <p className="section-label">Inventory</p>
-          <h2 id="inventory-results-title">Items and boosters</h2>
+          <h2 id="inventory-results-title">Inventory and level-up planning</h2>
         </div>
         <InventoryPricingSummary
           inventory={inventory}
@@ -2440,10 +2461,15 @@ function InventoryResults({
           />
         ) : (
           <div className="inventory-empty">
-            <h3>No inventory items to display</h3>
+            <h3>
+              {isPublicInventory
+                ? "No inventory items to display"
+                : "Inventory items unavailable"}
+            </h3>
             <p>
-              Steam returned a public inventory with no items. Recheck after
-              your inventory changes.
+              {isPublicInventory
+                ? "Steam returned a public inventory with no items. Recheck after your inventory changes."
+                : inventory.message}
             </p>
           </div>
         )}
@@ -2461,14 +2487,29 @@ function InventoryResults({
           <BoosterResults boosters={inventory.boosters} />
         ) : (
           <div className="inventory-empty">
-            <h3>No booster packs to display</h3>
+            <h3>
+              {isPublicInventory
+                ? "No booster packs to display"
+                : "Booster details unavailable"}
+            </h3>
             <p>
-              No trading-card games were identified in this inventory, so
-              there are no related booster packs to display.
+              {isPublicInventory
+                ? "No trading-card games were identified in this inventory, so there are no related booster packs to display."
+                : inventory.message}
             </p>
           </div>
         )}
       </div>
+      <LevelUpOptimizationPanel
+        key={`level-up-${inventoryRefreshedAt ?? "missing"}-${isInventoryLoading ? "loading" : "ready"}`}
+        steamId={steamId}
+        inventoryStatus={inventory.status}
+        items={inventory.items}
+        inventoryRefreshedAt={inventoryRefreshedAt}
+        isInventoryLoading={isInventoryLoading}
+        isActive={activeResultView === "level-up"}
+        onRefreshInventory={onRefreshInventory}
+      />
     </section>
   );
 }
@@ -2705,11 +2746,15 @@ function SignedInView({
         </button>
       </div>
 
-      {inventoryState.inventory?.status === "public" && (
+      {inventoryState.inventory !== null && (
         <InventoryResults
           inventory={inventoryState.inventory}
+          steamId={session.user.steam_id}
+          inventoryRefreshedAt={inventoryState.refreshedAt}
+          isInventoryLoading={inventoryState.isLoading}
           isRefreshingGems={isRefreshingGems}
           refreshMessage={gemRefreshMessage}
+          onRefreshInventory={onRefreshInventory}
           onRefreshGems={onRefreshGems}
         />
       )}

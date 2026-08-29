@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -8,7 +9,7 @@ import sqlite3
 import time
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -27,6 +28,7 @@ from app.gem_pricing import (
     _CircuitOpenError,
     _CommunityRateLimitedError,
 )
+from app.json_parsing import reject_duplicate_object_keys
 
 if TYPE_CHECKING:
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
@@ -64,6 +66,7 @@ CREATE TABLE booster_card_count_cache (
     game_app_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('positive', 'negative')),
     card_set_size INTEGER,
+    game_name TEXT,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     PRIMARY KEY (game_app_id)
@@ -73,6 +76,7 @@ _BOOSTER_CACHE_TABLE_INFO = (
     ("game_app_id", "TEXT", 1, None, 1),
     ("status", "TEXT", 1, None, 0),
     ("card_set_size", "INTEGER", 0, None, 0),
+    ("game_name", "TEXT", 0, None, 0),
     ("created_at", "REAL", 1, None, 0),
     ("expires_at", "REAL", 1, None, 0),
 )
@@ -84,6 +88,7 @@ _LOGGER = logging.getLogger(__name__)
 class BoosterResolution:
     card_set_size: int
     gem_cost: int
+    game_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +98,7 @@ class BoosterCacheEntry:
     card_set_size: int | None
     created_at: float
     expires_at: float
+    game_name: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -104,7 +110,11 @@ class BoosterCacheEntry:
         gem_cost = derive_booster_gem_cost(self.card_set_size)
         if gem_cost is None:
             return None
-        return BoosterResolution(card_set_size=self.card_set_size, gem_cost=gem_cost)
+        return BoosterResolution(
+            card_set_size=self.card_set_size,
+            gem_cost=gem_cost,
+            game_name=self.game_name,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +123,11 @@ class BoosterLookup:
     rate_limited: bool = False
     retry_after_seconds: int | None = None
     failure: str | None = None
+    game_name: str | None = None
+    # Only a successful, structurally valid market response can establish
+    # that an AppID has no supported normal-card set.  Transport and parse
+    # failures remain retryable and must not poison the negative cache.
+    definitive_negative: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +137,17 @@ class BoosterScanResult:
     rate_limited: bool = False
     retry_after_seconds: int | None = None
     used_stale_cache: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BoosterMetadataState:
+    """Fresh metadata state used by the level-up catalog adapter."""
+
+    values: Mapping[str, BoosterResolution]
+    pending_app_ids: tuple[str, ...] = ()
+    rejected_app_ids: tuple[str, ...] = ()
+    rate_limited: bool = False
+    retry_after_seconds: int | None = None
 
 
 class BoosterProviderProtocol(Protocol):
@@ -165,6 +191,74 @@ def _parse_card_set_size(value: object) -> int | None:
     if not MIN_BOOSTER_CARD_SET_SIZE <= parsed <= MAX_BOOSTER_CARD_SET_SIZE:
         return None
     return parsed
+
+
+def _is_definitive_set_count(value: object) -> bool:
+    """Return whether a successful count value proves no supported set."""
+
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= 99
+    if not isinstance(value, str) or _ASCII_DIGITS.fullmatch(value) is None:
+        return False
+    normalized = value.lstrip("0") or "0"
+    return len(normalized) <= 2
+
+
+def _validated_game_name(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_BOOSTER_SEARCH_SCALAR_LENGTH
+        or "\x00" in value
+    ):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _validated_game_tag(
+    tags: object,
+    game_app_id: str,
+) -> str | None:
+    if not isinstance(tags, list):
+        return None
+    found: str | None = None
+    for tag in tags:
+        if not isinstance(tag, Mapping):
+            continue
+        category = tag.get("category")
+        internal_name = tag.get("internal_name")
+        if category != "Game" or internal_name != f"app_{game_app_id}":
+            continue
+        candidate = _validated_game_name(tag.get("localized_tag_name"))
+        if candidate is None:
+            return None
+        if found is None:
+            found = candidate
+        elif found != candidate:
+            return None
+    return found
+
+
+def _game_name_from_result(
+    payload: Mapping[str, object],
+    game_app_id: str,
+) -> str | None:
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    for result in results:
+        if not isinstance(result, Mapping):
+            continue
+        description = result.get("asset_description")
+        if not isinstance(description, Mapping):
+            description = result
+        game_name = _validated_game_tag(description.get("tags"), game_app_id)
+        if game_name is not None:
+            return game_name
+    return None
 
 
 def _bounded_json_size(value: object, maximum: int) -> int | None:
@@ -449,15 +543,18 @@ class BoosterPriceCache:
 
     @classmethod
     def _entry(cls, row: tuple[object, ...]) -> BoosterCacheEntry | None:
-        if len(row) != 5:
+        if len(row) != 6:
             return None
         game_app_id = cls._sqlite_text(row[0], maximum=MAX_BOOSTER_APP_ID_LENGTH)
         if game_app_id is None or not _valid_game_app_id(game_app_id):
             return None
         status = cls._cache_status(row[1])
         card_set_size = _parse_card_set_size(row[2])
-        created_at = cls._sqlite_real(row[3])
-        expires_at = cls._sqlite_real(row[4])
+        game_name = _validated_game_name(row[3])
+        if status == "negative":
+            game_name = None
+        created_at = cls._sqlite_real(row[4])
+        expires_at = cls._sqlite_real(row[5])
         if status is None or created_at is None or expires_at is None:
             return None
         if status == "positive" and card_set_size is None:
@@ -470,6 +567,7 @@ class BoosterPriceCache:
             card_set_size=card_set_size,
             created_at=created_at,
             expires_at=expires_at,
+            game_name=game_name,
         )
 
     def get(self, game_app_id: str) -> BoosterCacheEntry | None:
@@ -478,7 +576,8 @@ class BoosterPriceCache:
             connection = self._connect()
             row = connection.execute(
                 """
-                SELECT game_app_id, status, card_set_size, created_at, expires_at
+                SELECT game_app_id, status, card_set_size, game_name,
+                       created_at, expires_at
                   FROM booster_card_count_cache
                  WHERE game_app_id = ?
                 """,
@@ -502,7 +601,8 @@ class BoosterPriceCache:
             for game_app_id in unique_ids:
                 row = connection.execute(
                     """
-                    SELECT game_app_id, status, card_set_size, created_at, expires_at
+                    SELECT game_app_id, status, card_set_size, game_name,
+                           created_at, expires_at
                       FROM booster_card_count_cache
                      WHERE game_app_id = ?
                     """,
@@ -524,9 +624,11 @@ class BoosterPriceCache:
         game_app_id: str,
         card_set_size: int,
         *,
+        game_name: str | None = None,
         now: float | None = None,
     ) -> None:
         timestamp = time.time() if now is None else now
+        normalized_game_name = _validated_game_name(game_name)
         if (
             not _valid_game_app_id(game_app_id)
             or _parse_card_set_size(card_set_size) is None
@@ -538,17 +640,23 @@ class BoosterPriceCache:
             connection.execute(
                 """
                 INSERT INTO booster_card_count_cache (
-                    game_app_id, status, card_set_size, created_at, expires_at
-                ) VALUES (?, 'positive', ?, ?, ?)
+                    game_app_id, status, card_set_size, game_name,
+                    created_at, expires_at
+                ) VALUES (?, 'positive', ?, ?, ?, ?)
                 ON CONFLICT(game_app_id) DO UPDATE SET
                     status = excluded.status,
                     card_set_size = excluded.card_set_size,
+                    game_name = COALESCE(
+                        excluded.game_name,
+                        booster_card_count_cache.game_name
+                    ),
                     created_at = excluded.created_at,
                     expires_at = excluded.expires_at
                 """,
                 (
                     game_app_id,
                     card_set_size,
+                    normalized_game_name,
                     timestamp,
                     timestamp + BOOSTER_CACHE_TTL_SECONDS,
                 ),
@@ -570,11 +678,13 @@ class BoosterPriceCache:
             connection.execute(
                 """
                 INSERT INTO booster_card_count_cache (
-                    game_app_id, status, card_set_size, created_at, expires_at
-                ) VALUES (?, 'negative', NULL, ?, ?)
+                    game_app_id, status, card_set_size, game_name,
+                    created_at, expires_at
+                ) VALUES (?, 'negative', NULL, NULL, ?, ?)
                 ON CONFLICT(game_app_id) DO UPDATE SET
                     status = excluded.status,
                     card_set_size = NULL,
+                    game_name = NULL,
                     created_at = excluded.created_at,
                     expires_at = excluded.expires_at
                 WHERE booster_card_count_cache.status = 'negative'
@@ -654,9 +764,19 @@ class SteamCommunityBoosterProvider:
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
             if not _response_content_length_within(response, MAX_BOOSTER_SEARCH_BYTES):
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
+            raw_text = response.text
+            if not isinstance(raw_text, str):
+                return BoosterLookup(failure="Steam Market card data is unavailable.")
             try:
-                payload = response.json()
-            except (TypeError, ValueError):
+                if len(raw_text.encode("utf-8")) > MAX_BOOSTER_SEARCH_BYTES:
+                    return BoosterLookup(
+                        failure="Steam Market card data is unavailable."
+                    )
+                payload = json.loads(
+                    raw_text,
+                    object_pairs_hook=reject_duplicate_object_keys,
+                )
+            except (TypeError, UnicodeError, ValueError, RecursionError):
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
             if _bounded_json_size(payload, MAX_BOOSTER_SEARCH_BYTES) is None:
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
@@ -664,10 +784,17 @@ class SteamCommunityBoosterProvider:
                 payload.get("success")
             ):
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
-            card_set_size = _parse_card_set_size(payload.get("total_count"))
+            raw_count = payload.get("total_count")
+            card_set_size = _parse_card_set_size(raw_count)
             if card_set_size is None:
-                return BoosterLookup(failure="Steam Market card data is unavailable.")
-            return BoosterLookup(card_set_size=card_set_size)
+                return BoosterLookup(
+                    failure="Steam Market card data is unavailable.",
+                    definitive_negative=_is_definitive_set_count(raw_count),
+                )
+            return BoosterLookup(
+                card_set_size=card_set_size,
+                game_name=_game_name_from_result(payload, game_app_id),
+            )
         except _CircuitOpenError as error:
             return BoosterLookup(
                 rate_limited=True,
@@ -787,16 +914,6 @@ class BoosterPricingService:
             else BoosterLookup(failure="Steam Market card data is unavailable.")
         )
 
-    def _record_lookup(self, game_app_id: str, outcome: BoosterLookup) -> None:
-        if outcome.rate_limited:
-            return
-        if outcome.card_set_size is not None:
-            card_set_size = _parse_card_set_size(outcome.card_set_size)
-            if card_set_size is not None:
-                self.cache.put_positive(game_app_id, card_set_size)
-                return
-        self.cache.put_negative(game_app_id)
-
     def _rate_limit_delay(self, outcome: BoosterLookup) -> int:
         retry_after = outcome.retry_after_seconds
         if (
@@ -857,14 +974,27 @@ class BoosterPricingService:
 
     def _queue_lookup(self, game_app_id: str) -> bool:
         self._ensure_started()
-        if game_app_id in self._scheduled:
-            return False
         queue = self._queue
-        if queue is None:
+        if queue is None or game_app_id in self._scheduled:
             return False
         self._scheduled.add(game_app_id)
-        queue.put_nowait(_QueuedLookup(game_app_id))
+        queue.put_nowait(_QueuedLookup(game_app_id=game_app_id))
         return True
+
+    def _record_lookup(self, game_app_id: str, outcome: BoosterLookup) -> None:
+        if outcome.rate_limited:
+            return
+        if outcome.card_set_size is not None:
+            card_set_size = _parse_card_set_size(outcome.card_set_size)
+            if card_set_size is not None:
+                self.cache.put_positive(
+                    game_app_id,
+                    card_set_size,
+                    game_name=outcome.game_name,
+                )
+            return
+        if outcome.definitive_negative is True:
+            self.cache.put_negative(game_app_id)
 
     def _rate_limit_status(self) -> tuple[bool, int | None]:
         remaining = self._rate_limited_until - self._clock()
@@ -873,7 +1003,13 @@ class BoosterPricingService:
             return False, None
         return True, max(1, math.ceil(remaining))
 
-    def read_cached(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
+    def read_cached(
+        self,
+        game_app_ids: Iterable[str],
+        *,
+        require_game_name: bool = False,
+        require_fresh: bool = False,
+    ) -> BoosterScanResult:
         """Read completed warmer results without scheduling provider work."""
 
         unique_ids = tuple(dict.fromkeys(game_app_ids))
@@ -892,11 +1028,17 @@ class BoosterPricingService:
             if cached.status == "negative":
                 continue
             resolution = cached.resolution()
-            if resolution is None:
+            if resolution is None or (
+                require_game_name and resolution.game_name is None
+            ):
                 pending_count += 1
                 continue
+            if cached.expired:
+                used_stale_cache = True
+                if require_fresh:
+                    pending_count += 1
+                    continue
             values[game_app_id] = resolution
-            used_stale_cache = used_stale_cache or cached.expired
         rate_limited, retry_after_seconds = self._rate_limit_status()
         return BoosterScanResult(
             values=values,
@@ -906,7 +1048,63 @@ class BoosterPricingService:
             used_stale_cache=used_stale_cache,
         )
 
-    async def resolve(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
+    def read_metadata(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
+        """Read fresh, validated set-size/name metadata for level-up planning.
+
+        This adapter intentionally exposes no cache rows and never queues work.
+        A missing, expired, negative, or nameless result is represented as
+        pending so callers can enqueue only a bounded shortlist through
+        :meth:`resolve`.
+        """
+
+        return self.read_cached(
+            game_app_ids,
+            require_game_name=True,
+            require_fresh=True,
+        )
+
+    def read_metadata_state(
+        self,
+        game_app_ids: Iterable[str],
+    ) -> BoosterMetadataState:
+        """Expose fresh positive, negative, and pending metadata states."""
+
+        unique_ids = tuple(dict.fromkeys(game_app_ids))
+        cached_entries = self.cache.get_many(unique_ids)
+        values: dict[str, BoosterResolution] = {}
+        pending: list[str] = []
+        rejected: list[str] = []
+        for game_app_id in unique_ids:
+            if not _valid_game_app_id(game_app_id):
+                pending.append(game_app_id)
+                continue
+            cached = cached_entries.get(game_app_id)
+            if cached is None or cached.expired:
+                pending.append(game_app_id)
+                continue
+            if cached.status == "negative":
+                rejected.append(game_app_id)
+                continue
+            resolution = cached.resolution()
+            if resolution is None or resolution.game_name is None:
+                pending.append(game_app_id)
+                continue
+            values[game_app_id] = resolution
+        rate_limited, retry_after_seconds = self._rate_limit_status()
+        return BoosterMetadataState(
+            values=values,
+            pending_app_ids=tuple(pending),
+            rejected_app_ids=tuple(rejected),
+            rate_limited=rate_limited,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+    async def resolve(
+        self,
+        game_app_ids: Iterable[str],
+        *,
+        require_game_name: bool = False,
+    ) -> BoosterScanResult:
         unique_ids = tuple(dict.fromkeys(game_app_ids))
         if not unique_ids:
             return BoosterScanResult(values={})
@@ -921,13 +1119,28 @@ class BoosterPricingService:
                 continue
             cached = cached_entries.get(game_app_id)
             resolution = cached.resolution() if cached is not None else None
+            has_required_name = not require_game_name or (
+                resolution is not None and resolution.game_name is not None
+            )
             if cached is not None and not cached.expired:
-                if cached.status == "positive" and resolution is not None:
+                if (
+                    cached.status == "positive"
+                    and resolution is not None
+                    and has_required_name
+                ):
                     values[game_app_id] = resolution
+                elif cached.status != "positive":
+                    continue
+                else:
+                    pending_count += 1
+                    if self._queue_lookup(game_app_id):
+                        continue
                 continue
             stale_resolution = (
                 resolution
-                if cached is not None and cached.status == "positive"
+                if cached is not None
+                and cached.status == "positive"
+                and has_required_name
                 else None
             )
             if stale_resolution is not None:
@@ -959,6 +1172,7 @@ __all__ = [
     "STEAM_MARKET_SEARCH_RENDER_ENDPOINT",
     "BoosterCacheEntry",
     "BoosterLookup",
+    "BoosterMetadataState",
     "BoosterPriceCache",
     "BoosterPricingService",
     "BoosterProviderProtocol",

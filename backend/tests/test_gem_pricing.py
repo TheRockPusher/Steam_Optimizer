@@ -106,11 +106,12 @@ class FakeHTTPClient:
         method: str,
         url: str,
         *,
+        params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
     ) -> AsyncIterator[FakeResponse]:
-        del method, url, headers, follow_redirects, timeout
+        del method, url, params, headers, follow_redirects, timeout
         if not self.responses:
             raise AssertionError
         response = self.responses.pop(0)

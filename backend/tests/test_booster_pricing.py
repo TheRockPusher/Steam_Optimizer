@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
@@ -35,12 +36,19 @@ class FakeResponse:
         *,
         headers: Mapping[str, str] | None = None,
         json_error: BaseException | None = None,
+        raw_text: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.payload = payload
         self.headers = dict(headers or {})
         self.json_error = json_error
-        self.text = ""
+        self.text = (
+            raw_text
+            if raw_text is not None
+            else "{"
+            if json_error is not None
+            else json.dumps(payload)
+        )
         self.chunks: tuple[bytes, ...] = ()
 
     def json(self) -> object:
@@ -107,11 +115,12 @@ class FakeHTTPClient:
         method: str,
         url: str,
         *,
+        params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
     ) -> AsyncIterator[FakeResponse]:
-        del method, url, headers, follow_redirects, timeout
+        del method, url, params, headers, follow_redirects, timeout
         if self.stream_response is None:
             raise AssertionError
         yield self.stream_response
@@ -273,6 +282,38 @@ def test_provider_rejects_unavailable_or_invalid_market_payloads(
     assert result == BoosterLookup(failure="Steam Market card data is unavailable.")
 
 
+def test_provider_rejects_duplicate_set_count_members() -> None:
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                raw_text=(
+                    '{"success":true,"total_count":5,"total_count":6,"results":[]}'
+                ),
+            )
+        ]
+    )
+    provider = SteamCommunityBoosterProvider(settings(), http_client=client)
+
+    result = run(provider.lookup("123"))
+
+    assert result.failure == "Steam Market card data is unavailable."
+    assert result.definitive_negative is False
+
+
+@pytest.mark.parametrize("total_count", [-1, 100, 10_000])
+def test_malformed_integer_set_counts_remain_retryable(total_count: int) -> None:
+    client = FakeHTTPClient(
+        [FakeResponse(200, {"success": True, "total_count": total_count})]
+    )
+    provider = SteamCommunityBoosterProvider(settings(), http_client=client)
+
+    result = run(provider.lookup("123"))
+
+    assert result.failure == "Steam Market card data is unavailable."
+    assert result.definitive_negative is False
+
+
 def test_provider_rejects_market_payload_over_aggregate_size_bound() -> None:
     padding = ["x" * 1024] * (MAX_BOOSTER_SEARCH_BYTES // 1024 + 1)
     payload = {"success": True, "total_count": 7, "padding": padding}
@@ -377,6 +418,69 @@ def test_service_suppresses_fresh_negative_cache_and_requeues_expired_entry(
     run(exercise())
 
 
+def test_transient_metadata_failure_remains_pending_and_retries(
+    tmp_path: Path,
+) -> None:
+    cache = BoosterPriceCache(tmp_path / "boosters.sqlite3")
+    provider = RecordingProvider(
+        BoosterLookup(failure="Steam Market card data is unavailable.")
+    )
+    service = BoosterPricingService(
+        settings(gem_price_cache_path=str(tmp_path / "boosters.sqlite3")),
+        cache=cache,
+        provider=provider,
+    )
+
+    async def exercise() -> None:
+        await service.start()
+        first = await service.resolve(("123",), require_game_name=True)
+        assert first.pending_count == 1
+        await service.wait_until_idle()
+        assert cache.get("123") is None
+
+        second = await service.resolve(("123",), require_game_name=True)
+        assert second.pending_count == 1
+        await service.wait_until_idle()
+        assert provider.calls == ["123", "123"]
+        assert service.read_metadata_state(("123",)).pending_app_ids == ("123",)
+        await service.stop()
+
+    run(exercise())
+
+
+def test_definitive_metadata_mismatch_is_negative_cached(
+    tmp_path: Path,
+) -> None:
+    cache = BoosterPriceCache(tmp_path / "boosters.sqlite3")
+    provider = RecordingProvider(
+        BoosterLookup(
+            failure="Steam Market card set is unavailable.",
+            definitive_negative=True,
+        )
+    )
+    service = BoosterPricingService(
+        settings(gem_price_cache_path=str(tmp_path / "boosters.sqlite3")),
+        cache=cache,
+        provider=provider,
+    )
+
+    async def exercise() -> None:
+        await service.start()
+        first = await service.resolve(("123",), require_game_name=True)
+        assert first.pending_count == 1
+        await service.wait_until_idle()
+        cached = cache.get("123")
+        assert cached is not None
+        assert cached.status == "negative"
+
+        second = await service.resolve(("123",), require_game_name=True)
+        assert second.pending_count == 0
+        assert provider.calls == ["123"]
+        await service.stop()
+
+    run(exercise())
+
+
 def test_service_resolve_returns_before_provider_and_cached_refresh_sees_completion(
     tmp_path: Path,
 ) -> None:
@@ -418,3 +522,78 @@ def test_service_resolve_returns_before_provider_and_cached_refresh_sees_complet
             await service.stop()
 
     run(exercise())
+
+
+def test_provider_returns_validated_game_tag_name_without_changing_count() -> None:
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                {
+                    "success": True,
+                    "total_count": 7,
+                    "results": [
+                        {
+                            "asset_description": {
+                                "tags": [
+                                    {
+                                        "category": "Game",
+                                        "internal_name": "app_123",
+                                        "localized_tag_name": "Example Game",
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    provider = SteamCommunityBoosterProvider(settings(), http_client=client)
+
+    result = run(provider.lookup("123"))
+
+    assert result == BoosterLookup(card_set_size=7, game_name="Example Game")
+
+
+def test_count_only_booster_lookup_and_cache_remain_valid_without_game_name(
+    tmp_path: Path,
+) -> None:
+    cache = BoosterPriceCache(tmp_path / "boosters.sqlite3")
+    cache.put_positive("123", 7)
+
+    entry = cache.get("123")
+
+    assert isinstance(entry, BoosterCacheEntry)
+    assert entry.game_name is None
+    assert entry.resolution() == BoosterResolution(card_set_size=7, gem_cost=857)
+
+
+def test_positive_booster_cache_persists_validated_game_name() -> None:
+    cache = BoosterPriceCache(":memory:")
+    cache.put_positive("123", 7, game_name="Example Game")
+
+    entry = cache.get("123")
+
+    assert entry is not None
+    assert entry.game_name == "Example Game"
+    assert entry.resolution() == BoosterResolution(
+        card_set_size=7,
+        gem_cost=857,
+        game_name="Example Game",
+    )
+
+
+def test_cached_count_only_resolution_can_be_marked_pending_for_optimizer() -> None:
+    cache = BoosterPriceCache(":memory:")
+    cache.put_positive("123", 7)
+    service = BoosterPricingService(
+        settings(),
+        cache=cache,
+        provider=RecordingProvider(BoosterLookup(card_set_size=7)),
+    )
+
+    result = service.read_cached(("123",), require_game_name=True)
+
+    assert result.values == {}
+    assert result.pending_count == 1
