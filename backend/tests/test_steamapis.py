@@ -1415,6 +1415,142 @@ def test_price_stream_decodes_percent_literal_exactly_once() -> None:
     assert set(lookup.prices) == {"Literal%20Name"}
 
 
+def test_live_literal_percent_keeps_prices_and_level_up_available(
+    tmp_path: Path,
+) -> None:
+    quote_time = datetime.now(UTC)
+    configured = settings(
+        gem_price_cache_path=str(tmp_path / "boosters.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1_000,
+        level_up_min_fee_minor=1,
+        level_up_max_quote_age_seconds=900,
+        level_up_max_inventory_age_seconds=3_600,
+    )
+    source_hashes = [f"440-Source Card {index} (Trading Card)" for index in range(1, 6)]
+    destination_hashes = [
+        f"{app_id}-Destination {app_id} Card {index} (Trading Card)"
+        for app_id in (10, 20)
+        for index in range(1, 6)
+    ]
+    literal_percent_name = "1115050-100% Complete"
+
+    def price_row(
+        market_hash_name: str,
+        highest_buy: float,
+        lowest_sell: float,
+    ) -> dict[str, object]:
+        return {
+            "marketHashName": market_hash_name,
+            "orderBook": {
+                "highestBuy": highest_buy,
+                "lowestSell": lowest_sell,
+                "buyOrdersTop10": [{"price": highest_buy, "quantity": 1}],
+                "sellOrdersTop10": [{"price": lowest_sell, "quantity": 1}],
+            },
+            "updatedAt": int(quote_time.timestamp() * 1_000),
+        }
+
+    rows = [
+        *(price_row(name, 1.0, 1.0) for name in source_hashes),
+        *(price_row(name, 0.25, 0.25) for name in destination_hashes),
+        price_row(literal_percent_name, 0.05, 0.1),
+    ]
+    bulk_client = FakeHTTPClient(
+        [],
+        stream_response=FakeResponse(
+            200,
+            chunks=[
+                json.dumps(
+                    {
+                        "metadata": {"appId": 753, "itemCount": len(rows)},
+                        "items": rows,
+                    },
+                    separators=(",", ":"),
+                ).encode()
+            ],
+        ),
+    )
+    booster_cache = BoosterPriceCache(configured.gem_price_cache_path)
+    booster_cache.put_positive("440", 5, game_name="Source Game")
+    booster_cache.put_positive("10", 5, game_name="Destination Ten")
+    booster_cache.put_positive("20", 5, game_name="Destination Twenty")
+    booster_pricing = BoosterPricingService(
+        configured,
+        cache=booster_cache,
+        provider=NeverBoosterProvider(),
+    )
+    gateway = SteamGateway(
+        configured,
+        http_client=FakeHTTPClient(
+            [
+                FakeResponse(
+                    200,
+                    page(
+                        assets=[item_asset(str(index)) for index in range(1, 6)],
+                        descriptions=[
+                            item_description(
+                                str(index),
+                                f"Source Card {index}",
+                                market_hash_name=market_hash_name,
+                                marketable=1,
+                                tags=trading_card_tags(),
+                            )
+                            for index, market_hash_name in enumerate(
+                                source_hashes,
+                                start=1,
+                            )
+                        ],
+                    ),
+                ),
+                price_redirect(),
+            ],
+            stream_response=_badge_stream_response(_badge_payload()),
+        ),
+        bulk_http_client=bulk_client,
+        gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+        booster_pricing=booster_pricing,
+    )
+
+    inventory = run(gateway.check_inventory("76561198000000000"))
+    generation = gateway.steamapis.price_cache.read(frozenset({literal_percent_name}))
+    plan_time = datetime.now(UTC)
+    result = run(
+        gateway.check_level_up(
+            "76561198000000000",
+            tuple(
+                steam_gateway.Holding(
+                    market_hash_name=item.market_hash_name,
+                    owned_quantity=item.quantity,
+                    sellable_quantity=item.quantity,
+                )
+                for item in inventory.items
+                if item.market_hash_name is not None
+            ),
+            inventory_refreshed_at=plan_time,
+            now=plan_time,
+        )
+    )
+
+    assert inventory.status == "public"
+    assert inventory.price_status == "complete"
+    assert inventory.priceable_item_count == inventory.priced_item_count == 5
+    assert inventory.items[0].price is not None
+    assert inventory.items[0].price.highest_buy == "1.0"
+    assert generation.has_generation is True
+    assert generation.optimizer_complete is True
+    assert set(generation.prices) == {literal_percent_name}
+    assert generation.prices[literal_percent_name].highest_buy == "0.05"
+    assert generation.prices[literal_percent_name].lowest_sell == "0.1"
+    assert (result.status, result.reason) == ("ready", "ready")
+    assert result.source is not None
+    assert result.source.app_id == 440
+    assert [destination.app_id for destination in result.destinations] == [10, 20]
+
+
 def test_inventory_hash_literal_percent_joins_once_decoded_bulk_name() -> None:
     client = FakeHTTPClient(
         [
