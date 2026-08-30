@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.8.3
+
+
+### Bug Fixes
+- Scope badge state to card catalog
+
+
+### Documentation
+- Update changelog for v0.8.2
+
+
+### Maintenance
+- Prepare release v0.8.3
+
 ## v0.8.2
 
 
