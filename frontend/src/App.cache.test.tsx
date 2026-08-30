@@ -42,6 +42,12 @@ const signedInSession = {
     profile: {
       status: "public",
       message: "Your Steam profile is publicly visible."
+    },
+    badges: {
+      status: "public",
+      message: "Steam badge data is available.",
+      player_xp: 1250,
+      player_level: 11
     }
   }
 };
@@ -286,7 +292,7 @@ describe("App inventory cache orchestration", () => {
       name: "Steam inventory: Private"
     });
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam profile" })
+      screen.getByRole("button", { name: "Recheck Steam access" })
     );
 
     expect(

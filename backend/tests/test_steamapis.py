@@ -58,6 +58,7 @@ from app.steam_gateway import (
     STEAMAPIS_BULK_HOST_SUFFIX,
     STEAMAPIS_INVENTORY_ENDPOINT,
     STEAMAPIS_ITEMS_ENDPOINT,
+    BadgeCheck,
     InventoryCheck,
     SteamApisClient,
     SteamGateway,
@@ -2620,6 +2621,83 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
             "timeout": None,
         }
     ]
+
+
+def test_badge_check_rejects_inconsistent_xp_and_level() -> None:
+    with pytest.raises(ValidationError):
+        BadgeCheck(
+            status="public",
+            message="Steam badge data is available.",
+            player_xp=1_250,
+            player_level=12,
+        )
+
+
+def test_check_badges_returns_validated_public_xp_and_level() -> None:
+    client = FakeHTTPClient(
+        [],
+        stream_response=_badge_stream_response(
+            _badge_payload(
+                player_xp=100,
+                player_level=1,
+                badges=[{"appID": 440, "borderColor": 0, "level": 1}],
+            )
+        ),
+    )
+    gateway = SteamGateway(settings(), http_client=client)
+
+    result = run(gateway.check_badges("76561198000000000"))
+
+    assert result.status == "public"
+    assert result.message == "Steam badge data is available."
+    assert result.player_xp == 100
+    assert result.player_level == 1
+    assert client.get_calls == []
+    assert len(client.stream_calls) == 1
+    assert client.stream_calls[0]["url"] == STEAMAPIS_BADGES_ENDPOINT.format(
+        steam_id="76561198000000000"
+    )
+
+
+def test_check_badges_maps_provider_failure_to_unavailable_not_private() -> None:
+    client = FakeHTTPClient(
+        [],
+        stream_response=_badge_stream_response(
+            _badge_payload(),
+            status_code=403,
+        ),
+    )
+    gateway = SteamGateway(settings(), http_client=client)
+
+    result = run(gateway.check_badges("76561198000000000"))
+
+    assert result.status == "unavailable"
+    assert result.message == "Steam badge check is unavailable."
+    assert result.player_xp is None
+    assert result.player_level is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _badge_payload(player_xp=100, player_level=0),
+        {"success": True, "result": {"xp": 0, "level": 0}},
+    ],
+)
+def test_check_badges_maps_invalid_payload_to_unavailable(
+    payload: object,
+) -> None:
+    client = FakeHTTPClient(
+        [],
+        stream_response=_badge_stream_response(payload),
+    )
+    gateway = SteamGateway(settings(), http_client=client)
+
+    result = run(gateway.check_badges("76561198000000000"))
+
+    assert result.status == "unavailable"
+    assert result.player_xp is None
+    assert result.player_level is None
 
 
 def test_get_badges_accepts_documented_snake_case_fields() -> None:

@@ -46,6 +46,12 @@ const signedInSession = {
     profile: {
       status: "public",
       message: "Your Steam profile is publicly visible."
+    },
+    badges: {
+      status: "public",
+      message: "Steam badge data is available.",
+      player_xp: 1_250,
+      player_level: 11
     }
   }
 };
@@ -461,6 +467,413 @@ describe("App", () => {
     expect(
       within(nonmarketableRow as HTMLElement).getAllByText("Not applicable")
     ).toHaveLength(5);
+  });
+  it("computes quantity-aware market totals with exact mixed-scale decimals and coverage", async () => {
+    const pricedCard = tradingCardItem(1, {
+      market_hash_name: "Priced card",
+      quantity: 3,
+      marketable: true,
+      tradable: true,
+      gem_key: null,
+      gem_yield: null,
+      gem_cash_value: null,
+      price: {
+        currency: "USD",
+        highest_buy: "0.1",
+        lowest_sell: "1.005",
+        observed_at: null
+      }
+    });
+    const partiallyPricedItem = {
+      ...inventoryItem(2),
+      name: "Partially priced item",
+      market_hash_name: "Partially priced item",
+      quantity: 2,
+      marketable: true,
+      tradable: true,
+      price: {
+        currency: "USD",
+        highest_buy: null,
+        lowest_sell: "0.20",
+        observed_at: null
+      }
+    };
+    const missingPriceItem = {
+      ...inventoryItem(3),
+      name: "Missing price item",
+      market_hash_name: "Missing price item",
+      quantity: 4,
+      marketable: true,
+      tradable: true,
+      price: null
+    };
+    const inventory = publicInventory(
+      [pricedCard, partiallyPricedItem, missingPriceItem],
+      {
+        total_asset_count: 9,
+        priceable_item_count: 3,
+        priced_item_count: 2,
+        price_status: "partial",
+        price_message: "One marketable item type is still waiting for a quote.",
+        boosters: [
+          {
+            game_app_id: "440",
+            game_name: "Team Fortress 2",
+            market_hash_name: "440-Team Fortress 2 Booster Pack",
+            card_count: 3,
+            card_set_size: null,
+            gem_cost: null,
+            price: {
+              currency: "USD",
+              highest_buy: "100",
+              lowest_sell: "200",
+              observed_at: null
+            }
+          }
+        ]
+      }
+    );
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory));
+
+    render(<App />);
+
+    const pricingSummary = await screen.findByLabelText(
+      "Inventory pricing summary"
+    );
+    expect(
+      within(pricingSummary).getByText("USD 0.3")
+    ).toBeInTheDocument();
+    expect(
+      within(pricingSummary).getByText("USD 3.415")
+    ).toBeInTheDocument();
+    expect(
+      within(pricingSummary).getByText("Coverage 1/3 item types")
+    ).toBeInTheDocument();
+    expect(
+      within(pricingSummary).getByText("Coverage 2/3 item types")
+    ).toBeInTheDocument();
+    expect(
+      within(pricingSummary).queryByText("USD 100")
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders zero market totals when no inventory item needs a quote", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(publicInventory([])));
+
+    render(<App />);
+
+    const pricingSummary = await screen.findByLabelText(
+      "Inventory pricing summary"
+    );
+    expect(within(pricingSummary).getAllByText("USD 0")).toHaveLength(2);
+    expect(
+      within(pricingSummary).getAllByText("Coverage 0/0 item types")
+    ).toHaveLength(2);
+  });
+
+  it("does not report zero value when inventory ownership is unknown", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory));
+
+    render(<App />);
+
+    const pricingSummary = await screen.findByLabelText(
+      "Inventory pricing summary"
+    );
+    expect(within(pricingSummary).queryByText("USD 0")).not.toBeInTheDocument();
+    expect(within(pricingSummary).getAllByText("Unavailable")).toHaveLength(2);
+  });
+
+  it("keeps the Level-up page available when inventory loading fails", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+    expect(within(calculator).getByText("1,250 XP")).toBeInTheDocument();
+    expect(
+      within(calculator).getByRole("spinbutton", { name: "Target level" })
+    ).toHaveValue(11);
+  });
+
+  it("renders the initial badge session XP and level in the Level-up calculator", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+
+    expect(within(calculator).getByText("1,250 XP")).toBeInTheDocument();
+    expect(within(calculator).getByText("11")).toBeInTheDocument();
+    const targetInput = within(calculator).getByRole("spinbutton", {
+      name: "Target level"
+    });
+    expect(targetInput).toHaveValue(11);
+    expect(targetInput).toHaveAttribute("min", "11");
+    expect(targetInput).toHaveAttribute("max", "100000");
+    expect(within(calculator).getByText("0 XP")).toBeInTheDocument();
+    expect(within(calculator).getByText("Badges needed")).toBeInTheDocument();
+  });
+
+  it("calculates XP and whole-badge requirements from the target level", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+    const targetInput = within(calculator).getByRole("spinbutton", {
+      name: "Target level"
+    });
+
+    fireEvent.change(targetInput, { target: { value: "12" } });
+    expect(within(calculator).getByText("150 XP")).toBeInTheDocument();
+    expect(within(calculator).getByText("2")).toBeInTheDocument();
+    expect(
+      within(calculator).queryByRole("alert")
+    ).not.toBeInTheDocument();
+  });
+
+  it("rejects invalid Level-up targets without showing computed totals", async () => {
+    const inventory = publicInventory([inventoryItem(1)]);
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+    const targetInput = within(calculator).getByRole("spinbutton", {
+      name: "Target level"
+    });
+
+    fireEvent.change(targetInput, { target: { value: "10" } });
+    expect(within(calculator).getByRole("alert")).toHaveTextContent(
+      "Target level cannot be below your current level (11)."
+    );
+    expect(within(calculator).queryByText("XP needed")).not.toBeInTheDocument();
+
+    fireEvent.change(targetInput, { target: { value: "100001" } });
+    expect(within(calculator).getByRole("alert")).toHaveTextContent(
+      "Target level cannot exceed 100000."
+    );
+    expect(within(calculator).queryByText("XP needed")).not.toBeInTheDocument();
+
+    fireEvent.change(targetInput, { target: { value: "12.5" } });
+    expect(within(calculator).getByRole("alert")).toHaveTextContent(
+      "Target level must be a whole number"
+    );
+    expect(within(calculator).queryByText("Badges needed")).not.toBeInTheDocument();
+  });
+
+  it("renders badge-unavailable null state and provider message", async () => {
+    const unavailableBadgeSession = {
+      ...signedInSession,
+      checks: {
+        ...signedInSession.checks,
+        badges: {
+          status: "unavailable",
+          message: "Steam badge check is unavailable.",
+          player_xp: null,
+          player_level: null
+        }
+      }
+    };
+    const inventory = publicInventory([inventoryItem(1)]);
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(unavailableBadgeSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+
+    expect(
+      within(calculator).getByText(
+        "Badge data is unavailable: Steam badge check is unavailable."
+      )
+    ).toBeInTheDocument();
+    expect(within(calculator).getAllByText("Unavailable")).toHaveLength(2);
+    expect(
+      within(calculator).getByRole("spinbutton", { name: "Target level" })
+    ).toBeDisabled();
+    expect(
+      within(calculator).queryByText("XP needed")
+    ).not.toBeInTheDocument();
+  });
+
+  it("synchronizes the target when same-account badge data changes", async () => {
+    const unavailableBadgeSession = {
+      ...signedInSession,
+      checks: {
+        ...signedInSession.checks,
+        badges: {
+          status: "unavailable",
+          message: "Steam badge check is unavailable.",
+          player_xp: null,
+          player_level: null
+        }
+      }
+    };
+    const levelTwelveSession = {
+      ...signedInSession,
+      checks: {
+        ...signedInSession.checks,
+        badges: {
+          status: "public",
+          message: "Steam badge data is available.",
+          player_xp: 1_450,
+          player_level: 12
+        }
+      }
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(unavailableBadgeSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory))
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(levelTwelveSession));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    const calculator = await screen.findByRole("region", {
+      name: "Level-up calculator"
+    });
+    const targetInput = within(calculator).getByRole("spinbutton", {
+      name: "Target level"
+    });
+    expect(targetInput).toBeDisabled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Recheck Steam access" })
+    );
+    await waitFor(() => {
+      expect(targetInput).toBeEnabled();
+      expect(targetInput).toHaveValue(11);
+    });
+
+    fireEvent.change(targetInput, { target: { value: "20" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Recheck Steam access" })
+    );
+    await waitFor(() => {
+      expect(
+        within(calculator).getByText("Current level").closest("div")
+      ).toHaveTextContent("12");
+      expect(targetInput).toHaveValue(20);
+    });
+  });
+
+  it("invalidates optimizer results when rechecked badge state changes", async () => {
+    const levelTwelveSession = {
+      ...signedInSession,
+      checks: {
+        ...signedInSession.checks,
+        badges: {
+          status: "public",
+          message: "Steam badge data is available.",
+          player_xp: 1_450,
+          player_level: 12
+        }
+      }
+    };
+    const responseForRequest = (
+      reason: "no_complete_sellable_set" | "no_positive_xp_swap"
+    ) => async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as {
+        inventory_refreshed_at: string;
+      };
+      const response = levelUpNoOpportunityResponse(
+        reason,
+        request.inventory_refreshed_at
+      );
+      response.generated_at = new Date().toISOString();
+      return jsonResponse(response);
+    };
+    const inventory = publicInventory([inventoryItem(1)]);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockImplementationOnce(
+        responseForRequest("no_complete_sellable_set")
+      )
+      .mockResolvedValueOnce(jsonResponse(levelTwelveSession))
+      .mockImplementationOnce(responseForRequest("no_positive_xp_swap"));
+
+    render(<App />);
+
+    const tablist = await screen.findByRole("tablist", {
+      name: "Inventory result views"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
+    expect(
+      await screen.findByText(
+        "No complete sellable normal-card set is available in this inventory snapshot."
+      )
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Recheck Steam access" })
+    );
+
+    expect(
+      await screen.findByText(
+        "Every self-funded swap would provide no more XP than crafting the owned set."
+      )
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls[2][0]).toMatch(/\/api\/auth\/level-up$/);
+    expect(fetchMock.mock.calls[4][0]).toMatch(/\/api\/auth\/level-up$/);
   });
 
   it("filters gem-convertible items by exact per-item gem cash value above lowest sell", async () => {
@@ -974,7 +1387,6 @@ describe("App", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Boosters" }));
 
     const section = await screen.findByRole("region", {
       name: "Booster details by game"
@@ -1020,7 +1432,6 @@ describe("App", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Boosters" }));
 
     const boosterCard = within(
       await screen.findByRole("region", { name: "Booster details by game" })
@@ -1031,7 +1442,7 @@ describe("App", () => {
     expect(within(boosterCard).getByText("USD 0.20")).toBeInTheDocument();
     expect(within(boosterCard).getByText("USD 0.10")).toBeInTheDocument();
   });
-  it("switches between item and booster result panels with manual keyboard activation", async () => {
+  it("switches between Inventory and Level-up result panels with manual keyboard activation", async () => {
     const inventory = publicInventory([tradingCardItem(10)], {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
@@ -1052,69 +1463,78 @@ describe("App", () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory));
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse(levelUpNoOpportunityResponse())
+      );
     render(<App />);
 
     const tablist = await screen.findByRole("tablist", {
       name: "Inventory result views"
     });
-    const itemsTab = within(tablist).getByRole("tab", { name: "Items" });
-    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
-    const itemsPanel = document.getElementById("inventory-results-panel-items");
-    const boostersPanel = document.getElementById(
-      "inventory-results-panel-boosters"
+    const inventoryTab = within(tablist).getByRole("tab", { name: "Inventory" });
+    const levelUpTab = within(tablist).getByRole("tab", { name: "Level-up" });
+    const inventoryPanel = document.getElementById(
+      "inventory-results-panel-inventory"
+    );
+    const levelUpPanel = document.getElementById(
+      "inventory-results-panel-level-up"
     );
 
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
-    expect(boostersTab).toHaveAttribute("aria-selected", "false");
-    expect(itemsPanel).not.toBeNull();
-    expect(boostersPanel).not.toBeNull();
-    expect(itemsPanel).not.toHaveAttribute("hidden");
-    expect(boostersPanel).toHaveAttribute("hidden");
+    expect(within(tablist).getAllByRole("tab")).toHaveLength(2);
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
+    expect(levelUpTab).toHaveAttribute("aria-selected", "false");
+    expect(inventoryTab).toHaveAttribute(
+      "aria-controls",
+      "inventory-results-panel-inventory"
+    );
+    expect(levelUpTab).toHaveAttribute(
+      "aria-controls",
+      "inventory-results-panel-level-up"
+    );
+    expect(inventoryPanel).not.toHaveAttribute("hidden");
+    expect(levelUpPanel).toHaveAttribute("hidden");
     expect(
       screen.getByRole("table", { name: "Inventory items" })
     ).toBeInTheDocument();
-    const groupByGame = screen.getByRole("checkbox", {
-      name: "Group by game"
-    });
-    fireEvent.click(groupByGame);
-    expect(groupByGame).not.toBeChecked();
-    expect(
-      screen.queryByRole("region", { name: "Booster details by game" })
-    ).not.toBeInTheDocument();
-    expect(
-      boostersPanel?.querySelector("section[aria-labelledby=booster-coverage-title]")
-    ).not.toBeNull();
-
-    fireEvent.keyDown(itemsTab, { key: "ArrowRight" });
-    expect(document.activeElement).toBe(boostersTab);
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
-    expect(boostersTab).toHaveAttribute("aria-selected", "false");
-    fireEvent.keyDown(boostersTab, { key: " " });
-    expect(boostersTab).toHaveAttribute("aria-selected", "true");
-    expect(itemsTab).toHaveAttribute("aria-selected", "false");
-    expect(itemsPanel).toHaveAttribute("hidden");
-    expect(boostersPanel).not.toHaveAttribute("hidden");
     expect(
       screen.getByRole("region", { name: "Booster details by game" })
     ).toBeInTheDocument();
+
+    inventoryTab.focus();
+    fireEvent.keyDown(inventoryTab, { key: "ArrowRight" });
+    expect(levelUpTab).toHaveFocus();
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(levelUpTab, { key: " " });
+    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
+    expect(inventoryTab).toHaveAttribute("aria-selected", "false");
+    expect(inventoryPanel).toHaveAttribute("hidden");
+    expect(levelUpPanel).not.toHaveAttribute("hidden");
     expect(
       screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
     expect(
-      itemsPanel?.querySelector("table.inventory-table")
-    ).not.toBeNull();
+      screen.queryByRole("region", { name: "Booster details by game" })
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByText(/No complete sellable normal-card set/)
+    ).toBeInTheDocument();
 
-    fireEvent.click(itemsTab);
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(inventoryTab);
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
+    expect(inventoryPanel).not.toHaveAttribute("hidden");
+    expect(levelUpPanel).toHaveAttribute("hidden");
     expect(
       screen.getByRole("table", { name: "Inventory items" })
     ).toBeInTheDocument();
-    expect(groupByGame).not.toBeChecked();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByRole("region", { name: "Booster details by game" })
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("adds a lazy level-up tab with stable ARIA wiring and manual activation", async () => {
+  it("adds a lazy Level-up tab with stable ARIA wiring and manual activation", async () => {
     const inventory = publicInventory([inventoryItem(1)]);
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -1129,16 +1549,15 @@ describe("App", () => {
     const tablist = await screen.findByRole("tablist", {
       name: "Inventory result views"
     });
-    const itemsTab = within(tablist).getByRole("tab", { name: "Items" });
-    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
-    const levelUpTab = within(tablist).getByRole("tab", {
-      name: "Level-up optimization"
-    });
-    const itemsPanel = document.getElementById("inventory-results-panel-items");
-    const boostersPanel = document.getElementById(
-      "inventory-results-panel-boosters"
+    const inventoryTab = within(tablist).getByRole("tab", { name: "Inventory" });
+    const levelUpTab = within(tablist).getByRole("tab", { name: "Level-up" });
+    const inventoryPanel = document.getElementById(
+      "inventory-results-panel-inventory"
     );
     const levelUpPanel = document.getElementById(
+      "inventory-results-panel-level-up"
+    );
+    const optimizerPanel = document.getElementById(
       "level-up-optimization-panel"
     );
 
@@ -1148,56 +1567,56 @@ describe("App", () => {
         String(url).endsWith("/api/auth/level-up")
       )
     ).toBe(false);
-    expect(itemsTab).toHaveAttribute("id", "inventory-results-tab-items");
-    expect(itemsTab).toHaveAttribute(
-      "aria-controls",
-      "inventory-results-panel-items"
+    expect(inventoryTab).toHaveAttribute(
+      "id",
+      "inventory-results-tab-inventory"
     );
-    expect(boostersTab).toHaveAttribute("id", "inventory-results-tab-boosters");
-    expect(boostersTab).toHaveAttribute(
+    expect(inventoryTab).toHaveAttribute(
       "aria-controls",
-      "inventory-results-panel-boosters"
+      "inventory-results-panel-inventory"
     );
-    expect(levelUpTab).toHaveAttribute("id", "level-up-optimization-tab");
+    expect(levelUpTab).toHaveAttribute("id", "inventory-results-tab-level-up");
     expect(levelUpTab).toHaveAttribute(
       "aria-controls",
-      "level-up-optimization-panel"
+      "inventory-results-panel-level-up"
     );
     expect(levelUpTab).toHaveAttribute("aria-selected", "false");
     expect(levelUpTab).toHaveAttribute("tabindex", "-1");
     expect(levelUpPanel).toHaveAttribute("role", "tabpanel");
     expect(levelUpPanel).toHaveAttribute(
       "aria-labelledby",
-      "level-up-optimization-tab"
+      "inventory-results-tab-level-up"
     );
     expect(levelUpPanel).toHaveAttribute("hidden");
-    expect(itemsPanel).not.toBeNull();
-    expect(boostersPanel).not.toBeNull();
+    expect(optimizerPanel).not.toHaveAttribute("role", "tabpanel");
+    expect(optimizerPanel).not.toHaveAttribute("aria-labelledby");
+    expect(inventoryPanel).not.toBeNull();
 
-    itemsTab.focus();
-    fireEvent.keyDown(itemsTab, { key: "ArrowLeft" });
+    inventoryTab.focus();
+    fireEvent.keyDown(inventoryTab, { key: "ArrowLeft" });
     expect(levelUpTab).toHaveFocus();
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
 
     fireEvent.keyDown(levelUpTab, { key: "Home" });
-    expect(itemsTab).toHaveFocus();
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(inventoryTab).toHaveFocus();
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
 
-    fireEvent.keyDown(itemsTab, { key: "End" });
+    fireEvent.keyDown(inventoryTab, { key: "End" });
     expect(levelUpTab).toHaveFocus();
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
 
     fireEvent.keyDown(levelUpTab, { key: "Enter" });
     expect(levelUpTab).toHaveAttribute("aria-selected", "true");
-    expect(itemsTab).toHaveAttribute("aria-selected", "false");
+    expect(inventoryTab).toHaveAttribute("aria-selected", "false");
     expect(levelUpPanel).not.toHaveAttribute("hidden");
     expect(
       await screen.findByText(/No complete sellable normal-card set/)
     ).toBeInTheDocument();
+    expect(screen.getByText("Current total XP")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
-    fireEvent.click(itemsTab);
-    expect(itemsTab).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(inventoryTab);
+    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
     expect(levelUpPanel).toHaveAttribute("hidden");
     levelUpTab.focus();
     fireEvent.keyDown(levelUpTab, { key: " " });
@@ -1206,8 +1625,8 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
     fireEvent.keyDown(levelUpTab, { key: "ArrowRight" });
-    expect(itemsTab).toHaveFocus();
-    fireEvent.keyDown(itemsTab, { key: "ArrowLeft" });
+    expect(inventoryTab).toHaveFocus();
+    fireEvent.keyDown(inventoryTab, { key: "ArrowLeft" });
     expect(levelUpTab).toHaveFocus();
   });
 
@@ -1223,7 +1642,7 @@ describe("App", () => {
       name: "Inventory result views"
     });
     const levelUpTab = within(tablist).getByRole("tab", {
-      name: "Level-up optimization"
+      name: "Level-up"
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -1261,7 +1680,7 @@ describe("App", () => {
       name: "Inventory result views"
     });
     const levelUpTab = within(tablist).getByRole("tab", {
-      name: "Level-up optimization"
+      name: "Level-up"
     });
     fireEvent.click(levelUpTab);
     expect(
@@ -1313,14 +1732,14 @@ describe("App", () => {
       name: "Inventory result views"
     });
     fireEvent.click(
-      within(tablist).getByRole("tab", { name: "Level-up optimization" })
+      within(tablist).getByRole("tab", { name: "Level-up" })
     );
     expect(
       await screen.findByText(/No complete sellable normal-card set/)
     ).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam profile" })
+      screen.getByRole("button", { name: "Recheck Steam access" })
     );
     expect(
       await screen.findByText(/Account changed\. Steam profile: Public\./)
@@ -1336,7 +1755,7 @@ describe("App", () => {
       name: "Inventory result views"
     });
     fireEvent.click(
-      within(tablist).getByRole("tab", { name: "Level-up optimization" })
+      within(tablist).getByRole("tab", { name: "Level-up" })
     );
     expect(
       await screen.findByText(/Every self-funded swap would provide no more XP/)
@@ -1353,23 +1772,17 @@ describe("App", () => {
     );
   });
 
-  it("keeps an empty booster view selectable and explains the missing data", async () => {
+  it("shows an empty booster section inside the Inventory panel", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
 
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    const boostersTab = within(tablist).getByRole("tab", { name: "Boosters" });
-    fireEvent.click(boostersTab);
 
     expect(
       await screen.findByRole("heading", { name: "No booster packs to display" })
     ).toBeInTheDocument();
-    expect(boostersTab).toHaveAttribute("aria-selected", "true");
     expect(
       screen.getByText(
         "No trading-card games were identified in this inventory, so there are no related booster packs to display."
@@ -2015,6 +2428,7 @@ describe("App", () => {
         jsonResponse({
           ...signedInSession,
           checks: {
+            ...signedInSession.checks,
             profile: {
               status: "unavailable",
               message: "The Steam Web API is not configured."
@@ -2221,6 +2635,7 @@ describe("App", () => {
     const refreshedSession = {
       ...signedInSession,
       checks: {
+        ...signedInSession.checks,
         profile: {
           status: "private",
           message: "Profile access was checked again."
@@ -2238,7 +2653,7 @@ describe("App", () => {
     await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam profile" })
+      screen.getByRole("button", { name: "Recheck Steam access" })
     );
 
     await waitFor(() => {
@@ -2256,7 +2671,7 @@ describe("App", () => {
     ).toBeInTheDocument();
 
     expect(statusRegion).toHaveTextContent(
-      "Profile recheck complete. Steam profile: Private."
+      "Steam access recheck complete. Profile: Private. Badges: Public."
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
@@ -2267,7 +2682,7 @@ describe("App", () => {
 
   it("keeps profile recheck failures visible and announced without replacing prior results", async () => {
     const message =
-      "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
+      "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(privateInventory))
@@ -2278,7 +2693,7 @@ describe("App", () => {
     await screen.findByLabelText("Connected Steam account: Alyx");
     const statusRegion = screen.getByRole("status");
     fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam profile" })
+      screen.getByRole("button", { name: "Recheck Steam access" })
     );
 
     await waitFor(() => {
@@ -2658,7 +3073,7 @@ describe("App", () => {
       within(screen.getByText("Card 0002").closest("tr") as HTMLElement)
         .getByText("100")
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("tab", { name: "Boosters" }));
+    expect(screen.getByRole("region", { name: "Booster details by game" })).toBeInTheDocument();
     const boosterCard = within(
       await screen.findByRole("region", { name: "Booster details by game" })
     ).getByRole("article", { name: "Team Fortress 2" });

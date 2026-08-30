@@ -58,6 +58,7 @@ from app.level_up_optimizer import (
     LevelUpOptimizationResponse,
     OptimizerInputError,
     ResolvedCatalog,
+    level_for_xp,
     optimize_level_up,
     parse_normal_card_hash,
 )
@@ -94,8 +95,12 @@ _CANONICAL_GEM_CASH_VALUE_ERROR = "Gem cash value must be a canonical decimal."
 _INVALID_ITEM_GEM_METADATA_ERROR = "Inventory item gem metadata is inconsistent."
 _INVALID_BOOSTER_PAIR_ERROR = "Booster card set size and gem cost must be paired."
 _INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
+_PUBLIC_BADGE_FIELDS_ERROR = "Public badge checks require XP and level."
+_PUBLIC_BADGE_CONSISTENCY_ERROR = "Public badge XP and level must agree."
+_UNAVAILABLE_BADGE_FIELDS_ERROR = "Unavailable badge checks cannot include XP or level."
 
 CheckStatus = Literal["public", "private", "unavailable"]
+BadgeStatus = Literal["public", "unavailable"]
 PriceStatus = Literal["complete", "partial", "unavailable"]
 GemStatus = Literal["complete", "partial", "unavailable"]
 InventoryItemType = ItemType
@@ -189,6 +194,24 @@ class CheckResult(BaseModel):
 class ProfileCheck(CheckResult):
     display_name: str | None = None
     avatar_url: str | None = None
+
+
+class BadgeCheck(BaseModel):
+    status: BadgeStatus
+    message: str
+    player_xp: StrictInt | None = Field(default=None, ge=0, le=10**12)
+    player_level: StrictInt | None = Field(default=None, ge=0, le=100_000)
+
+    @model_validator(mode="after")
+    def validate_status_fields(self) -> BadgeCheck:
+        if self.status == "public":
+            if self.player_xp is None or self.player_level is None:
+                raise ValueError(_PUBLIC_BADGE_FIELDS_ERROR)
+            if level_for_xp(self.player_xp) != self.player_level:
+                raise ValueError(_PUBLIC_BADGE_CONSISTENCY_ERROR)
+        elif self.player_xp is not None or self.player_level is not None:
+            raise ValueError(_UNAVAILABLE_BADGE_FIELDS_ERROR)
+        return self
 
 
 class InventoryPrice(BaseModel):
@@ -342,6 +365,10 @@ class InventoryCheck(CheckResult):
 class SteamGatewayProtocol(Protocol):
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         """Check whether a Steam profile is publicly visible."""
+        ...
+
+    async def check_badges(self, steam_id: str) -> BadgeCheck:
+        """Check whether Steam badge XP and level are publicly available."""
         ...
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
@@ -1507,6 +1534,13 @@ def _unavailable_profile() -> ProfileCheck:
     return ProfileCheck(
         status="unavailable",
         message="Steam profile API is unavailable.",
+    )
+
+
+def _unavailable_badges() -> BadgeCheck:
+    return BadgeCheck(
+        status="unavailable",
+        message="Steam badge check is unavailable.",
     )
 
 
@@ -2804,6 +2838,20 @@ class SteamGateway:
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         return await self.steamapis.fetch_inventory(steam_id)
+
+    async def check_badges(self, steam_id: str) -> BadgeCheck:
+        try:
+            badge_state = await self._fetch_badge_state(steam_id, ())
+            if not isinstance(badge_state, BadgeState):
+                return _unavailable_badges()
+            return BadgeCheck(
+                status="public",
+                message="Steam badge data is available.",
+                player_xp=badge_state.player_xp,
+                player_level=badge_state.player_level,
+            )
+        except Exception:  # noqa: BLE001 - map badge failures to unavailable
+            return _unavailable_badges()
 
     async def _fetch_badge_state(
         self,

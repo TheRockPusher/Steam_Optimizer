@@ -1,6 +1,18 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+
+## Unreleased
+
+### Features
+
+- Load validated Steam badge XP and level with the authenticated session.
+- Add Inventory and Level-up pages with quantity-aware market totals and target-level badge math.
+
+### Testing
+
+- Cover badge-session fallbacks, exact inventory totals, accessible tabs, and level calculations.
+
 ## v0.8.3
 
 

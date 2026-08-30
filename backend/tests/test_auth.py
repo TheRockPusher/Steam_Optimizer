@@ -28,6 +28,7 @@ from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
     PROFILE_ENDPOINT,
+    BadgeCheck,
     InventoryCheck,
     ProfileCheck,
     SteamGateway,
@@ -65,12 +66,19 @@ class FakeGateway:
         inventory_error: Exception | None = None,
         level_up_result: LevelUpOptimizationResponse | None = None,
         level_up_error: Exception | None = None,
+        profile_error: Exception | None = None,
+        badge_result: BadgeCheck | None = None,
+        badge_error: Exception | None = None,
     ) -> None:
         self.inventory_retry_after_seconds = inventory_retry_after_seconds
         self.inventory_error = inventory_error
         self.level_up_result = level_up_result
         self.level_up_error = level_up_error
+        self.profile_error = profile_error
+        self.badge_result = badge_result
+        self.badge_error = badge_error
         self.profile_calls = 0
+        self.badge_calls = 0
         self.inventory_calls = 0
         self.level_up_calls: list[
             tuple[
@@ -86,11 +94,27 @@ class FakeGateway:
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         self.profile_calls += 1
         del steam_id
+        if self.profile_error is not None:
+            raise self.profile_error
         return ProfileCheck(
             status="public",
             message="profile ok",
             display_name="Ada",
             avatar_url="https://cdn.example/avatar.jpg",
+        )
+
+    async def check_badges(self, steam_id: str) -> BadgeCheck:
+        self.badge_calls += 1
+        del steam_id
+        if self.badge_error is not None:
+            raise self.badge_error
+        if self.badge_result is not None:
+            return self.badge_result
+        return BadgeCheck(
+            status="public",
+            message="badge ok",
+            player_xp=0,
+            player_level=0,
         )
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
@@ -363,13 +387,98 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
         },
         "checks": {
             "profile": {"status": "public", "message": "profile ok"},
+            "badges": {
+                "status": "public",
+                "message": "badge ok",
+                "player_xp": 0,
+                "player_level": 0,
+            },
         },
     }
     assert session.headers["cache-control"] == "no-store"
     assert gateway.profile_calls == 1
+    assert gateway.badge_calls == 1
     assert gateway.inventory_calls == 0
     assert logout.status_code == 204
     assert after_logout.json() == {"authenticated": False}
+
+
+def test_session_badge_failure_is_isolated_from_profile_success() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(badge_error=RuntimeError("provider unavailable"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get("/api/auth/session")
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == {
+        "profile": {"status": "public", "message": "profile ok"},
+        "badges": {
+            "status": "unavailable",
+            "message": "Steam badge check is unavailable.",
+            "player_xp": None,
+            "player_level": None,
+        },
+    }
+    assert gateway.profile_calls == 1
+    assert gateway.badge_calls == 1
+
+
+def test_session_profile_failure_is_isolated_from_badge_success() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(profile_error=RuntimeError("provider unavailable"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get("/api/auth/session")
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == {
+        "profile": {
+            "status": "unavailable",
+            "message": "Steam profile check is unavailable.",
+        },
+        "badges": {
+            "status": "public",
+            "message": "badge ok",
+            "player_xp": 0,
+            "player_level": 0,
+        },
+    }
+    assert gateway.profile_calls == 1
+    assert gateway.badge_calls == 1
+
+
+def test_unauthenticated_session_response_stays_unchanged() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/auth/session")
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": False}
+    assert gateway.profile_calls == 0
+    assert gateway.badge_calls == 0
 
 
 @pytest.mark.parametrize("session_cookie", [None, "invalid-session-cookie"])

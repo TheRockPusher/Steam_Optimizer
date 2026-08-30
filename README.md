@@ -64,8 +64,9 @@ The current connection, inventory, and read-only recommendation stage provides:
 
 - Browser-based Steam OpenID 2.0 authentication.
 - An application-owned, signed, HTTP-only session.
-- A profile-only server session check: `GET /api/auth/session` checks profile visibility and does
-  not request inventory.
+- A concurrent server session check: `GET /api/auth/session` checks profile visibility and
+  validated current badge XP/level without requesting inventory. Either check can be unavailable
+  without invalidating the authenticated session.
 - Inventory is requested once on an authenticated client cache miss (including an account-change
   or invalid-schema miss) or when the user explicitly selects **Refresh inventory**. Session
   rechecks do not request inventory. Each request names the expected SteamID64, which the backend
@@ -89,27 +90,31 @@ The current connection, inventory, and read-only recommendation stage provides:
 - Canonical names and independent game, rarity, and card-border metadata for every Steam Community
   item class, with gem eligibility derived from Steam's validated conversion action rather than
   inferred from the class.
-- A responsive inventory interface with separate Items and Boosters views, sortable and paginated
-  item data, optional game grouping, selectable lowest-sell or highest-buy gem cash valuation, and
-  filtering for marketable gem-convertible items whose selected gem cash value exceeds their
-  current lowest-sell market price.
-- A third, manually activated **Level-up optimization** tab in the **Inventory and level-up
-  planning** section. Items remains the default tab, and the optimizer does not request anything
-  until the user opens this tab. It requires a public inventory and an eligible ownership
-  timestamp; otherwise it shows the existing recovery or **Refresh inventory** state.
-- On activation, the frontend aggregates only normal trading-card rows from the current IndexedDB
-  inventory record into a bounded transient snapshot: exact `market_hash_name`, `owned_quantity`,
-  `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that snapshot to
-  `POST /api/auth/level-up` with the signed session and matching `x-expected-steam-id` header.
-  The endpoint never calls the inventory provider, logs holdings, or stores the submitted snapshot.
-- The endpoint derives eligible normal-card AppIDs from the complete normalized market catalog. If
-  no eligible group exists, it returns without calling the badge provider; otherwise it reads at
-  most one bounded SteamApis v2 `/v2/steam/users/{steamid}/badges` response on the server for the
-  signed SteamID64. It uses the player's XP and level plus normal badge records for those catalog
-  AppIDs. Foil and non-game records are ignored, as are syntactically valid records outside the
-  catalog, including unrelated event and collection badges. Relevant records with malformed border
-  metadata, and relevant normal records with malformed level metadata, fail closed. Badge response
-  data is not persisted or exposed to the browser beyond the recommendation result.
+- A responsive two-tab interface with **Inventory** selected by default and a **Level-up** page.
+  Inventory starts with quantity-aware highest-buy and lowest-sell totals, reports independent
+  quote coverage for each side, and keeps sortable, paginated item data, booster details, optional
+  game grouping, selectable gem cash valuation, and the worth-more-as-gems filter together.
+- During authenticated session loading, the backend checks profile visibility and reads one
+  bounded SteamApis badge response concurrently. It exposes only validated current XP and level
+  under `checks.badges`; failures remain an explicit unavailable badge state and do not prevent
+  profile, inventory-cache, or inventory loading. Badge XP and level remain in React memory and
+  are not written to IndexedDB, `localStorage`, cookies, or a server-side user cache.
+- The **Level-up** page shows current total XP and level immediately, accepts a target level, and
+  calculates the exact XP threshold delta plus the number of 100-XP badge crafts required. Its
+  existing swap optimizer remains read-only and does not request anything until the user opens
+  this page. It requires a public inventory and an eligible ownership timestamp; otherwise it
+  shows the existing recovery or **Refresh inventory** state.
+- On optimizer activation, the frontend aggregates only normal trading-card rows from the current
+  IndexedDB inventory record into a bounded transient snapshot: exact `market_hash_name`,
+  `owned_quantity`, `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that
+  snapshot to `POST /api/auth/level-up` with the signed session and matching
+  `x-expected-steam-id` header. The endpoint never calls the inventory provider, logs holdings, or
+  stores the submitted snapshot.
+- The optimizer derives eligible normal-card AppIDs from the complete normalized market catalog.
+  If no eligible group exists, it returns without another badge-provider call; otherwise it reads
+  at most one bounded SteamApis badges response for the signed SteamID64 and uses catalog-scoped
+  normal badge levels. Foil, non-game, unrelated event, and collection records are excluded.
+  Catalog-scoped badge levels are neither persisted nor exposed to the browser.
 - A complete `ready` response is one deterministic, fully funded advisory plan: sell one copy of
   every card in one owned normal set into current highest bids, buy up to five cheaper complete
   normal sets at current lowest asks, and compare the resulting badge XP. The response includes
@@ -313,11 +318,12 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   third-party SteamApis v2 provider. Profile visibility uses Valve's documented
   [Steam Web API](https://steamcommunity.com/dev) when `STEAM_WEB_API_KEY` is configured.
   `STEAMAPI_KEY` and `STEAM_WEB_API_KEY` are server-only; neither credential is sent to the
-  browser or persisted in caches. When the level-up catalog has at least one eligible normal-card
-  group, the endpoint reads at most one bounded SteamApis v2
-  `/v2/steam/users/{steamid}/badges` response for the signed SteamID64. It uses only player
-  XP/level and normal badge records for catalog AppIDs and does not retain that response. Foil,
-  non-game, and syntactically valid records outside the catalog are ignored.
+  browser or persisted in caches. Each authenticated call to the session endpoint, including a
+  reload or explicit recheck, reads one bounded SteamApis badges response for the signed SteamID64
+  and returns only validated current XP and level. Opening the
+  Level-up optimizer may make one additional bounded read for catalog-scoped normal badge levels;
+  those levels and the raw provider response are discarded after calculation. Foil, non-game, and
+  unrelated records never become optimizer inputs.
 - Provider caveat: SteamApis response availability, fields, pagination, price snapshots, and
   top-of-book depth are provider/data-source facts rather than Valve guarantees. Price coverage is
   `complete` when all priceable rows are priced, `partial` when some but not all priceable rows are
@@ -357,8 +363,10 @@ was last updated on 2026-08-30.
   receives the verified SteamID64. The signed, HTTP-only session cookie contains that identifier
   on the user's device for up to 24 hours by default; it is sent to the Railway-hosted backend for
   authenticated requests and cleared by logout or expiry. The session endpoint checks profile
-  visibility only. It does not request inventory, and inventory data is never placed in a cookie.
-  Steam handles passwords and Steam Guard; Steam Optimizer never receives or stores either.
+  visibility and current badge XP/level concurrently; it does not request inventory. Only
+  validated XP and level are returned to React memory, and no badge data or inventory data is
+  placed in a cookie. Steam handles passwords and Steam Guard; Steam Optimizer never receives or
+  stores either.
 - Inventory retention and refresh: after authentication, the client reads one current-user browser
   IndexedDB record keyed to SteamID64. A valid matching public/private record is rendered without
   an inventory API call. A missing, mismatched, corrupt, or incompatible-schema record triggers one
