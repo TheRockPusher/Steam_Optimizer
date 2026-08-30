@@ -4,11 +4,20 @@ import asyncio
 import json
 import re
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from urllib.parse import quote, unquote, urljoin, urlsplit
@@ -102,8 +111,19 @@ BOOSTER_CARD_COUNT = 3
 
 STEAMAPIS_BADGES_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/users/{{steam_id}}/badges"
 LEVEL_UP_PRICE_MAX_AGE_SECONDS = 15 * 60
-MAX_BADGE_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_BADGE_RECORDS = 10_000
+MAX_BADGE_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_BADGE_DECODED_SIZE = 16 * 1024 * 1024
+MAX_BADGE_PREFLIGHT_CHARGE = 32 * 1024 * 1024
+MAX_BADGE_RECORDS = 25_000
+MAX_BADGE_JSON_TOKENS = 1_000_000
+_BADGE_JSON_CONTAINER_START_EVENTS = frozenset({"start_map", "start_array"})
+_BADGE_JSON_CONTAINER_END_EVENTS = frozenset({"end_map", "end_array"})
+_BADGE_JSON_SCALAR_EVENTS = frozenset(
+    {"null", "boolean", "integer", "double", "number"}
+)
+_BADGE_JSON_VALUE_EVENTS = (
+    _BADGE_JSON_CONTAINER_START_EVENTS | _BADGE_JSON_SCALAR_EVENTS | {"string"}
+)
 MAX_LEVEL_UP_CATALOG_ROWS = 250_000
 MAX_LEVEL_UP_METADATA_APPS = 128
 
@@ -638,29 +658,36 @@ def _retry_after_seconds(response: HTTPResponse) -> int | None:
 
 
 def _bounded_json_size(value: object, maximum: int) -> int | None:
-    """Estimate decoded JSON size without serializing or recursing."""
+    """Estimate decoded JSON size with depth-bounded traversal state."""
 
     total = 0
-    pending: list[tuple[object, int]] = [(value, 0)]
+    pending: list[tuple[Iterator[object], int]] = [(iter((value,)), 0)]
     while pending:
-        current, depth = pending.pop()
+        children, depth = pending[-1]
+        try:
+            current = next(children)
+        except StopIteration:
+            pending.pop()
+            continue
         if depth > MAX_INVENTORY_NESTING:
             return None
-        if isinstance(current, Mapping):
+        if isinstance(current, (Mapping, list)):
             total += 16 + len(current) * 8
-            for key, child in current.items():
-                pending.append((child, depth + 1))
-                if isinstance(key, str):
-                    total += len(key)
-        elif isinstance(current, list):
-            total += 16 + len(current) * 8
-            pending.extend((child, depth + 1) for child in current)
         elif isinstance(current, (str, bytes, bytearray, memoryview)):
             total += len(current)
         else:
             total += 32
         if total > maximum:
             return None
+        if isinstance(current, Mapping):
+            pending.append(
+                (
+                    (child for pair in current.items() for child in pair),
+                    depth + 1,
+                )
+            )
+        elif isinstance(current, list):
+            pending.append((iter(current), depth + 1))
     return total
 
 
@@ -684,6 +711,14 @@ def _response_content_length_within(
     if len(normalized) > maximum_digits:
         return False
     return int(normalized) <= maximum
+
+
+def _response_content_is_identity(response: HTTPResponse) -> bool:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return True
+    value = _header(headers, "content-encoding")
+    return value is None or value.strip().casefold() == "identity"
 
 
 def _append_bounded_bytes(
@@ -759,17 +794,78 @@ def _steamapis_badge_value(
     return payload.get(documented_name)
 
 
-def _parse_badges_payload(payload: object) -> BadgeState:
-    """Parse SteamApis' bounded badge response into immutable badge state."""
+def _badge_json_events(body: bytes) -> Iterator[tuple[str, str, object]]:
+    try:
+        yield from ijson.parse(BytesIO(body))
+    except (
+        IncompleteJSONError,
+        JSONError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        OverflowError,
+    ) as error:
+        raise InvalidSteamApisPayloadError from error
 
-    if (
-        _bounded_json_size(payload, MAX_BADGE_RESPONSE_BYTES) is None
-        or not isinstance(payload, Mapping)
-        or not _is_success_flag(payload.get("success"))
-    ):
+
+def _preflight_badge_json_body(body: bytes) -> None:
+    """Reject amplified JSON before materializing its Python object graph."""
+
+    decoded_size = 0
+    depth = 0
+    record_count = 0
+    token_count = 0
+    for prefix, event, value in _badge_json_events(body):
+        token_count += 1
+        if token_count > MAX_BADGE_JSON_TOKENS:
+            raise InvalidSteamApisPayloadError
+        if prefix == "result.badges.item" and event in _BADGE_JSON_VALUE_EVENTS:
+            record_count += 1
+            if record_count > MAX_BADGE_RECORDS:
+                raise InvalidSteamApisPayloadError
+        if event in _BADGE_JSON_CONTAINER_START_EVENTS:
+            depth += 1
+            if depth > MAX_INVENTORY_NESTING:
+                raise InvalidSteamApisPayloadError
+            decoded_size += 72
+        elif event in _BADGE_JSON_CONTAINER_END_EVENTS:
+            depth -= 1
+            if depth < 0:
+                raise InvalidSteamApisPayloadError
+            continue
+        elif event == "map_key":
+            if not isinstance(value, str):
+                raise InvalidSteamApisPayloadError
+            decoded_size += 96 + len(value)
+        elif event == "string":
+            if not isinstance(value, str):
+                raise InvalidSteamApisPayloadError
+            decoded_size += 64 + len(value)
+        elif event in _BADGE_JSON_SCALAR_EVENTS:
+            decoded_size += 40
+        else:
+            raise InvalidSteamApisPayloadError
+        if decoded_size > MAX_BADGE_PREFLIGHT_CHARGE:
+            raise InvalidSteamApisPayloadError
+    if depth != 0:
+        raise InvalidSteamApisPayloadError
+
+
+def _parse_badges_payload(
+    payload: object,
+    relevant_app_ids: Collection[int],
+) -> BadgeState:
+    """Parse relevant normal-card badge levels from one bounded SteamApis response."""
+
+    if not isinstance(payload, Mapping) or not _is_success_flag(payload.get("success")):
         raise InvalidSteamApisPayloadError
     result = payload.get("result")
     if not isinstance(result, Mapping):
+        raise InvalidSteamApisPayloadError
+    records = result.get("badges")
+    if not isinstance(records, list) or len(records) > MAX_BADGE_RECORDS:
+        raise InvalidSteamApisPayloadError
+    if _bounded_json_size(payload, MAX_BADGE_DECODED_SIZE) is None:
         raise InvalidSteamApisPayloadError
     player_xp = _badge_integer(
         _steamapis_badge_value(result, "xp", "player_xp"),
@@ -781,19 +877,23 @@ def _parse_badges_payload(payload: object) -> BadgeState:
         minimum=0,
         maximum=100_000,
     )
-    records = result.get("badges")
-    if player_xp is None or player_level is None or not isinstance(records, list):
-        raise InvalidSteamApisPayloadError
-    if len(records) > MAX_BADGE_RECORDS:
+    if player_xp is None or player_level is None:
         raise InvalidSteamApisPayloadError
     levels: dict[int, int] = {}
     for record in records:
         if not isinstance(record, Mapping):
             raise InvalidSteamApisPayloadError
         raw_app_id = _steamapis_badge_value(record, "appID", "appid")
-        # Non-game badges have no application ID. They carry no game-level
-        # semantics, so ignore them before validating game-only fields.
-        if raw_app_id is None or raw_app_id == 0:
+        if raw_app_id is None:
+            continue
+        if isinstance(raw_app_id, bool) or not isinstance(raw_app_id, int):
+            raise InvalidSteamApisPayloadError
+        if raw_app_id == 0:
+            continue
+        app_id = _badge_integer(raw_app_id, minimum=1, maximum=MAX_APP_ID)
+        if app_id is None:
+            raise InvalidSteamApisPayloadError
+        if app_id not in relevant_app_ids:
             continue
         border_color = _badge_integer(
             _steamapis_badge_value(record, "borderColor", "border_color"),
@@ -802,12 +902,9 @@ def _parse_badges_payload(payload: object) -> BadgeState:
         )
         if border_color is None:
             raise InvalidSteamApisPayloadError
-        # Foil records are deliberately ignored.
+        # Foil records do not affect normal-card badge progress.
         if border_color != 0:
             continue
-        app_id = _badge_integer(raw_app_id, minimum=1, maximum=MAX_APP_ID)
-        if app_id is None:
-            raise InvalidSteamApisPayloadError
         level = _badge_integer(record.get("level"), minimum=0, maximum=5)
         if level is None or app_id in levels:
             raise InvalidSteamApisPayloadError
@@ -2708,10 +2805,15 @@ class SteamGateway:
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         return await self.steamapis.fetch_inventory(steam_id)
 
-    async def _fetch_badge_state(self, steam_id: str) -> BadgeState:
+    async def _fetch_badge_state(
+        self,
+        steam_id: str,
+        relevant_app_ids: Collection[int],
+    ) -> BadgeState:
         headers = self.steamapis._api_headers()
         if headers is None:
             raise InvalidSteamApisPayloadError
+        headers["Accept-Encoding"] = "identity"
         if (
             not isinstance(steam_id, str)
             or not steam_id
@@ -2730,6 +2832,7 @@ class SteamGateway:
         ) as response:
             if (
                 not 200 <= response.status_code < 300
+                or not _response_content_is_identity(response)
                 or not _response_content_length_within(
                     response, MAX_BADGE_RESPONSE_BYTES
                 )
@@ -2743,14 +2846,16 @@ class SteamGateway:
                 raise
             except (TypeError, ValueError, OSError, RuntimeError) as error:
                 raise InvalidSteamApisPayloadError from error
+        raw_body = bytes(body)
+        _preflight_badge_json_body(raw_body)
         try:
             payload = json.loads(
-                bytes(body).decode("utf-8"),
+                raw_body.decode("utf-8"),
                 object_pairs_hook=reject_duplicate_object_keys,
             )
         except (TypeError, UnicodeDecodeError, ValueError, RecursionError):
             raise InvalidSteamApisPayloadError from None
-        return _parse_badges_payload(payload)
+        return _parse_badges_payload(payload, relevant_app_ids)
 
     async def check_level_up(
         self,
@@ -2904,8 +3009,18 @@ class SteamGateway:
                 contract=contract,
             )
 
+        groups = _catalog_groups(catalog_read)
+        if not groups:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_complete_sellable_set",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+
         try:
-            badge_state = await self._fetch_badge_state(steam_id)
+            badge_state = await self._fetch_badge_state(steam_id, groups)
         except (
             InvalidSteamApisPayloadError,
             httpx2.HTTPError,
@@ -2941,15 +3056,6 @@ class SteamGateway:
                 contract=contract,
             )
 
-        groups = _catalog_groups(catalog_read)
-        if not groups:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_complete_sellable_set",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-            )
         if not all(isinstance(holding, Holding) for holding in holdings):
             return _level_up_response(
                 status="unavailable",
