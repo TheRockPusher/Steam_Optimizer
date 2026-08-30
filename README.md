@@ -102,10 +102,14 @@ The current connection, inventory, and read-only recommendation stage provides:
   `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that snapshot to
   `POST /api/auth/level-up` with the signed session and matching `x-expected-steam-id` header.
   The endpoint never calls the inventory provider, logs holdings, or stores the submitted snapshot.
-- The endpoint reads one bounded SteamApis v2 `/v2/steam/users/{steamid}/badges` response on the
-  server for the signed SteamID64. It uses the player's XP, level, and normal game badges only
-  (border color `0`); foil and non-game badges are ignored. Badge response data is not persisted or
-  exposed to the browser beyond the recommendation result.
+- The endpoint derives eligible normal-card AppIDs from the complete normalized market catalog. If
+  no eligible group exists, it returns without calling the badge provider; otherwise it reads at
+  most one bounded SteamApis v2 `/v2/steam/users/{steamid}/badges` response on the server for the
+  signed SteamID64. It uses the player's XP and level plus normal badge records for those catalog
+  AppIDs. Foil and non-game records are ignored, as are syntactically valid records outside the
+  catalog, including unrelated event and collection badges. Relevant records with malformed border
+  metadata, and relevant normal records with malformed level metadata, fail closed. Badge response
+  data is not persisted or exposed to the browser beyond the recommendation result.
 - A complete `ready` response is one deterministic, fully funded advisory plan: sell one copy of
   every card in one owned normal set into current highest bids, buy up to five cheaper complete
   normal sets at current lowest asks, and compare the resulting badge XP. The response includes
@@ -309,10 +313,11 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   third-party SteamApis v2 provider. Profile visibility uses Valve's documented
   [Steam Web API](https://steamcommunity.com/dev) when `STEAM_WEB_API_KEY` is configured.
   `STEAMAPI_KEY` and `STEAM_WEB_API_KEY` are server-only; neither credential is sent to the
-  browser or persisted in caches. The level-up endpoint reads one bounded SteamApis v2
-  `/v2/steam/users/{steamid}/badges` response for the signed SteamID64, uses only player XP/level
-  and normal (border color `0`) game badges, and does not retain that response. Foil and non-game
-  badges are ignored.
+  browser or persisted in caches. When the level-up catalog has at least one eligible normal-card
+  group, the endpoint reads at most one bounded SteamApis v2
+  `/v2/steam/users/{steamid}/badges` response for the signed SteamID64. It uses only player
+  XP/level and normal badge records for catalog AppIDs and does not retain that response. Foil,
+  non-game, and syntactically valid records outside the catalog are ignored.
 - Provider caveat: SteamApis response availability, fields, pagination, price snapshots, and
   top-of-book depth are provider/data-source facts rather than Valve guarantees. Price coverage is
   `complete` when all priceable rows are priced, `partial` when some but not all priceable rows are
@@ -373,12 +378,12 @@ was last updated on 2026-08-30.
   IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
   inventory refresh, and unmount discard it. Quote expiry retains the rows only in React memory as
   non-actionable audit information until refresh or another lifecycle invalidation.
-- Badge-state handling: the backend makes one bounded server-only SteamApis v2
-  `/v2/steam/users/{steamid}/badges` request for the signed SteamID64 when calculating a
-  recommendation. It reads player XP, player level, and normal game badges (border color `0`),
-  ignoring foil and non-game badges. The SteamApis API key and raw badge response remain
-  server-side and are not persisted; only validated badge-derived fields needed in the response
-  can reach the browser.
+- Badge-state handling: after finding at least one eligible normal-card catalog group, the backend
+  makes at most one bounded server-only SteamApis v2 `/v2/steam/users/{steamid}/badges` request for
+  the signed SteamID64. It reads player XP, player level, and normal badge records for catalog
+  AppIDs. Foil, non-game, and syntactically valid records outside the catalog are ignored. The
+  SteamApis API key and raw badge response remain server-side and are not persisted; only validated
+  badge-derived fields needed in the response can reach the browser.
 - Market-price retention and provider freshness: market prices are a global AppID 753 generation,
   not user-specific inventory data. The backend stores normalized fields only in a separate SQLite
   cache, fresh for 24 hours for inventory display. It refreshes lazily when a request finds the

@@ -44,6 +44,7 @@ from app.main import create_app
 from app.market_fees import MarketFeeContract
 from app.settings import Settings
 from app.steam_gateway import (
+    MAX_BADGE_DECODED_SIZE,
     MAX_BADGE_RECORDS,
     MAX_BADGE_RESPONSE_BYTES,
     MAX_INVENTORY_ASSETS_PER_PAGE,
@@ -75,12 +76,14 @@ class FakeResponse:
         headers: Mapping[str, str] | None = None,
         chunks: list[bytes] | None = None,
         json_error: BaseException | None = None,
+        stream_error: BaseException | None = None,
     ) -> None:
         self.status_code = status_code
         self.payload = payload
         self.headers = dict(headers or {})
         self.chunks = chunks or []
         self.json_error = json_error
+        self.stream_error = stream_error
         self.text = ""
 
     def json(self) -> object:
@@ -94,6 +97,8 @@ class FakeResponse:
         async def chunks() -> AsyncIterator[bytes]:
             for chunk in self.chunks:
                 yield chunk
+            if self.stream_error is not None:
+                raise self.stream_error
 
         return chunks()
 
@@ -2570,7 +2575,13 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
             _badge_payload(
                 badges=[
                     {"appID": 440, "borderColor": 0, "level": 3},
-                    {"appID": 440, "borderColor": 1, "level": 5},
+                    {"appID": 440, "borderColor": 1, "level": 50},
+                    {
+                        "appID": 2_243_720,
+                        "borderColor": 0,
+                        "level": 372_366,
+                    },
+                    {"appID": 2_861_690, "borderColor": 7, "level": "unknown"},
                     {"id": 1, "level": 7},
                 ]
             )
@@ -2584,7 +2595,7 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
         http_client=client,
     )
 
-    result = run(gateway._fetch_badge_state("76561198000000000"))
+    result = run(gateway._fetch_badge_state("76561198000000000", {440}))
 
     assert result.player_xp == 0
     assert result.player_level == 0
@@ -2599,6 +2610,7 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
             "params": None,
             "headers": {
                 "x-api-key": "server-badge-key",
+                "Accept-Encoding": "identity",
                 "User-Agent": (
                     "SteamOptimizer/0.1.1 "
                     "(+https://github.com/TheRockPusher/Steam_Optimizer)"
@@ -2621,7 +2633,8 @@ def test_get_badges_accepts_documented_snake_case_fields() -> None:
                     {"appid": 440, "border_color": 0, "level": 1},
                 ],
             },
-        }
+        },
+        {440},
     )
 
     assert result.player_xp == 100
@@ -2629,25 +2642,161 @@ def test_get_badges_accepts_documented_snake_case_fields() -> None:
     assert dict(result.normal_badge_levels) == {440: 1}
 
 
-def test_get_badges_rejects_ambiguous_provider_aliases() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "success": True,
+            "result": {
+                "xp": 100,
+                "player_xp": 100,
+                "level": 1,
+                "badges": [],
+            },
+        },
+        _badge_payload(
+            player_xp=100,
+            player_level=1,
+            badges=[
+                {
+                    "appID": 440,
+                    "appid": 440,
+                    "borderColor": 0,
+                    "level": 1,
+                }
+            ],
+        ),
+        _badge_payload(
+            player_xp=100,
+            player_level=1,
+            badges=[
+                {
+                    "appID": 440,
+                    "borderColor": 0,
+                    "border_color": 0,
+                    "level": 1,
+                }
+            ],
+        ),
+    ],
+)
+def test_get_badges_rejects_ambiguous_provider_aliases(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(payload, {440})
+
+
+@pytest.mark.parametrize(
+    "raw_app_id",
+    [False, 0.0, "440", -1, steam_gateway.MAX_APP_ID + 1],
+)
+def test_get_badges_rejects_malformed_app_ids(raw_app_id: object) -> None:
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
         steam_gateway._parse_badges_payload(
-            {
-                "success": True,
-                "result": {
-                    "xp": 100,
-                    "player_xp": 100,
-                    "level": 1,
-                    "badges": [],
-                },
-            }
+            _badge_payload(
+                badges=[
+                    {
+                        "appID": raw_app_id,
+                        "borderColor": 0,
+                        "level": 1,
+                    }
+                ]
+            ),
+            {440},
         )
 
 
-@pytest.mark.parametrize("status_code", [403, 429])
-def test_get_badges_rejects_private_and_rate_limited_responses(
-    status_code: int,
+def test_get_badges_ignores_non_game_irrelevant_and_foil_records() -> None:
+    result = steam_gateway._parse_badges_payload(
+        _badge_payload(
+            player_xp=100,
+            player_level=1,
+            badges=[
+                {"id": 13, "level": 625},
+                {"appID": None},
+                {"appID": 0},
+                {"appID": 2_243_720, "borderColor": 99, "level": "unknown"},
+                {"appID": 440, "borderColor": 1},
+                {"appID": 440, "borderColor": 1, "level": 999},
+                {"appID": 440, "borderColor": 0, "level": 1},
+            ],
+        ),
+        {440},
+    )
+
+    assert dict(result.normal_badge_levels) == {440: 1}
+
+
+@pytest.mark.parametrize(
+    "badges",
+    [
+        [{"appID": 440, "level": 1}],
+        [{"appID": 440, "borderColor": 2, "level": 1}],
+        [{"appID": 440, "borderColor": False, "level": 1}],
+        [{"appID": 440, "borderColor": 0}],
+        [{"appID": 440, "borderColor": 0, "level": 6}],
+        [{"appID": 440, "borderColor": 0, "level": -1}],
+        [{"appID": 440, "borderColor": 0, "level": False}],
+        [{"appID": 440, "borderColor": 0, "level": "1"}],
+        [
+            {"appID": 440, "borderColor": 0, "level": 1},
+            {"appID": 440, "borderColor": 0, "level": 1},
+        ],
+    ],
+)
+def test_get_badges_rejects_malformed_relevant_normal_badges(
+    badges: list[dict[str, object]],
 ) -> None:
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(
+            _badge_payload(badges=badges),
+            {440},
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"success": False, "result": {}},
+        {"success": True, "result": None},
+        {"success": True, "result": {"xp": 0, "level": 0}},
+        {
+            "success": True,
+            "result": {"xp": 0, "level": 0, "badges": {}},
+        },
+        {
+            "success": True,
+            "result": {"xp": False, "level": 0, "badges": []},
+        },
+        {
+            "success": True,
+            "result": {"xp": 0, "level": False, "badges": []},
+        },
+        {
+            "success": True,
+            "result": {"xp": 0, "level": 0, "badges": [None]},
+        },
+    ],
+)
+def test_get_badges_rejects_malformed_envelopes(payload: object) -> None:
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(payload, {440})
+
+
+def test_get_badges_rejects_decoded_payload_over_structural_bound() -> None:
+    payload = _badge_payload()
+    result = cast("dict[str, object]", payload["result"])
+    result["padding"] = [None] * (MAX_BADGE_DECODED_SIZE // 32)
+
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(payload, {440})
+
+
+@pytest.mark.parametrize("status_code", [400, 403, 429, 500])
+def test_get_badges_rejects_non_success_responses(status_code: int) -> None:
     client = FakeHTTPClient(
         [],
         stream_response=_badge_stream_response(
@@ -2658,7 +2807,7 @@ def test_get_badges_rejects_private_and_rate_limited_responses(
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state("76561198000000000"))
+        run(gateway._fetch_badge_state("76561198000000000", {440}))
 
 
 def test_get_badges_rejects_duplicate_object_members() -> None:
@@ -2673,7 +2822,47 @@ def test_get_badges_rejects_duplicate_object_members() -> None:
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state("76561198000000000"))
+        run(gateway._fetch_badge_state("76561198000000000", {440}))
+
+
+@pytest.mark.parametrize("steam_id", ["", "abc", " 123", "1" * 21])
+def test_get_badges_rejects_invalid_steam_ids_before_network(
+    steam_id: str,
+) -> None:
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(settings(), http_client=client)
+
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        run(gateway._fetch_badge_state(steam_id, {440}))
+
+    assert client.stream_calls == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        FakeResponse(200, chunks=[b"\xff"]),
+        FakeResponse(200, headers={"content-length": "unknown"}),
+        FakeResponse(
+            200,
+            headers={"content-encoding": "gzip"},
+            chunks=[json.dumps(_badge_payload()).encode()],
+        ),
+        FakeResponse(
+            200,
+            chunks=[b'{"success":'],
+            stream_error=OSError("connection reset"),
+        ),
+    ],
+)
+def test_get_badges_fails_closed_for_transport_corruption(
+    response: FakeResponse,
+) -> None:
+    client = FakeHTTPClient([], stream_response=response)
+    gateway = SteamGateway(settings(), http_client=client)
+
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        run(gateway._fetch_badge_state("76561198000000000", {440}))
 
 
 def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> None:
@@ -2712,7 +2901,8 @@ def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> N
     with pytest.raises(TimeoutError):
         run(
             SteamGateway(settings(), http_client=timeout_client)._fetch_badge_state(
-                "76561198000000000"
+                "76561198000000000",
+                {440},
             )
         )
     for client in (
@@ -2725,9 +2915,70 @@ def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> N
         with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
             run(
                 SteamGateway(settings(), http_client=client)._fetch_badge_state(
-                    "76561198000000000"
+                    "76561198000000000",
+                    {440},
                 )
             )
+
+
+def test_get_badges_rejects_compact_decoded_object_amplification() -> None:
+    body = (
+        b'{"success":true,"result":{"xp":0,"level":0,"badges":[],"padding":['
+        + b'"x",' * 600_000
+        + b'"x"]}}'
+    )
+    assert len(body) < MAX_BADGE_RESPONSE_BYTES
+    client = FakeHTTPClient(
+        [],
+        stream_response=FakeResponse(200, chunks=[body]),
+    )
+
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        run(
+            SteamGateway(settings(), http_client=client)._fetch_badge_state(
+                "76561198000000000",
+                {440},
+            )
+        )
+
+
+def test_get_badges_accepts_large_valid_public_profile() -> None:
+    badges: list[dict[str, object]] = [
+        {
+            "id": 1,
+            "appID": 1_000_000 + index,
+            "borderColor": 0,
+            "level": 10_000 + index,
+            "xp": 100,
+            "name": "Steam Awards - 2024",
+            "icon": "a" * 24,
+            "iconGray": "b" * 24,
+        }
+        for index in range(20_180)
+    ]
+    badges.append({"id": 1, "appID": 440, "borderColor": 0, "level": 2})
+    payload = _badge_payload(player_xp=200, player_level=2, badges=badges)
+    body = json.dumps(payload).encode()
+    assert 2 * 1024 * 1024 < len(body) <= MAX_BADGE_RESPONSE_BYTES
+    client = FakeHTTPClient(
+        [],
+        stream_response=FakeResponse(
+            200,
+            headers={"content-length": str(len(body))},
+            chunks=[body],
+        ),
+    )
+
+    result = run(
+        SteamGateway(settings(), http_client=client)._fetch_badge_state(
+            "76561198000000000",
+            {440},
+        )
+    )
+
+    assert result.player_xp == 200
+    assert result.player_level == 2
+    assert dict(result.normal_badge_levels) == {440: 2}
 
 
 def test_level_up_empty_holdings_short_circuit_without_provider_calls() -> None:
@@ -2758,6 +3009,59 @@ def test_level_up_empty_holdings_short_circuit_without_provider_calls() -> None:
     assert result.status == "no_opportunity"
     assert result.reason == "no_complete_sellable_set"
     assert client.get_calls == []
+    assert client.stream_calls == []
+
+
+def test_level_up_incomplete_catalog_short_circuits_before_badges(
+    tmp_path: Path,
+) -> None:
+    quote_time = datetime.now(UTC)
+    configured = settings(
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1000,
+        level_up_min_fee_minor=1,
+        level_up_max_quote_age_seconds=900,
+        level_up_max_inventory_age_seconds=3600,
+    )
+    price_cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    refresh = price_cache.begin_refresh()
+    market_hash_names = [
+        f"440-Oversized Set Card {index} (Trading Card)" for index in range(16)
+    ]
+    for market_hash_name in market_hash_names:
+        refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
+    refresh.commit(now=time.time(), optimizer_complete=True)
+    now = datetime.now(UTC)
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(
+        configured,
+        http_client=client,
+        price_cache=price_cache,
+    )
+
+    result = run(
+        gateway.check_level_up(
+            "76561198000000000",
+            (
+                steam_gateway.Holding(
+                    market_hash_name=market_hash_names[0],
+                    owned_quantity=1,
+                    sellable_quantity=1,
+                ),
+            ),
+            inventory_refreshed_at=now,
+            now=now,
+        )
+    )
+
+    assert (result.status, result.reason) == (
+        "no_opportunity",
+        "no_complete_sellable_set",
+    )
     assert client.stream_calls == []
 
 
@@ -2799,8 +3103,25 @@ def test_level_up_requires_steamapis_key_before_provider_calls() -> None:
     assert client.stream_calls == []
 
 
-def test_level_up_real_gateway_reports_no_positive_swap_with_valid_source(
+@pytest.mark.parametrize(
+    ("badge_payload", "expected"),
+    [
+        pytest.param(
+            _badge_payload(),
+            ("no_opportunity", "no_positive_xp_swap"),
+            id="valid-badge-state",
+        ),
+        pytest.param(
+            _badge_payload(badges=[{"appID": 440, "borderColor": 0, "level": 6}]),
+            ("unavailable", "badge_data_unavailable"),
+            id="malformed-relevant-normal-badge",
+        ),
+    ],
+)
+def test_level_up_real_gateway_uses_catalog_badge_relevance(
     tmp_path: Path,
+    badge_payload: dict[str, object],
+    expected: tuple[str, str],
 ) -> None:
     quote_time = datetime.now(UTC)
     configured = settings(
@@ -2833,7 +3154,7 @@ def test_level_up_real_gateway_reports_no_positive_swap_with_valid_source(
         configured,
         http_client=FakeHTTPClient(
             [],
-            stream_response=_badge_stream_response(_badge_payload()),
+            stream_response=_badge_stream_response(badge_payload),
         ),
         price_cache=price_cache,
         booster_pricing=booster_pricing,
@@ -2855,10 +3176,7 @@ def test_level_up_real_gateway_reports_no_positive_swap_with_valid_source(
         )
     )
 
-    assert (result.status, result.reason) == (
-        "no_opportunity",
-        "no_positive_xp_swap",
-    )
+    assert (result.status, result.reason) == expected
 
 
 def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
@@ -2944,7 +3262,17 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
     )
     badge_client = FakeHTTPClient(
         [],
-        stream_response=_badge_stream_response(_badge_payload()),
+        stream_response=_badge_stream_response(
+            _badge_payload(
+                badges=[
+                    {
+                        "appID": 2_243_720,
+                        "borderColor": 0,
+                        "level": 372_366,
+                    }
+                ]
+            )
+        ),
     )
     gateway = SteamGateway(
         configured,

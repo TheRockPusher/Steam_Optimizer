@@ -30,10 +30,10 @@ The **Level-up optimization** tab is manual-activation and read-only. It aggrega
 normal-card ownership snapshot from the current browser inventory record, then sends that
 transient snapshot to `POST /api/auth/level-up` with the signed session and matching
 `x-expected-steam-id` header. The endpoint never fetches inventory or stores the submitted
-snapshot. It reads one bounded, server-only SteamApis v2
-`/v2/steam/users/{steamid}/badges` response for the signed SteamID64, using player XP/level and
-normal game badges only, and returns a complete advisory plan or an explicit no-opportunity,
-warming, or unavailable state.
+snapshot. After finding at least one eligible normal-card catalog group, it reads at most one
+bounded, server-only SteamApis v2 `/v2/steam/users/{steamid}/badges` response for the signed
+SteamID64, using player XP/level and normal badge records for catalog AppIDs only, and returns a
+complete advisory plan or an explicit no-opportunity, warming, or unavailable state.
 
 ## Safety and identity boundary
 
@@ -108,11 +108,15 @@ unchanged. It is never written to IndexedDB, `localStorage`, cookies, or a serve
 Logout, account changes, inventory refresh, and unmount invalidate it; quote expiry downgrades any
 retained rows to an expired, non-actionable state until the user refreshes.
 
-For that request, the backend makes one bounded server-only SteamApis v2
-`/v2/steam/users/{steamid}/badges` call for the signed SteamID64. It parses player XP, player
-level, and normal game badges only (border color `0`), ignoring foil and non-game badges. The raw
-response and badge payload are not persisted; only validated badge-derived fields needed for the
-advisory response can reach the browser.
+For that request, the backend derives eligible normal-card AppIDs from the complete normalized
+market catalog. If no eligible group exists, it returns without calling the badge provider;
+otherwise it makes at most one bounded server-only SteamApis v2
+`/v2/steam/users/{steamid}/badges` call for the signed SteamID64. It parses player XP and level plus
+normal badge records for those catalog AppIDs. Foil and non-game records are ignored, as are
+syntactically valid records outside the catalog, including unrelated event and collection badges.
+Relevant records with malformed border metadata, and relevant normal records with malformed level
+metadata, fail closed. The raw response and badge payload are not persisted; only validated
+badge-derived fields needed for the advisory response can reach the browser.
 
 The endpoint returns exactly one of these read-only states:
 
