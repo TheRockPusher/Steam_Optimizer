@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.8.1
+
+
+### Bug Fixes
+- Restore market pricing and level-up optimization
+
+
+### Documentation
+- Update changelog for v0.8.0
+
+
+### Maintenance
+- Prepare release v0.8.1
+
 ## v0.8.0
 
 
