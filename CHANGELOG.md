@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.8.2
+
+
+### Bug Fixes
+- Load badge state from SteamApis
+
+
+### Documentation
+- Update changelog for v0.8.1
+
+
+### Maintenance
+- Prepare release v0.8.2
+
 ## v0.8.1
 
 
