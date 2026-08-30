@@ -21,8 +21,9 @@ Prerequisites for a fresh Linux, macOS, or Windows development environment:
 - [pnpm](https://pnpm.io/installation) 10
 - Optional: a server-only [Steam Web API key](https://steamcommunity.com/dev/apikey) for a
   conclusive profile-visibility result.
-- A server-only SteamApis v2 key in `STEAMAPI_KEY` for complete public AppID 753/context 6 inventory
-  retrieval and the lazily refreshed global normalized AppID 753 market-price cache.
+- A server-only SteamApis v2 key in `STEAMAPI_KEY` for complete public AppID 753/context 6
+  inventory retrieval, authenticated badge-state reads, and the lazily refreshed global normalized
+  AppID 753 market-price cache.
 
 Install and run the backend:
 
@@ -101,10 +102,10 @@ The current connection, inventory, and read-only recommendation stage provides:
   `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that snapshot to
   `POST /api/auth/level-up` with the signed session and matching `x-expected-steam-id` header.
   The endpoint never calls the inventory provider, logs holdings, or stores the submitted snapshot.
-- The endpoint reads one bounded Valve `IPlayerService/GetBadges/v1` response on the server for
-  the signed SteamID64. It uses `player_xp`, `player_level`, and normal game badges only
-  (`border_color == 0`); foil and non-game badges are ignored. Badge response data is not
-  persisted or exposed to the browser beyond the recommendation result.
+- The endpoint reads one bounded SteamApis v2 `/v2/steam/users/{steamid}/badges` response on the
+  server for the signed SteamID64. It uses the player's XP, level, and normal game badges only
+  (border color `0`); foil and non-game badges are ignored. Badge response data is not persisted or
+  exposed to the browser beyond the recommendation result.
 - A complete `ready` response is one deterministic, fully funded advisory plan: sell one copy of
   every card in one owned normal set into current highest bids, buy up to five cheaper complete
   normal sets at current lowest asks, and compare the resulting badge XP. The response includes
@@ -145,7 +146,7 @@ Each item is converted exactly to integer minor units, and fees are calculated p
 returned contract, with taxes, holds, and an existing wallet balance excluded.
 
 Known unavailable and warming states are explicit: `currency_contract_missing`,
-`steam_web_api_key_missing`, `badge_data_unavailable`, `inventory_snapshot_too_old`,
+`steamapi_key_missing`, `badge_data_unavailable`, `inventory_snapshot_too_old`,
 `price_generation_unavailable`, `price_generation_stale`, `quote_depth_unavailable`, and
 `catalog_warming`. Valid inputs with no qualifying source or positive-XP swap return
 `no_complete_sellable_set` or `no_positive_xp_swap`; they do not render a zero-valued
@@ -185,10 +186,11 @@ For separate Railway frontend and backend services in EU-West (`europe-west4-dra
   `/api` proxy, so session cookies are issued on the same host used by the browser application.
 - Backend: set `SIGNING_SECRET` to a random value of at least 32 characters,
   `COOKIE_SECURE=true`, and `COOKIE_SAMESITE=lax`.
-- `STEAM_WEB_API_KEY` is optional for profile visibility but is required by the level-up endpoint
-  to verify authenticated badge state; it belongs only in the backend environment.
+- `STEAM_WEB_API_KEY` is optional for profile visibility and belongs only in the backend
+  environment.
 - `STEAMAPI_KEY` belongs only in the backend environment and is never exposed to the browser. It
-  enables SteamApis v2 inventory retrieval and the global normalized AppID 753 price cache.
+  enables SteamApis v2 inventory retrieval, authenticated badge-state reads, and the global
+  normalized AppID 753 price cache.
 - Level-up recommendations use the complete verified monetary group:
   `LEVEL_UP_CURRENCY_CODE=USD`, `LEVEL_UP_CURRENCY_MINOR_DIGITS=2`,
   `LEVEL_UP_PRICE_BASIS=buyer_total`, `LEVEL_UP_STEAM_FEE_BPS=500`,
@@ -302,14 +304,14 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 - Commercial role or open-core model: none is documented; the repository is GNU AGPL v3.0.
 - Non-free components: Steam is a proprietary external service; no non-free component is bundled
   in this repository.
-- Centralized services and terms: authentication uses Steam Community/OpenID. Inventory retrieval
-  and lazy global AppID 753 market-price refreshes use the third-party SteamApis v2 provider.
-  Profile visibility and authenticated badge-state reads use Valve's documented
+- Centralized services and terms: authentication uses Steam Community/OpenID. Inventory retrieval,
+  authenticated badge-state reads, and lazy global AppID 753 market-price refreshes use the
+  third-party SteamApis v2 provider. Profile visibility uses Valve's documented
   [Steam Web API](https://steamcommunity.com/dev) when `STEAM_WEB_API_KEY` is configured.
   `STEAMAPI_KEY` and `STEAM_WEB_API_KEY` are server-only; neither credential is sent to the
-  browser or persisted in caches. The level-up endpoint reads one bounded
-  `IPlayerService/GetBadges/v1` response for the signed SteamID64, uses only player XP/level and
-  normal (`border_color == 0`) game badges, and does not retain that response. Foil and non-game
+  browser or persisted in caches. The level-up endpoint reads one bounded SteamApis v2
+  `/v2/steam/users/{steamid}/badges` response for the signed SteamID64, uses only player XP/level
+  and normal (border color `0`) game badges, and does not retain that response. Foil and non-game
   badges are ignored.
 - Provider caveat: SteamApis response availability, fields, pagination, price snapshots, and
   top-of-book depth are provider/data-source facts rather than Valve guarantees. Price coverage is
@@ -344,7 +346,7 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 ### Privacy and Steam Data Policy
 
 This section is Steam Optimizer's published privacy policy. It applies to the deployed service and
-was last updated on 2026-08-29.
+was last updated on 2026-08-30.
 
 - Data handling and privacy policy: the browser redirects to Steam for login, and the backend
   receives the verified SteamID64. The signed, HTTP-only session cookie contains that identifier
@@ -371,11 +373,12 @@ was last updated on 2026-08-29.
   IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
   inventory refresh, and unmount discard it. Quote expiry retains the rows only in React memory as
   non-actionable audit information until refresh or another lifecycle invalidation.
-- Badge-state handling: the backend makes one bounded server-only
-  `IPlayerService/GetBadges/v1` request for the signed SteamID64 when calculating a recommendation.
-  It reads player XP, player level, and normal game badges (`border_color == 0`), ignoring foil and
-  non-game badges. The Web API key and raw badge response remain server-side and are not persisted;
-  only validated badge-derived fields needed in the response can reach the browser.
+- Badge-state handling: the backend makes one bounded server-only SteamApis v2
+  `/v2/steam/users/{steamid}/badges` request for the signed SteamID64 when calculating a
+  recommendation. It reads player XP, player level, and normal game badges (border color `0`),
+  ignoring foil and non-game badges. The SteamApis API key and raw badge response remain
+  server-side and are not persisted; only validated badge-derived fields needed in the response
+  can reach the browser.
 - Market-price retention and provider freshness: market prices are a global AppID 753 generation,
   not user-specific inventory data. The backend stores normalized fields only in a separate SQLite
   cache, fresh for 24 hours for inventory display. It refreshes lazily when a request finds the

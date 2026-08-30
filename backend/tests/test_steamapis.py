@@ -44,7 +44,6 @@ from app.main import create_app
 from app.market_fees import MarketFeeContract
 from app.settings import Settings
 from app.steam_gateway import (
-    BADGES_ENDPOINT,
     MAX_BADGE_RECORDS,
     MAX_BADGE_RESPONSE_BYTES,
     MAX_INVENTORY_ASSETS_PER_PAGE,
@@ -54,6 +53,7 @@ from app.steam_gateway import (
     MAX_RETRY_AFTER_SECONDS,
     PROFILE_ENDPOINT,
     STEAM_ICON_BASE_URL,
+    STEAMAPIS_BADGES_ENDPOINT,
     STEAMAPIS_BULK_HOST_SUFFIX,
     STEAMAPIS_INVENTORY_ENDPOINT,
     STEAMAPIS_ITEMS_ENDPOINT,
@@ -2541,11 +2541,12 @@ def _badge_payload(
     badges: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
-        "response": {
-            "player_xp": player_xp,
-            "player_level": player_level,
+        "success": True,
+        "result": {
+            "xp": player_xp,
+            "level": player_level,
             "badges": badges or [],
-        }
+        },
     }
 
 
@@ -2562,22 +2563,24 @@ def _badge_stream_response(
     )
 
 
-def test_get_badges_uses_fixed_endpoint_server_key_and_signed_steam_id() -> None:
+def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> None:
     client = FakeHTTPClient(
         [],
         stream_response=_badge_stream_response(
             _badge_payload(
                 badges=[
-                    {"appid": 440, "border_color": 0, "level": 3},
-                    {"appid": 440, "border_color": 1, "level": 5},
-                    {"badgeid": 1, "level": 7},
-                    {"appid": 0},
+                    {"appID": 440, "borderColor": 0, "level": 3},
+                    {"appID": 440, "borderColor": 1, "level": 5},
+                    {"id": 1, "level": 7},
                 ]
             )
         ),
     )
     gateway = SteamGateway(
-        settings(steam_web_api_key="server-badge-key"),
+        settings(
+            steamapi_key="server-badge-key",
+            steam_web_api_key=None,
+        ),
         http_client=client,
     )
 
@@ -2590,16 +2593,55 @@ def test_get_badges_uses_fixed_endpoint_server_key_and_signed_steam_id() -> None
     assert client.stream_calls == [
         {
             "method": "GET",
-            "url": BADGES_ENDPOINT,
-            "params": {
-                "key": "server-badge-key",
-                "steamid": "76561198000000000",
+            "url": STEAMAPIS_BADGES_ENDPOINT.format(
+                steam_id="76561198000000000",
+            ),
+            "params": None,
+            "headers": {
+                "x-api-key": "server-badge-key",
+                "User-Agent": (
+                    "SteamOptimizer/0.1.1 "
+                    "(+https://github.com/TheRockPusher/Steam_Optimizer)"
+                ),
             },
-            "headers": None,
             "follow_redirects": False,
             "timeout": None,
         }
     ]
+
+
+def test_get_badges_accepts_documented_snake_case_fields() -> None:
+    result = steam_gateway._parse_badges_payload(
+        {
+            "success": True,
+            "result": {
+                "player_xp": 100,
+                "player_level": 1,
+                "badges": [
+                    {"appid": 440, "border_color": 0, "level": 1},
+                ],
+            },
+        }
+    )
+
+    assert result.player_xp == 100
+    assert result.player_level == 1
+    assert dict(result.normal_badge_levels) == {440: 1}
+
+
+def test_get_badges_rejects_ambiguous_provider_aliases() -> None:
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(
+            {
+                "success": True,
+                "result": {
+                    "xp": 100,
+                    "player_xp": 100,
+                    "level": 1,
+                    "badges": [],
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize("status_code", [403, 429])
@@ -2621,8 +2663,8 @@ def test_get_badges_rejects_private_and_rate_limited_responses(
 
 def test_get_badges_rejects_duplicate_object_members() -> None:
     payload = (
-        b'{"response":{"player_xp":0,"player_level":0,"badges":'
-        b'[{"appid":440,"level":1,"level":5}]}}'
+        b'{"success":true,"result":{"xp":0,"level":0,"badges":'
+        b'[{"appID":440,"level":1,"level":5}]}}'
     )
     client = FakeHTTPClient(
         [],
@@ -2657,7 +2699,7 @@ def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> N
     overbounded_list_client = FakeHTTPClient(
         [],
         stream_response=_badge_stream_response(
-            _badge_payload(badges=[{"appid": 0}] * (MAX_BADGE_RECORDS + 1))
+            _badge_payload(badges=[{"appID": 0}] * (MAX_BADGE_RECORDS + 1))
         ),
     )
     inconsistent_client = FakeHTTPClient(
@@ -2693,6 +2735,7 @@ def test_level_up_empty_holdings_short_circuit_without_provider_calls() -> None:
     gateway = SteamGateway(
         settings(
             steam_web_api_key=None,
+            steamapi_key=None,
             level_up_currency_code=None,
             level_up_currency_minor_digits=None,
             level_up_price_basis=None,
@@ -2714,6 +2757,44 @@ def test_level_up_empty_holdings_short_circuit_without_provider_calls() -> None:
 
     assert result.status == "no_opportunity"
     assert result.reason == "no_complete_sellable_set"
+    assert client.get_calls == []
+    assert client.stream_calls == []
+
+
+def test_level_up_requires_steamapis_key_before_provider_calls() -> None:
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(
+        settings(
+            steamapi_key=None,
+            steam_web_api_key="profile-only-key",
+            level_up_currency_code="USD",
+            level_up_currency_minor_digits=2,
+            level_up_price_basis="buyer_total",
+            level_up_steam_fee_bps=500,
+            level_up_publisher_fee_bps=1000,
+            level_up_min_fee_minor=1,
+        ),
+        http_client=client,
+    )
+
+    result = run(
+        gateway.check_level_up(
+            "76561198000000000",
+            (
+                steam_gateway.Holding(
+                    market_hash_name="440-Card (Trading Card)",
+                    owned_quantity=1,
+                    sellable_quantity=1,
+                ),
+            ),
+            inventory_refreshed_at=now,
+            now=now,
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason == "steamapi_key_missing"
     assert client.get_calls == []
     assert client.stream_calls == []
 

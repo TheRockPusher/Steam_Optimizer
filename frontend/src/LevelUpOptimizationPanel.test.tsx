@@ -119,7 +119,11 @@ function readyResponse(): LevelUpOptimizationResponse {
 
 function responseWithStatus(
   status: "no_opportunity" | "warming" | "unavailable",
-  reason: "no_complete_sellable_set" | "catalog_warming" | "price_generation_stale"
+  reason:
+    | "no_complete_sellable_set"
+    | "catalog_warming"
+    | "price_generation_stale"
+    | "steamapi_key_missing"
 ): LevelUpOptimizationResponse {
   return {
     status,
@@ -255,6 +259,11 @@ describe("strict response validation", () => {
     expect(isLevelUpOptimizationResponse(responseWithStatus("no_opportunity", "no_complete_sellable_set"))).toBe(true);
     expect(isLevelUpOptimizationResponse(responseWithStatus("warming", "catalog_warming"))).toBe(true);
     expect(isLevelUpOptimizationResponse(responseWithStatus("unavailable", "price_generation_stale"))).toBe(true);
+    expect(
+      isLevelUpOptimizationResponse(
+        responseWithStatus("unavailable", "steamapi_key_missing")
+      )
+    ).toBe(true);
   });
 
   it("rejects a scope-limited response that does not contain five destinations", () => {
@@ -461,6 +470,14 @@ describe("lazy panel lifecycle and state surfaces", () => {
     renderPanel(responseWithStatus("no_opportunity", "no_complete_sellable_set"));
     await flushPanelEffects();
     expect(screen.getByText(/No complete sellable normal-card set/)).toBeInTheDocument();
+  });
+
+  it("renders the SteamApis key configuration failure", async () => {
+    renderPanel(responseWithStatus("unavailable", "steamapi_key_missing"));
+    await flushPanelEffects();
+
+    expect(screen.getByText(/server has no SteamApis API key/)).toBeInTheDocument();
+    expect(screen.getByText(/operator configuration issue/)).toBeInTheDocument();
   });
 
   it("changes a ready surface to expired once, without polling", async () => {

@@ -49,8 +49,8 @@ const REASON_COPY: Record<LevelUpReason, string> = {
   ready: "The current recommendation is ready for review.",
   currency_contract_missing:
     "Level-up estimates are disabled until the market currency and fee contract is configured.",
-  steam_web_api_key_missing:
-    "Level-up estimates are unavailable because the server has no Steam Web API key.",
+  steamapi_key_missing:
+    "Level-up estimates are unavailable because the server has no SteamApis API key.",
   badge_data_unavailable:
     "Steam badge data could not be verified. Try refreshing the recommendation later.",
   inventory_snapshot_too_old:
@@ -533,7 +533,7 @@ function ResponseSurface({
         >
           <p>{REASON_COPY[response.reason]}</p>
           {(response.reason === "currency_contract_missing" ||
-            response.reason === "steam_web_api_key_missing") && (
+            response.reason === "steamapi_key_missing") && (
               <p>This is an operator configuration issue; no partial monetary estimate is displayed.</p>
             )}
         </StatusSurface>
