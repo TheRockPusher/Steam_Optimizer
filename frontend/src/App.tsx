@@ -8,10 +8,12 @@ import {
 } from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
 import {
-  LEVEL_UP_OPTIMIZATION_PANEL_ID,
-  LEVEL_UP_OPTIMIZATION_TAB_ID,
   LevelUpOptimizationPanel
 } from "./LevelUpOptimizationPanel";
+import {
+  levelForXp,
+  minimumXpForLevel
+} from "./levelUpOptimization";
 import {
   clearInventoryCache,
   clearInventoryCacheExcept,
@@ -26,6 +28,13 @@ type VisibilityStatus = "public" | "private" | "unavailable";
 type VisibilityCheck = {
   status: VisibilityStatus;
   message: string;
+};
+
+type BadgeCheck = {
+  status: "public" | "unavailable";
+  message: string;
+  player_xp: number | null;
+  player_level: number | null;
 };
 
 type PriceStatus = "complete" | "partial" | "unavailable";
@@ -133,7 +142,7 @@ type InventoryViewDefinition = {
   tabId: string;
   panelId: string;
 };
-type InventoryResultView = "items" | "boosters" | "level-up";
+type InventoryResultView = "inventory" | "level-up";
 
 type InventoryResultViewDefinition = {
   key: InventoryResultView;
@@ -178,6 +187,7 @@ type SignedInSession = {
   user: SteamUser;
   checks: {
     profile: VisibilityCheck;
+    badges: BadgeCheck;
   };
 };
 
@@ -235,6 +245,9 @@ const STEAM_PRIVACY_URL = "https://steamcommunity.com/my/edit/settings";
 const PRIVACY_POLICY_URL =
   "https://github.com/TheRockPusher/Steam_Optimizer#privacy-and-steam-data-policy";
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
+const MAX_BADGE_XP = 1_000_000_000_000;
+const MAX_BADGE_LEVEL = 100_000;
+const MAX_LEVEL_UP_TARGET_LEVEL = 100_000;
 const MAX_RETRY_AFTER_SECONDS = 900;
 const MAX_DECIMAL_LENGTH = 16_384;
 const GEM_MAX_APP_ID_LENGTH = 20;
@@ -328,25 +341,20 @@ const INVENTORY_VIEWS: ReadonlyArray<InventoryViewDefinition> = [
 ];
 const INVENTORY_RESULT_VIEWS: ReadonlyArray<InventoryResultViewDefinition> = [
   {
-    key: "items",
-    label: "Items",
-    tabId: "inventory-results-tab-items",
-    panelId: "inventory-results-panel-items"
-  },
-  {
-    key: "boosters",
-    label: "Boosters",
-    tabId: "inventory-results-tab-boosters",
-    panelId: "inventory-results-panel-boosters"
+    key: "inventory",
+    label: "Inventory",
+    tabId: "inventory-results-tab-inventory",
+    panelId: "inventory-results-panel-inventory"
   },
   {
     key: "level-up",
-    label: "Level-up optimization",
-    tabId: LEVEL_UP_OPTIMIZATION_TAB_ID,
-    panelId: LEVEL_UP_OPTIMIZATION_PANEL_ID
+    label: "Level-up",
+    tabId: "inventory-results-tab-level-up",
+    panelId: "inventory-results-panel-level-up"
   }
 ];
 
+const EMPTY_INVENTORY_ITEMS: readonly InventoryItem[] = [];
 
 const INVENTORY_COUNT_FORMATTER = new Intl.NumberFormat("en-US");
 const PRICE_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("en-US", {
@@ -417,6 +425,33 @@ function isVisibilityCheck(value: unknown): value is VisibilityCheck {
   );
 }
 
+function isBadgeCheck(value: unknown): value is BadgeCheck {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const check = value as Partial<BadgeCheck>;
+  if (typeof check.message !== "string") {
+    return false;
+  }
+
+  if (check.status === "unavailable") {
+    return check.player_xp === null && check.player_level === null;
+  }
+
+  if (
+    check.status !== "public" ||
+    !isSafeInteger(check.player_xp, 0) ||
+    check.player_xp > MAX_BADGE_XP ||
+    !isSafeInteger(check.player_level, 0) ||
+    check.player_level > MAX_BADGE_LEVEL
+  ) {
+    return false;
+  }
+
+  return levelForXp(check.player_xp) === check.player_level;
+}
+
 function isSafeInteger(value: unknown, minimum: number): value is number {
   return (
     typeof value === "number" &&
@@ -446,6 +481,119 @@ function isCanonicalGemDecimal(value: unknown): value is string {
     return !value.endsWith("0");
   }
   return true;
+}
+type FixedDecimalAmount = {
+  units: bigint;
+  scale: number;
+};
+
+function parseFixedDecimal(value: string): FixedDecimalAmount {
+  const [integer, fraction = ""] = value.split(".");
+  return {
+    units: BigInt(`${integer}${fraction}`),
+    scale: fraction.length
+  };
+}
+
+function addFixedDecimal(
+  first: FixedDecimalAmount | null,
+  second: FixedDecimalAmount
+): FixedDecimalAmount {
+  if (first === null) {
+    return second;
+  }
+
+  if (first.scale === second.scale) {
+    return {
+      units: first.units + second.units,
+      scale: first.scale
+    };
+  }
+
+  const scale = Math.max(first.scale, second.scale);
+  return {
+    units:
+      first.units * 10n ** BigInt(scale - first.scale) +
+      second.units * 10n ** BigInt(scale - second.scale),
+    scale
+  };
+}
+
+function multiplyFixedDecimal(
+  value: FixedDecimalAmount,
+  quantity: number
+): FixedDecimalAmount {
+  return {
+    units: value.units * BigInt(quantity),
+    scale: value.scale
+  };
+}
+
+function formatFixedDecimal(value: FixedDecimalAmount | null): string {
+  if (value === null) {
+    return "Unavailable";
+  }
+
+  if (value.scale === 0) {
+    return value.units.toString();
+  }
+
+  const digits = value.units.toString().padStart(value.scale + 1, "0");
+  const whole = digits.slice(0, -value.scale);
+  const fraction = digits.slice(-value.scale).replace(/0+$/, "");
+  return fraction.length === 0 ? whole : `${whole}.${fraction}`;
+}
+
+
+type InventoryPriceTotals = {
+  highestBuy: FixedDecimalAmount | null;
+  lowestSell: FixedDecimalAmount | null;
+  highestBuyCoverage: number;
+  lowestSellCoverage: number;
+  priceableItemTypes: number;
+};
+
+function inventoryPriceTotals(items: readonly InventoryItem[]): InventoryPriceTotals {
+  let highestBuy: FixedDecimalAmount | null = null;
+  let lowestSell: FixedDecimalAmount | null = null;
+  let highestBuyCoverage = 0;
+  let lowestSellCoverage = 0;
+  let priceableItemTypes = 0;
+
+  for (const item of items) {
+    if (!item.marketable) {
+      continue;
+    }
+
+    priceableItemTypes += 1;
+    if (item.market_hash_name === null) {
+      continue;
+    }
+
+    const price = item.price;
+    if (price?.highest_buy !== null && price?.highest_buy !== undefined) {
+      highestBuyCoverage += 1;
+      highestBuy = addFixedDecimal(
+        highestBuy,
+        multiplyFixedDecimal(parseFixedDecimal(price.highest_buy), item.quantity)
+      );
+    }
+    if (price?.lowest_sell !== null && price?.lowest_sell !== undefined) {
+      lowestSellCoverage += 1;
+      lowestSell = addFixedDecimal(
+        lowestSell,
+        multiplyFixedDecimal(parseFixedDecimal(price.lowest_sell), item.quantity)
+      );
+    }
+  }
+
+  return {
+    highestBuy,
+    lowestSell,
+    highestBuyCoverage,
+    lowestSellCoverage,
+    priceableItemTypes
+  };
 }
 
 function gemCashValueForYield(gemYield: number, sackPrice: string): string {
@@ -869,6 +1017,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
   const user = session.user as Partial<SteamUser>;
   const checks = session.checks as {
     profile?: unknown;
+    badges?: unknown;
     inventory?: unknown;
   };
 
@@ -879,6 +1028,7 @@ function isSessionResponse(value: unknown): value is SessionResponse {
     (typeof user.display_name === "string" || user.display_name === null) &&
     (typeof user.avatar_url === "string" || user.avatar_url === null) &&
     isVisibilityCheck(checks.profile) &&
+    isBadgeCheck(checks.badges) &&
     !("inventory" in checks)
   );
 }
@@ -1349,10 +1499,12 @@ function SteamIdentity({
 
 function AccessSummary({
   profile,
+  badges,
   inventory,
   isInventoryLoading
 }: {
   profile: VisibilityCheck;
+  badges: BadgeCheck;
   inventory: InventoryCheck | null;
   isInventoryLoading: boolean;
 }) {
@@ -1388,6 +1540,16 @@ function AccessSummary({
         >
           <span className="status-dot" aria-hidden="true" />
           {inventoryStatusLabel}
+        </dd>
+      </div>
+      <div className={`access-summary-item access-summary-${badges.status}`}>
+        <dt>Badges</dt>
+        <dd
+          className={`access-badge access-badge-${badges.status}`}
+          aria-label={`Steam badges: ${STATUS_LABELS[badges.status]}`}
+        >
+          <span className="status-dot" aria-hidden="true" />
+          {STATUS_LABELS[badges.status]}
         </dd>
       </div>
     </dl>
@@ -2369,9 +2531,53 @@ function InventoryPricingSummary({
   )}/${INVENTORY_COUNT_FORMATTER.format(
     inventory.gem_priceable_item_count
   )}`;
+  const priceTotals = inventoryPriceTotals(inventory.items);
+  const highestBuyTotal =
+    priceTotals.highestBuy === null
+      ? priceTotals.priceableItemTypes === 0 && inventory.status === "public"
+        ? formatUsdAmount("0")
+        : "Unavailable"
+      : formatUsdAmount(formatFixedDecimal(priceTotals.highestBuy));
+  const lowestSellTotal =
+    priceTotals.lowestSell === null
+      ? priceTotals.priceableItemTypes === 0 && inventory.status === "public"
+        ? formatUsdAmount("0")
+        : "Unavailable"
+      : formatUsdAmount(formatFixedDecimal(priceTotals.lowestSell));
+  const highestBuyCoverage = `${INVENTORY_COUNT_FORMATTER.format(
+    priceTotals.highestBuyCoverage
+  )}/${INVENTORY_COUNT_FORMATTER.format(
+    priceTotals.priceableItemTypes
+  )} item types`;
+  const lowestSellCoverage = `${INVENTORY_COUNT_FORMATTER.format(
+    priceTotals.lowestSellCoverage
+  )}/${INVENTORY_COUNT_FORMATTER.format(
+    priceTotals.priceableItemTypes
+  )} item types`;
 
   return (
     <div className="inventory-pricing-summary" aria-label="Inventory pricing summary">
+      <dl className="inventory-pricing-totals">
+        <div
+          className="inventory-pricing-total inventory-pricing-total-highest-buy"
+          aria-label={`Highest buy total: ${highestBuyTotal}. Coverage: ${highestBuyCoverage}`}
+        >
+          <dt>Highest buy total</dt>
+          <dd>{highestBuyTotal}</dd>
+          <span>Coverage {highestBuyCoverage}</span>
+        </div>
+        <div
+          className="inventory-pricing-total inventory-pricing-total-lowest-sell"
+          aria-label={`Lowest sell total: ${lowestSellTotal}. Coverage: ${lowestSellCoverage}`}
+        >
+          <dt>Lowest sell total</dt>
+          <dd>{lowestSellTotal}</dd>
+          <span>Coverage {lowestSellCoverage}</span>
+        </div>
+      </dl>
+      <p className="inventory-pricing-basis">
+        Top-quote estimate across owned quantities; order-book depth is not included.
+      </p>
       <dl className="inventory-pricing-metrics">
         <div
           className="inventory-pricing-stat inventory-pricing-stat-total"
@@ -2458,37 +2664,204 @@ function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
     }.`;
 }
 
+function LevelUpCalculator({ badges }: { badges: BadgeCheck }) {
+  const currentXp = badges.status === "public" ? badges.player_xp : null;
+  const currentLevel = badges.status === "public" ? badges.player_level : null;
+  const [targetLevelInput, setTargetLevelInput] = useState(
+    currentLevel === null ? "" : String(currentLevel)
+  );
+  const previousCurrentLevelRef = useRef(currentLevel);
+  useEffect(() => {
+    const previousCurrentLevel = previousCurrentLevelRef.current;
+    setTargetLevelInput((currentTarget) => {
+      if (currentLevel === null) {
+        return "";
+      }
+
+      const trimmedTarget = currentTarget.trim();
+      const parsedTarget = /^[0-9]+$/.test(trimmedTarget)
+        ? Number(trimmedTarget)
+        : Number.NaN;
+      const wasPreviousDefault =
+        previousCurrentLevel !== null &&
+        trimmedTarget === String(previousCurrentLevel);
+      if (
+        trimmedTarget.length === 0 ||
+        wasPreviousDefault ||
+        !Number.isSafeInteger(parsedTarget) ||
+        parsedTarget < currentLevel
+      ) {
+        return String(currentLevel);
+      }
+      return currentTarget;
+    });
+    previousCurrentLevelRef.current = currentLevel;
+  }, [currentLevel]);
+
+  const calculation = useMemo(() => {
+    if (currentXp === null || currentLevel === null) {
+      return {
+        error: null,
+        xpNeeded: null,
+        badgesNeeded: null
+      };
+    }
+
+    const trimmedInput = targetLevelInput.trim();
+    if (!/^[0-9]+$/.test(trimmedInput)) {
+      return {
+        error: `Target level must be a whole number from ${currentLevel} to ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
+        xpNeeded: null,
+        badgesNeeded: null
+      };
+    }
+
+    const targetLevel = Number(trimmedInput);
+    if (!Number.isSafeInteger(targetLevel)) {
+      return {
+        error: `Target level must be a whole number from ${currentLevel} to ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
+        xpNeeded: null,
+        badgesNeeded: null
+      };
+    }
+    if (targetLevel < currentLevel) {
+      return {
+        error: `Target level cannot be below your current level (${currentLevel}).`,
+        xpNeeded: null,
+        badgesNeeded: null
+      };
+    }
+    if (targetLevel > MAX_LEVEL_UP_TARGET_LEVEL) {
+      return {
+        error: `Target level cannot exceed ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
+        xpNeeded: null,
+        badgesNeeded: null
+      };
+    }
+
+    const xpNeeded = Math.max(
+      0,
+      minimumXpForLevel(targetLevel) - currentXp
+    );
+    return {
+      error: null,
+      xpNeeded,
+      badgesNeeded: Math.ceil(xpNeeded / 100)
+    };
+  }, [currentLevel, currentXp, targetLevelInput]);
+
+  const targetErrorId = "level-up-target-level-error";
+  const hasBadgeData = currentXp !== null && currentLevel !== null;
+
+  return (
+    <section
+      className="level-up-calculator"
+      aria-labelledby="level-up-calculator-title"
+    >
+      <p className="section-label">Badge progress</p>
+      <h3 id="level-up-calculator-title">Level-up calculator</h3>
+      {hasBadgeData ? (
+        <p className="level-up-calculator-copy">
+          Estimate the XP and badges required to reach a target Steam level.
+        </p>
+      ) : (
+        <p className="level-up-calculator-unavailable" role="status">
+          Badge data is unavailable: {badges.message}
+        </p>
+      )}
+      <dl className="level-up-calculator-metrics">
+        <div>
+          <dt>Current total XP</dt>
+          <dd>
+            {currentXp === null
+              ? "Unavailable"
+              : `${INVENTORY_COUNT_FORMATTER.format(currentXp)} XP`}
+          </dd>
+        </div>
+        <div>
+          <dt>Current level</dt>
+          <dd>
+            {currentLevel === null
+              ? "Unavailable"
+              : INVENTORY_COUNT_FORMATTER.format(currentLevel)}
+          </dd>
+        </div>
+        {calculation?.error === null && calculation.xpNeeded !== null && (
+          <>
+            <div>
+              <dt>XP needed</dt>
+              <dd>{INVENTORY_COUNT_FORMATTER.format(calculation.xpNeeded)} XP</dd>
+            </div>
+            <div>
+              <dt>Badges needed</dt>
+              <dd>{INVENTORY_COUNT_FORMATTER.format(calculation.badgesNeeded ?? 0)}</dd>
+            </div>
+          </>
+        )}
+      </dl>
+      <label className="level-up-target-field" htmlFor="level-up-target-level">
+        <span>Target level</span>
+        <input
+          id="level-up-target-level"
+          type="number"
+          inputMode="numeric"
+          min={currentLevel ?? undefined}
+          max={MAX_LEVEL_UP_TARGET_LEVEL}
+          step={1}
+          value={targetLevelInput}
+          disabled={!hasBadgeData}
+          aria-invalid={calculation?.error !== null}
+          aria-describedby={calculation?.error !== null ? targetErrorId : undefined}
+          onChange={(event) => setTargetLevelInput(event.currentTarget.value)}
+        />
+      </label>
+      {calculation?.error !== null && (
+        <p
+          id={targetErrorId}
+          className="level-up-target-error"
+          role="alert"
+        >
+          {calculation.error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function InventoryResults({
   inventory,
   steamId,
+  badges,
   inventoryRefreshedAt,
   isInventoryLoading,
   gemCashBasis,
+  inventoryMessage,
   isRefreshingGems,
   refreshMessage,
   onRefreshInventory,
   onGemCashBasisChange,
   onRefreshGems
 }: {
-  inventory: InventoryCheck;
+  inventory: InventoryCheck | null;
   steamId: string;
+  badges: BadgeCheck;
   inventoryRefreshedAt: string | null;
   isInventoryLoading: boolean;
   gemCashBasis: GemCashBasis;
+  inventoryMessage: string | null;
   isRefreshingGems: boolean;
   refreshMessage: string | null;
   onRefreshInventory: () => void;
   onGemCashBasisChange: (basis: GemCashBasis) => void;
   onRefreshGems: () => void;
 }) {
-  const isPublicInventory = inventory.status === "public";
+  const isPublicInventory = inventory?.status === "public";
   const [activeResultView, setActiveResultView] =
-    useState<InventoryResultView>("items");
+    useState<InventoryResultView>("inventory");
   const resultTabRefs = useRef<
     Record<InventoryResultView, HTMLButtonElement | null>
   >({
-    items: null,
-    boosters: null,
+    inventory: null,
     "level-up": null
   });
 
@@ -2502,7 +2875,6 @@ function InventoryResults({
     }
   }
 
-
   return (
     <section className="inventory-results" aria-labelledby="inventory-results-title">
       <div className="inventory-results-heading">
@@ -2510,13 +2882,6 @@ function InventoryResults({
           <p className="section-label">Inventory</p>
           <h2 id="inventory-results-title">Inventory and level-up planning</h2>
         </div>
-        <InventoryPricingSummary
-          inventory={inventory}
-          gemCashBasis={gemCashBasis}
-          isRefreshingGems={isRefreshingGems}
-          onGemCashBasisChange={onGemCashBasisChange}
-          onRefreshGems={onRefreshGems}
-        />
       </div>
       {refreshMessage !== null && (
         <p className="inventory-refresh-status" aria-live="polite">
@@ -2553,7 +2918,6 @@ function InventoryResults({
                 }
 
                 let nextIndex: number | null = null;
-
                 if (event.key === "ArrowLeft") {
                   nextIndex =
                     (index - 1 + INVENTORY_RESULT_VIEWS.length) %
@@ -2584,70 +2948,97 @@ function InventoryResults({
 
       <div
         className="inventory-view-panel"
-        id="inventory-results-panel-items"
+        id="inventory-results-panel-inventory"
         role="tabpanel"
-        aria-labelledby="inventory-results-tab-items"
-        tabIndex={activeResultView === "items" ? 0 : -1}
-        hidden={activeResultView !== "items"}
+        aria-labelledby="inventory-results-tab-inventory"
+        tabIndex={activeResultView === "inventory" ? 0 : -1}
+        hidden={activeResultView !== "inventory"}
       >
-        {inventory.items.length > 0 ? (
-          <InventoryBrowser
-            key={inventory.unique_item_count}
-            items={inventory.items}
-            gemCashContext={inventory.gem_cash_context}
-            gemCashBasis={gemCashBasis}
-          />
-        ) : (
+        {inventory === null ? (
           <div className="inventory-empty">
             <h3>
-              {isPublicInventory
-                ? "No inventory items to display"
-                : "Inventory items unavailable"}
+              {isInventoryLoading ? "Loading inventory…" : "Inventory unavailable"}
             </h3>
             <p>
-              {isPublicInventory
-                ? "Steam returned a public inventory with no items. Recheck after your inventory changes."
-                : inventory.message}
+              {isInventoryLoading
+                ? "Checking your Steam inventory while badge progress remains available."
+                : inventoryMessage ??
+                "Steam inventory data is unavailable. Refresh when the service is available."}
             </p>
           </div>
+        ) : (
+          <>
+            <InventoryPricingSummary
+              inventory={inventory}
+              gemCashBasis={gemCashBasis}
+              isRefreshingGems={isRefreshingGems}
+              onGemCashBasisChange={onGemCashBasisChange}
+              onRefreshGems={onRefreshGems}
+            />
+            {inventory.items.length > 0 ? (
+              <InventoryBrowser
+                key={inventory.unique_item_count}
+                items={inventory.items}
+                gemCashContext={inventory.gem_cash_context}
+                gemCashBasis={gemCashBasis}
+              />
+            ) : (
+              <div className="inventory-empty">
+                <h3>
+                  {isPublicInventory
+                    ? "No inventory items to display"
+                    : "Inventory items unavailable"}
+                </h3>
+                <p>
+                  {isPublicInventory
+                    ? "Steam returned a public inventory with no items. Recheck after your inventory changes."
+                    : inventory.message}
+                </p>
+              </div>
+            )}
+            {inventory.boosters.length > 0 ? (
+              <BoosterResults boosters={inventory.boosters} />
+            ) : (
+              <div className="inventory-empty">
+                <h3>
+                  {isPublicInventory
+                    ? "No booster packs to display"
+                    : "Booster details unavailable"}
+                </h3>
+                <p>
+                  {isPublicInventory
+                    ? "No trading-card games were identified in this inventory, so there are no related booster packs to display."
+                    : inventory.message}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
 
       <div
         className="inventory-view-panel"
-        id="inventory-results-panel-boosters"
+        id="inventory-results-panel-level-up"
         role="tabpanel"
-        aria-labelledby="inventory-results-tab-boosters"
-        tabIndex={activeResultView === "boosters" ? 0 : -1}
-        hidden={activeResultView !== "boosters"}
+        aria-labelledby="inventory-results-tab-level-up"
+        tabIndex={activeResultView === "level-up" ? 0 : -1}
+        hidden={activeResultView !== "level-up"}
       >
-        {inventory.boosters.length > 0 ? (
-          <BoosterResults boosters={inventory.boosters} />
-        ) : (
-          <div className="inventory-empty">
-            <h3>
-              {isPublicInventory
-                ? "No booster packs to display"
-                : "Booster details unavailable"}
-            </h3>
-            <p>
-              {isPublicInventory
-                ? "No trading-card games were identified in this inventory, so there are no related booster packs to display."
-                : inventory.message}
-            </p>
-          </div>
-        )}
+        <LevelUpCalculator
+          key={`level-up-calculator-${steamId}`}
+          badges={badges}
+        />
+        <LevelUpOptimizationPanel
+          key={`level-up-optimizer-${steamId}-${badges.status}-${badges.player_xp ?? "missing"}-${badges.player_level ?? "missing"}`}
+          steamId={steamId}
+          inventoryStatus={inventory?.status ?? "unavailable"}
+          items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
+          inventoryRefreshedAt={inventoryRefreshedAt}
+          isInventoryLoading={isInventoryLoading}
+          isActive={activeResultView === "level-up"}
+          onRefreshInventory={onRefreshInventory}
+        />
       </div>
-      <LevelUpOptimizationPanel
-        key={`level-up-${inventoryRefreshedAt ?? "missing"}-${isInventoryLoading ? "loading" : "ready"}`}
-        steamId={steamId}
-        inventoryStatus={inventory.status}
-        items={inventory.items}
-        inventoryRefreshedAt={inventoryRefreshedAt}
-        isInventoryLoading={isInventoryLoading}
-        isActive={activeResultView === "level-up"}
-        onRefreshInventory={onRefreshInventory}
-      />
     </section>
   );
 }
@@ -2853,7 +3244,7 @@ function SignedInView({
           aria-live="polite"
         >
           {isRechecking
-            ? "Rechecking Steam profile access…"
+            ? "Rechecking Steam access…"
             : actionMessage ?? inventoryActionMessage}
         </p>
       )}
@@ -2897,20 +3288,20 @@ function SignedInView({
         </button>
       </div>
 
-      {inventoryState.inventory !== null && (
-        <InventoryResults
-          inventory={inventoryState.inventory}
-          steamId={session.user.steam_id}
-          inventoryRefreshedAt={inventoryState.refreshedAt}
-          isInventoryLoading={inventoryState.isLoading}
-          gemCashBasis={gemCashBasis}
-          isRefreshingGems={isRefreshingGems}
-          refreshMessage={gemRefreshMessage}
-          onRefreshInventory={onRefreshInventory}
-          onGemCashBasisChange={setGemCashBasis}
-          onRefreshGems={onRefreshGems}
-        />
-      )}
+      <InventoryResults
+        inventory={inventoryState.inventory}
+        steamId={session.user.steam_id}
+        badges={session.checks.badges}
+        inventoryRefreshedAt={inventoryState.refreshedAt}
+        isInventoryLoading={inventoryState.isLoading}
+        gemCashBasis={gemCashBasis}
+        inventoryMessage={inventoryState.message}
+        isRefreshingGems={isRefreshingGems}
+        refreshMessage={gemRefreshMessage}
+        onRefreshInventory={onRefreshInventory}
+        onGemCashBasisChange={setGemCashBasis}
+        onRefreshGems={onRefreshGems}
+      />
       {inventoryState.inventory !== null && (
         <InventoryFaq
           profile={session.checks.profile}
@@ -3350,7 +3741,7 @@ function HomePage() {
     setActionMessage(null);
     setInventoryActionMessage(null);
     setGemRefreshMessage(null);
-    setStatusAnnouncement("Rechecking Steam profile access…");
+    setStatusAnnouncement("Rechecking Steam access…");
 
     try {
       let session = await requestSession();
@@ -3363,7 +3754,7 @@ function HomePage() {
       }
       if (!session.authenticated) {
         setStatusAnnouncement(
-          "Your local session has ended. Sign in again to recheck Steam profile access."
+          "Your local session has ended. Sign in again to recheck Steam access."
         );
       } else if (
         previousSteamId !== null &&
@@ -3378,23 +3769,23 @@ function HomePage() {
           inventoryOutcome = `Inventory check complete: ${STATUS_LABELS[result.inventory.status]}.`;
         }
         setStatusAnnouncement(
-          `Account changed. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. ${inventoryOutcome}`
+          `Account changed. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Badges: ${STATUS_LABELS[session.checks.badges.status]}. ${inventoryOutcome}`
         );
       } else if (
         result?.kind === "network" &&
         result.inventory?.status === "unavailable"
       ) {
         setStatusAnnouncement(
-          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}. Inventory is unavailable.`
+          `Steam access recheck complete. Profile: ${STATUS_LABELS[session.checks.profile.status]}. Badges: ${STATUS_LABELS[session.checks.badges.status]}. Inventory is unavailable.`
         );
       } else {
         setStatusAnnouncement(
-          `Profile recheck complete. Steam profile: ${STATUS_LABELS[session.checks.profile.status]}.`
+          `Steam access recheck complete. Profile: ${STATUS_LABELS[session.checks.profile.status]}. Badges: ${STATUS_LABELS[session.checks.badges.status]}.`
         );
       }
     } catch {
       const message =
-        "We could not recheck Steam profile access. The service is unavailable, and your previous results have not changed.";
+        "We could not recheck Steam access. The service is unavailable, and your previous results have not changed.";
       setActionMessage(message);
       setStatusAnnouncement(message);
     } finally {
@@ -3633,6 +4024,7 @@ function HomePage() {
         {viewState.kind === "signed-in" && (
           <div className="site-account">
             <AccessSummary
+              badges={viewState.session.checks.badges}
               profile={viewState.session.checks.profile}
               inventory={inventoryState.inventory}
               isInventoryLoading={inventoryState.isLoading}
@@ -3640,7 +4032,7 @@ function HomePage() {
             <button
               className="secondary-action"
               type="button"
-              aria-label="Recheck Steam profile"
+              aria-label="Recheck Steam access"
               onClick={() => void handleRecheck()}
               disabled={
                 isRechecking ||

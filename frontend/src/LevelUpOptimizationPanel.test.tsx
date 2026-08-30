@@ -332,6 +332,24 @@ describe("request and safe navigation helpers", () => {
 });
 
 describe("lazy panel lifecycle and state surfaces", () => {
+  it("shows pending inventory as loading before unavailable recovery", () => {
+    renderPanel(readyResponse(), {
+      inventoryStatus: "unavailable",
+      isInventoryLoading: true
+    });
+
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "Calculating current swap options…"
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Refresh inventory" })
+    ).not.toBeInTheDocument();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it("deduplicates the lazy request for an unchanged snapshot", async () => {
     renderPanel();
     await flushPanelEffects();
@@ -451,10 +469,9 @@ describe("lazy panel lifecycle and state surfaces", () => {
       "src",
       "https://community.cloudflare.steamstatic.com/economy/image/source-0"
     );
-    expect(document.getElementById("level-up-optimization-panel")).toHaveAttribute(
-      "tabindex",
-      "0"
-    );
+    const panel = document.getElementById("level-up-optimization-panel");
+    expect(panel).not.toHaveAttribute("role", "tabpanel");
+    expect(panel).not.toHaveAttribute("aria-labelledby");
   });
 
   it("uses one polite live region without status or alert surfaces", async () => {
@@ -464,6 +481,32 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(panel).not.toBeNull();
     expect(panel!.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
     expect(panel!.querySelectorAll('[role="status"], [role="alert"]')).toHaveLength(1);
+  });
+
+  it("announces optimizer request failures", async () => {
+    vi.mocked(globalThis.fetch).mockRejectedValue(new Error("offline"));
+    render(
+      <LevelUpOptimizationPanel
+        steamId={steamId}
+        inventoryStatus="public"
+        items={inventoryItems}
+        inventoryRefreshedAt={inventoryRefreshedAt}
+        isInventoryLoading={false}
+        isActive
+        onRefreshInventory={vi.fn()}
+      />
+    );
+
+    await flushPanelEffects();
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Level-up optimization unavailable."
+    );
+    expect(
+      screen.getByText(
+        "The recommendation service could not be reached. Try again later."
+      )
+    ).toBeInTheDocument();
   });
 
   it("renders no-opportunity, warming, and unavailable recovery copy", async () => {

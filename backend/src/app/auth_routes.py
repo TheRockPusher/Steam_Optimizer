@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import re
@@ -38,7 +39,7 @@ from app.level_up_optimizer import (
     OptimizerInputError,
     parse_normal_card_hash,
 )
-from app.steam_gateway import InventoryCheck, ProfileCheck
+from app.steam_gateway import BadgeCheck, InventoryCheck, ProfileCheck
 from app.steam_openid import (
     OpenIDValidationError,
     OpenIDVerifierUnavailableError,
@@ -89,6 +90,7 @@ class SessionCheck(BaseModel):
 
 class SessionChecks(BaseModel):
     profile: SessionCheck
+    badges: BadgeCheck
 
 
 class AuthenticatedSessionResponse(BaseModel):
@@ -330,6 +332,13 @@ def _unavailable_profile() -> ProfileCheck:
     )
 
 
+def _unavailable_badges() -> BadgeCheck:
+    return BadgeCheck(
+        status="unavailable",
+        message="Steam badge check is unavailable.",
+    )
+
+
 def _unavailable_inventory() -> InventoryCheck:
     return InventoryCheck(
         status="unavailable",
@@ -341,6 +350,7 @@ def _unavailable_inventory() -> InventoryCheck:
 def _session_response(
     steam_id: str,
     profile: ProfileCheck,
+    badges: BadgeCheck,
 ) -> AuthenticatedSessionResponse:
     return AuthenticatedSessionResponse(
         user=SessionUser(
@@ -353,6 +363,7 @@ def _session_response(
                 status=profile.status,
                 message=profile.message,
             ),
+            badges=badges,
         ),
     )
 
@@ -572,15 +583,25 @@ def create_auth_router(
         except (InvalidCookieError, ValueError):
             return UnauthenticatedSessionResponse()
         try:
-            profile_result = await steam_gateway.check_profile(steam_id)
-        except Exception:  # noqa: BLE001 - preserve unavailable profile status
+            profile_result, badge_result = await asyncio.gather(
+                steam_gateway.check_profile(steam_id),
+                steam_gateway.check_badges(steam_id),
+                return_exceptions=True,
+            )
+        except Exception:  # noqa: BLE001 - preserve independent fallback states
             profile_result = _unavailable_profile()
+            badge_result = _unavailable_badges()
         profile = (
             profile_result
             if isinstance(profile_result, ProfileCheck)
             else _unavailable_profile()
         )
-        return _session_response(steam_id, profile)
+        badges = (
+            badge_result
+            if isinstance(badge_result, BadgeCheck)
+            else _unavailable_badges()
+        )
+        return _session_response(steam_id, profile, badges)
 
     @router.post(
         "/api/auth/inventory",

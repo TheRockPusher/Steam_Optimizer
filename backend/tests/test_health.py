@@ -16,7 +16,7 @@ from app.gem_pricing import GemKey, GemScanResult
 from app.level_up_optimizer import LevelUpOptimizationResponse
 from app.main import app, create_app
 from app.settings import Settings
-from app.steam_gateway import InventoryCheck, ProfileCheck
+from app.steam_gateway import BadgeCheck, InventoryCheck, ProfileCheck
 
 
 class LifecycleGateway:
@@ -32,6 +32,13 @@ class LifecycleGateway:
     async def check_profile(self, steam_id: str) -> ProfileCheck:
         del steam_id
         return ProfileCheck(status="unavailable", message="unused")
+
+    async def check_badges(self, steam_id: str) -> BadgeCheck:
+        del steam_id
+        return BadgeCheck(
+            status="unavailable",
+            message="unused",
+        )
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         del steam_id

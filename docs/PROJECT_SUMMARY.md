@@ -8,12 +8,12 @@ comparison, and helps a user decide what to do next. It is not an account operat
 automation tool.
 
 The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an application-owned
-signed session, a profile-only server session check, and server-only SteamApis v2 access through
-`STEAMAPI_KEY`. `GET /api/auth/session` checks profile visibility only; it does not request
-inventory. After authentication, the client reads one SteamID64-keyed IndexedDB record and requests
-`POST /api/auth/inventory` once only when that record is missing or invalid, or when the user
-explicitly refreshes inventory. A valid public/private record is rendered without an inventory
-call; transient unavailable results are not persisted.
+signed session, concurrent profile and badge-progress session checks, and server-only SteamApis v2
+access through `STEAMAPI_KEY`. `GET /api/auth/session` returns profile visibility plus validated
+current XP and level; it does not request inventory. After authentication, the client reads one
+SteamID64-keyed IndexedDB record and requests `POST /api/auth/inventory` only when that record is
+missing or invalid, or when the user explicitly refreshes inventory. A valid public/private record
+is rendered without an inventory call; transient unavailable results are not persisted.
 
 For a public inventory, the inventory endpoint retrieves the complete AppID 753/context 6 inventory
 through provider pagination, joins the global normalized AppID 753 market-price generation to
@@ -23,17 +23,20 @@ card-border metadata, and values any item carrying Steam's validated gem-convers
 cache and refresh identity uses the exact application ID, numeric item type, and border color from
 that action. For each identified trading-card game, it also looks up the canonical booster market
 item and reports its provider-denominated order-book values plus Steam's fixed three-card
-booster-pack size. The React interface exposes all retrieved items, booster details, separate
-price and gem coverage, and the inventory cache refresh timestamp.
+booster-pack size. The React interface has two top-level pages: **Inventory** and **Level-up**.
+Inventory is selected by default and starts with quantity-aware highest-buy and lowest-sell
+top-quote estimates plus per-side item-type coverage. Each owned copy is marked at the current top
+quote; order-book depth is not included. The existing item browser and booster details follow.
 
-The **Level-up optimization** tab is manual-activation and read-only. It aggregates a bounded
-normal-card ownership snapshot from the current browser inventory record, then sends that
-transient snapshot to `POST /api/auth/level-up` with the signed session and matching
-`x-expected-steam-id` header. The endpoint never fetches inventory or stores the submitted
-snapshot. After finding at least one eligible normal-card catalog group, it reads at most one
-bounded, server-only SteamApis v2 `/v2/steam/users/{steamid}/badges` response for the signed
-SteamID64, using player XP/level and normal badge records for catalog AppIDs only, and returns a
-complete advisory plan or an explicit no-opportunity, warming, or unavailable state.
+The **Level-up** page shows current total XP and level from the latest authenticated session
+check. Every page load or explicit recheck performs one bounded badge-provider read. A bounded
+target-level input derives the exact Steam XP threshold delta and rounds the result up to whole
+100-XP badge crafts. The existing swap optimizer remains manual-activation and read-only: it
+aggregates a bounded normal-card ownership snapshot from the current browser inventory record,
+sends that transient snapshot to `POST /api/auth/level-up` with the signed session and matching
+`x-expected-steam-id` header, and returns a complete advisory plan or an explicit no-opportunity,
+warming, or unavailable state. The endpoint never fetches inventory or stores the submitted
+snapshot.
 
 ## Safety and identity boundary
 
@@ -49,10 +52,12 @@ passwords or Steam Guard codes.
 
 Profile visibility uses Valve's documented [Steam Web API](https://steamcommunity.com/dev) when
 its optional `STEAM_WEB_API_KEY` is configured. The server session endpoint authenticates the
-signed session and checks profile visibility only. Inventory retrieval and authenticated badge
-state use the third-party SteamApis v2 provider with the server-only `STEAMAPI_KEY`; the key is
-never exposed to the browser. `POST /api/auth/inventory` is called once after an authenticated
-client cache miss (including an account or schema invalidation) or after an explicit user refresh.
+signed session and concurrently checks profile visibility plus badge XP/level. Badge failure is
+isolated from the profile and session; only validated XP and level reach React memory. Inventory
+retrieval and authenticated badge reads use the third-party SteamApis v2 provider with the
+server-only `STEAMAPI_KEY`; the key is never exposed to the browser. `POST /api/auth/inventory` is
+called once after an authenticated client cache miss (including an account or schema invalidation)
+or after an explicit user refresh.
 The request
 includes the expected SteamID64, and the backend rejects it unless it matches the signed session
 before inventory retrieval. A session recheck does not call the inventory endpoint. The
@@ -82,8 +87,8 @@ are not money until the provider contract has been verified and configured.
 
 ### Level-up recommendation boundary
 
-The third **Level-up optimization** tab is manually activated beside Items and Boosters; Items
-remains selected by default. It is available only for a public inventory with a fresh ownership
+The **Level-up** page is manually activated beside **Inventory**, which remains selected by
+default. Its swap optimizer is available only for a public inventory with a fresh ownership
 timestamp. On activation, the frontend aggregates normal trading-card rows from the current
 SteamID64-keyed IndexedDB record into one bounded, transient snapshot:
 

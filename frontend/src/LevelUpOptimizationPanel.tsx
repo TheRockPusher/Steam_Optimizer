@@ -42,9 +42,7 @@ export type LevelUpOptimizationPanelProps = {
 };
 
 export const LEVEL_UP_OPTIMIZATION_PANEL_ID = "level-up-optimization-panel";
-export const LEVEL_UP_OPTIMIZATION_TAB_ID = "level-up-optimization-tab";
 const PANEL_ID = LEVEL_UP_OPTIMIZATION_PANEL_ID;
-const TAB_ID = LEVEL_UP_OPTIMIZATION_TAB_ID;
 const REASON_COPY: Record<LevelUpReason, string> = {
   ready: "The current recommendation is ready for review.",
   currency_contract_missing:
@@ -830,18 +828,18 @@ export function LevelUpOptimizationPanel({
   let content: ReactNode;
   if (!isActive) {
     content = null;
+  } else if (isInventoryLoading) {
+    content = (
+      <StatusSurface status="loading" title="Calculating current swap options…">
+        <p>Checking current ownership, prices, and badge data.</p>
+      </StatusSurface>
+    );
   } else if (inventoryStatus !== "public") {
     content = (
       <InventoryUnavailableSurface
         inventoryStatus={inventoryStatus}
         onRefreshInventory={refreshInventory}
       />
-    );
-  } else if (isInventoryLoading) {
-    content = (
-      <StatusSurface status="loading" title="Calculating current swap options…">
-        <p>Checking current ownership, prices, and badge data.</p>
-      </StatusSurface>
     );
   } else if (expiredResponse !== null) {
     content = steamId === null ? (
@@ -906,10 +904,10 @@ export function LevelUpOptimizationPanel({
 
   let announcement = "";
   if (isActive) {
-    if (inventoryStatus !== "public") {
-      announcement = "Level-up optimization unavailable.";
-    } else if (isInventoryLoading) {
+    if (isInventoryLoading) {
       announcement = "Calculating current swap options…";
+    } else if (inventoryStatus !== "public") {
+      announcement = "Level-up optimization unavailable.";
     } else if (expiredResponse !== null) {
       announcement = inventoryIsFresh
         ? "Quote expired."
@@ -918,6 +916,8 @@ export function LevelUpOptimizationPanel({
       announcement = "Refresh inventory to calculate a plan.";
     } else if (activeState.kind === "loading") {
       announcement = "Calculating current swap options…";
+    } else if (activeState.kind === "error") {
+      announcement = "Level-up optimization unavailable.";
     } else if (activeState.kind === "response") {
       announcement =
         activeState.response.status === "ready"
@@ -931,14 +931,7 @@ export function LevelUpOptimizationPanel({
   }
 
   return (
-    <section
-      id={PANEL_ID}
-      role="tabpanel"
-      aria-labelledby={TAB_ID}
-      hidden={!isActive}
-      tabIndex={isActive ? 0 : -1}
-      className="level-up-optimization-panel"
-    >
+    <section id={PANEL_ID} className="level-up-optimization-panel">
       <h2>Level-up optimization</h2>
       <div
         role="status"
