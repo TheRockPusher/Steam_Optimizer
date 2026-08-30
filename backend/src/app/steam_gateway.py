@@ -100,7 +100,7 @@ _PRIVATE_INVENTORY_MESSAGE = (
 MAX_RETRY_AFTER_SECONDS = 900
 BOOSTER_CARD_COUNT = 3
 
-BADGES_ENDPOINT = "https://api.steampowered.com/IPlayerService/GetBadges/v1/"
+STEAMAPIS_BADGES_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/users/{{steam_id}}/badges"
 LEVEL_UP_PRICE_MAX_AGE_SECONDS = 15 * 60
 MAX_BADGE_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_BADGE_RECORDS = 10_000
@@ -745,27 +745,43 @@ def _badge_integer(value: object, *, minimum: int, maximum: int) -> int | None:
     return value
 
 
-def _parse_badges_payload(payload: object) -> BadgeState:
-    """Parse Valve's bounded GetBadges response into immutable badge state."""
+def _steamapis_badge_value(
+    payload: Mapping[str, object],
+    current_name: str,
+    documented_name: str,
+) -> object:
+    """Read one unambiguous field across SteamApis' live and documented schemas."""
 
-    if _bounded_json_size(payload, MAX_BADGE_RESPONSE_BYTES) is None:
+    if current_name in payload:
+        if documented_name in payload:
+            raise InvalidSteamApisPayloadError
+        return payload[current_name]
+    return payload.get(documented_name)
+
+
+def _parse_badges_payload(payload: object) -> BadgeState:
+    """Parse SteamApis' bounded badge response into immutable badge state."""
+
+    if (
+        _bounded_json_size(payload, MAX_BADGE_RESPONSE_BYTES) is None
+        or not isinstance(payload, Mapping)
+        or not _is_success_flag(payload.get("success"))
+    ):
         raise InvalidSteamApisPayloadError
-    if not isinstance(payload, Mapping):
-        raise InvalidSteamApisPayloadError
-    response = payload.get("response")
-    if not isinstance(response, Mapping):
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
         raise InvalidSteamApisPayloadError
     player_xp = _badge_integer(
-        response.get("player_xp"),
+        _steamapis_badge_value(result, "xp", "player_xp"),
         minimum=0,
         maximum=10**12,
     )
     player_level = _badge_integer(
-        response.get("player_level"),
+        _steamapis_badge_value(result, "level", "player_level"),
         minimum=0,
         maximum=100_000,
     )
-    records = response.get("badges")
+    records = result.get("badges")
     if player_xp is None or player_level is None or not isinstance(records, list):
         raise InvalidSteamApisPayloadError
     if len(records) > MAX_BADGE_RECORDS:
@@ -774,13 +790,16 @@ def _parse_badges_payload(payload: object) -> BadgeState:
     for record in records:
         if not isinstance(record, Mapping):
             raise InvalidSteamApisPayloadError
-        raw_app_id = record.get("appid")
-        # Valve includes non-game badge records (typically appid 0).  They
-        # carry no game-level semantics, so ignore them before validating the
-        # game-only border and level fields.
+        raw_app_id = _steamapis_badge_value(record, "appID", "appid")
+        # Non-game badges have no application ID. They carry no game-level
+        # semantics, so ignore them before validating game-only fields.
         if raw_app_id is None or raw_app_id == 0:
             continue
-        border_color = _badge_integer(record.get("border_color"), minimum=0, maximum=1)
+        border_color = _badge_integer(
+            _steamapis_badge_value(record, "borderColor", "border_color"),
+            minimum=0,
+            maximum=1,
+        )
         if border_color is None:
             raise InvalidSteamApisPayloadError
         # Foil records are deliberately ignored.
@@ -2690,8 +2709,8 @@ class SteamGateway:
         return await self.steamapis.fetch_inventory(steam_id)
 
     async def _fetch_badge_state(self, steam_id: str) -> BadgeState:
-        api_key = self.settings.steam_web_api_key
-        if not isinstance(api_key, str) or not api_key.strip():
+        headers = self.steamapis._api_headers()
+        if headers is None:
             raise InvalidSteamApisPayloadError
         if (
             not isinstance(steam_id, str)
@@ -2700,11 +2719,13 @@ class SteamGateway:
             or not _ASCII_DIGITS.fullmatch(steam_id)
         ):
             raise InvalidSteamApisPayloadError
-        params = {"key": api_key.strip(), "steamid": steam_id}
+        url = STEAMAPIS_BADGES_ENDPOINT.format(
+            steam_id=quote(steam_id, safe=""),
+        )
         async with self.http_client.stream(
             "GET",
-            BADGES_ENDPOINT,
-            params=params,
+            url,
+            headers=headers,
             follow_redirects=False,
         ) as response:
             if (
@@ -2766,11 +2787,11 @@ class SteamGateway:
                 inventory_time=safe_inventory_time,
                 contract=None,
             )
-        api_key = self.settings.steam_web_api_key
+        api_key = self.settings.steamapi_key
         if not isinstance(api_key, str) or not api_key.strip():
             return _level_up_response(
                 status="unavailable",
-                reason="steam_web_api_key_missing",
+                reason="steamapi_key_missing",
                 now=current,
                 inventory_time=safe_inventory_time,
                 contract=contract,

@@ -45,7 +45,7 @@ export type LevelUpOptimizationRequest = {
 export type LevelUpReason =
   | "ready"
   | "currency_contract_missing"
-  | "steam_web_api_key_missing"
+  | "steamapi_key_missing"
   | "badge_data_unavailable"
   | "inventory_snapshot_too_old"
   | "price_generation_unavailable"
@@ -200,7 +200,7 @@ export type LevelUpUnavailableResponse = LevelUpResponseCommon & {
   status: "unavailable";
   reason:
   | "currency_contract_missing"
-  | "steam_web_api_key_missing"
+  | "steamapi_key_missing"
   | "badge_data_unavailable"
   | "inventory_snapshot_too_old"
   | "price_generation_unavailable"
@@ -802,7 +802,7 @@ export function isLevelUpOptimizationResponse(
     case "unavailable":
       return (
         (response.reason === "currency_contract_missing" ||
-          response.reason === "steam_web_api_key_missing" ||
+          response.reason === "steamapi_key_missing" ||
           response.reason === "badge_data_unavailable" ||
           response.reason === "inventory_snapshot_too_old" ||
           response.reason === "price_generation_unavailable" ||

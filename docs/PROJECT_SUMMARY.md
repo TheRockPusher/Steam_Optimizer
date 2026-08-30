@@ -30,9 +30,10 @@ The **Level-up optimization** tab is manual-activation and read-only. It aggrega
 normal-card ownership snapshot from the current browser inventory record, then sends that
 transient snapshot to `POST /api/auth/level-up` with the signed session and matching
 `x-expected-steam-id` header. The endpoint never fetches inventory or stores the submitted
-snapshot. It reads one bounded, server-only Valve `IPlayerService/GetBadges/v1` response for the
-signed SteamID64, using player XP/level and normal game badges only, and returns either a complete
-advisory plan or an explicit no-opportunity, warming, or unavailable state.
+snapshot. It reads one bounded, server-only SteamApis v2
+`/v2/steam/users/{steamid}/badges` response for the signed SteamID64, using player XP/level and
+normal game badges only, and returns a complete advisory plan or an explicit no-opportunity,
+warming, or unavailable state.
 
 ## Safety and identity boundary
 
@@ -48,11 +49,11 @@ passwords or Steam Guard codes.
 
 Profile visibility uses Valve's documented [Steam Web API](https://steamcommunity.com/dev) when
 its optional `STEAM_WEB_API_KEY` is configured. The server session endpoint authenticates the
-signed session and checks profile visibility only. The level-up endpoint also requires this
-server-only key to verify the signed-in user's badge state; the key is never exposed to the
-browser. Inventory retrieval uses the third-party SteamApis v2 provider with the server-only
-`STEAMAPI_KEY`. `POST /api/auth/inventory` is called once after an authenticated client cache miss
-(including an account or schema invalidation) or after an explicit user refresh. The request
+signed session and checks profile visibility only. Inventory retrieval and authenticated badge
+state use the third-party SteamApis v2 provider with the server-only `STEAMAPI_KEY`; the key is
+never exposed to the browser. `POST /api/auth/inventory` is called once after an authenticated
+client cache miss (including an account or schema invalidation) or after an explicit user refresh.
+The request
 includes the expected SteamID64, and the backend rejects it unless it matches the signed session
 before inventory retrieval. A session recheck does not call the inventory endpoint. The
 authenticated inventory response is `Cache-Control: no-store`; successful public/private data is
@@ -107,9 +108,9 @@ unchanged. It is never written to IndexedDB, `localStorage`, cookies, or a serve
 Logout, account changes, inventory refresh, and unmount invalidate it; quote expiry downgrades any
 retained rows to an expired, non-actionable state until the user refreshes.
 
-For that request, the backend makes one bounded server-only
-`IPlayerService/GetBadges/v1` call for the signed SteamID64. It parses `player_xp`, `player_level`,
-and normal game badges only (`border_color == 0`), ignoring foil and non-game badges. The raw
+For that request, the backend makes one bounded server-only SteamApis v2
+`/v2/steam/users/{steamid}/badges` call for the signed SteamID64. It parses player XP, player
+level, and normal game badges only (border color `0`), ignoring foil and non-game badges. The raw
 response and badge payload are not persisted; only validated badge-derived fields needed for the
 advisory response can reach the browser.
 
@@ -124,7 +125,7 @@ The endpoint returns exactly one of these read-only states:
 - `unavailable`: a required contract, badge, price, depth, catalog, identity, or freshness gate
   is unresolved.
 
-Initial unavailable reasons are `currency_contract_missing`, `steam_web_api_key_missing`,
+Initial unavailable reasons are `currency_contract_missing`, `steamapi_key_missing`,
 `badge_data_unavailable`, `inventory_snapshot_too_old`, `price_generation_unavailable`,
 `price_generation_stale`, and `quote_depth_unavailable`; warming uses `catalog_warming`, while
 no-opportunity uses `no_complete_sellable_set` or `no_positive_xp_swap`. Every success response
@@ -238,10 +239,11 @@ Configure the following before a production release:
   `COOKIE_SAMESITE=lax`.
 - The Railway frontend service keeps `VITE_API_BASE_URL` empty and sets runtime `API_UPSTREAM` to
   the public backend origin. Caddy proxies `/api` so authentication uses same-origin cookies.
-- `STEAM_WEB_API_KEY` belongs only in the backend environment. It supports the profile visibility
-  check and is required for the authenticated server-only GetBadges read used by level-up.
-- `STEAMAPI_KEY` belongs only in the backend environment for SteamApis v2 inventory retrieval and
-  lazy global normalized AppID 753 market-price refreshes; it is never exposed to the browser.
+- `STEAM_WEB_API_KEY` belongs only in the backend environment and optionally supports the profile
+  visibility check.
+- `STEAMAPI_KEY` belongs only in the backend environment for SteamApis v2 inventory retrieval,
+  authenticated badge-state reads, and lazy global normalized AppID 753 market-price refreshes; it
+  is never exposed to the browser.
 - Level-up recommendations use the complete verified monetary group:
   `LEVEL_UP_CURRENCY_CODE=USD`, `LEVEL_UP_CURRENCY_MINOR_DIGITS=2`,
   `LEVEL_UP_PRICE_BASIS=buyer_total`, `LEVEL_UP_STEAM_FEE_BPS=500`,
