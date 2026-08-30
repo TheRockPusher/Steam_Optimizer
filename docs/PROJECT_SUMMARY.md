@@ -130,13 +130,13 @@ Initial unavailable reasons are `currency_contract_missing`, `steam_web_api_key_
 no-opportunity uses `no_complete_sellable_set` or `no_positive_xp_swap`. Every success response
 uses `Cache-Control: no-store`.
 
-Money is fail-closed behind one explicit, verified contract. The complete backend `LEVEL_UP_*`
-group must define an uppercase currency code, integer minor digits, the exact verified
-`buyer_total` price basis, Steam and publisher fee basis points, a per-item minimum fee, and
-freshness limits. The optimizer converts decimal quotes exactly to integer minor units and applies
-fees separately to each item; it does not infer currency, round provider values into a currency,
-or calculate a fee once on a set total. If the group is absent, partial, invalid, or not verified,
-the endpoint returns `currency_contract_missing` and no monetary recommendation.
+Money is fail-closed behind one explicit, verified contract. The checked-in service group defines
+`USD`, two minor digits, the exact `buyer_total` price basis, 500 Steam fee basis points, 1,000
+publisher fee basis points, a one-cent per-component minimum, and freshness limits. Settings
+validate the contract as one atomic group: clearing a field returns `currency_contract_missing`,
+while an invalid complete group prevents startup. Operators must review and replace every
+monetary value together. The optimizer converts decimal quotes exactly to integer minor units and
+applies fees separately to each item rather than calculating a fee once on a set total.
 
 The optimizer example limits are `LEVEL_UP_MAX_QUOTE_AGE_SECONDS=900` (15 minutes) and
 `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600` (one hour). Quotes, generation, and ownership must all
@@ -242,14 +242,13 @@ Configure the following before a production release:
   check and is required for the authenticated server-only GetBadges read used by level-up.
 - `STEAMAPI_KEY` belongs only in the backend environment for SteamApis v2 inventory retrieval and
   lazy global normalized AppID 753 market-price refreshes; it is never exposed to the browser.
-- Level-up recommendations fail closed unless the complete monetary group is configured and
-  verified: `LEVEL_UP_CURRENCY_CODE`, `LEVEL_UP_CURRENCY_MINOR_DIGITS`,
-  `LEVEL_UP_PRICE_BASIS=buyer_total`, `LEVEL_UP_STEAM_FEE_BPS`,
-  `LEVEL_UP_PUBLISHER_FEE_BPS`, and `LEVEL_UP_MIN_FEE_MINOR`. The example freshness limits are
+- Level-up recommendations use the complete verified monetary group:
+  `LEVEL_UP_CURRENCY_CODE=USD`, `LEVEL_UP_CURRENCY_MINOR_DIGITS=2`,
+  `LEVEL_UP_PRICE_BASIS=buyer_total`, `LEVEL_UP_STEAM_FEE_BPS=500`,
+  `LEVEL_UP_PUBLISHER_FEE_BPS=1000`, and `LEVEL_UP_MIN_FEE_MINOR=1`.
   `LEVEL_UP_MAX_QUOTE_AGE_SECONDS=900` and
-  `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600`. Blank or partial monetary values keep the endpoint
-  unavailable; operators must establish the provider's currency, buyer-total, fee, and depth
-  contract before setting them.
+  `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600` bound freshness. Operators must review and replace
+  the complete group together; clearing one member keeps the endpoint unavailable.
 - The backend uses `/data/gem_prices.sqlite3` for gem rows and
   `/data/steamapis_prices.sqlite3` for the separate global normalized market-price cache. The
   latter is fresh for 24 hours for inventory display, refreshes lazily on requests, uses

@@ -366,7 +366,6 @@ def _canonical_market_hash_name(value: object) -> str | None:
         or not value
         or len(value) > MAX_PRICE_STREAM_SCALAR_LENGTH
         or "\x00" in value
-        or re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None
     ):
         return None
     try:

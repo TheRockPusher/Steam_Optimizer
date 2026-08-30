@@ -32,8 +32,8 @@ uv sync
 cp .env.example .env
 # Set a random SIGNING_SECRET in .env. STEAM_WEB_API_KEY is optional for profile visibility;
 # STEAMAPI_KEY enables SteamApis inventory retrieval and the global normalized price cache.
-# Leave the blank monetary LEVEL_UP_* fields unchanged until the verified contract is configured;
-# the 900/3600 age examples are quote/inventory freshness limits.
+# The example includes the verified USD buyer-total fee group and active 900/3600
+# quote/inventory freshness limits.
 uv run uvicorn app.main:app --reload
 ```
 
@@ -136,15 +136,13 @@ optimizer-eligible only when its AppID 753 metadata declares an item count exact
 number of completely parsed item rows; mismatched or missing completeness metadata preserves the
 prior generation instead. Raw feeds, API keys, and redirect URLs are not persisted.
 
-The optimizer is fail-closed behind one explicit, verified money contract. Operators must provide
-the complete `LEVEL_UP_*` group in the backend environment: uppercase currency code, integer
-minor digits, the verified `buyer_total` price basis, Steam and publisher fee basis points,
-per-item minimum fee, and quote/inventory age limits. The contract is enabled only when every
-field validates. SteamApis' currency-less decimals remain provider-denominated display values
-until that upstream contract is verified; no currency symbol or monetary recommendation is
-invented. When enabled, each item is converted exactly to integer minor units and fees are
-calculated per item under the returned contract, with taxes, holds, and an existing wallet balance
-excluded.
+The optimizer is fail-closed behind one explicit, verified money contract. The checked-in service
+configuration uses USD with two minor digits, the `buyer_total` price basis, a 5% Steam fee, a
+10% publisher fee, and a one-cent minimum for each per-item fee component. Settings validate the
+contract as one atomic group: clearing a field disables recommendations, while an invalid complete
+group prevents startup. Operators must review and replace every monetary value together.
+Each item is converted exactly to integer minor units, and fees are calculated per item under the
+returned contract, with taxes, holds, and an existing wallet balance excluded.
 
 Known unavailable and warming states are explicit: `currency_contract_missing`,
 `steam_web_api_key_missing`, `badge_data_unavailable`, `inventory_snapshot_too_old`,
@@ -191,13 +189,13 @@ For separate Railway frontend and backend services in EU-West (`europe-west4-dra
   to verify authenticated badge state; it belongs only in the backend environment.
 - `STEAMAPI_KEY` belongs only in the backend environment and is never exposed to the browser. It
   enables SteamApis v2 inventory retrieval and the global normalized AppID 753 price cache.
-- Level-up recommendations fail closed unless all monetary settings are configured and verified:
-  `LEVEL_UP_CURRENCY_CODE`, `LEVEL_UP_CURRENCY_MINOR_DIGITS`, `LEVEL_UP_PRICE_BASIS` (the exact
-  literal `buyer_total`), `LEVEL_UP_STEAM_FEE_BPS`, `LEVEL_UP_PUBLISHER_FEE_BPS`, and
-  `LEVEL_UP_MIN_FEE_MINOR`. `LEVEL_UP_MAX_QUOTE_AGE_SECONDS=900` and
-  `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600` are example freshness limits. Keep the monetary
-  fields blank until the provider currency, buyer-total basis, fee rules, and quote-depth
-  contract have been independently verified; a partial group disables recommendations.
+- Level-up recommendations use the complete verified monetary group:
+  `LEVEL_UP_CURRENCY_CODE=USD`, `LEVEL_UP_CURRENCY_MINOR_DIGITS=2`,
+  `LEVEL_UP_PRICE_BASIS=buyer_total`, `LEVEL_UP_STEAM_FEE_BPS=500`,
+  `LEVEL_UP_PUBLISHER_FEE_BPS=1000`, and `LEVEL_UP_MIN_FEE_MINOR=1`.
+  `LEVEL_UP_MAX_QUOTE_AGE_SECONDS=900` and
+  `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600` bound freshness. Operators must review and replace
+  the complete group together; clearing one member disables recommendations.
 
 Each service has its own Dockerfile. Infrastructure is managed separately with the current
 `.railway/railway.ts`, which retains one backend replica and attaches the `backend-data` volume in
@@ -326,10 +324,11 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   currency symbol. The optimizer is enabled only by a complete, verified `LEVEL_UP_*` contract
   with an uppercase currency code, integer minor digits, the exact `buyer_total` basis, fee rates,
   per-item minimum, and freshness windows. It converts prices exactly to integer minor units and
-  applies fees per item; incomplete or invalid configuration fails closed as
-  `currency_contract_missing`. Missing badge data, stale/unavailable price generations, missing
-  quote depth, old ownership snapshots, and unresolved catalog metadata likewise return explicit
-  unavailable or warming states, never a partial plan.
+  applies fees per item. An absent or cleared contract member fails closed as
+  `currency_contract_missing`; an invalid complete group prevents backend startup. Missing badge
+  data, stale/unavailable price generations, missing quote depth, old ownership snapshots, and
+  unresolved catalog metadata likewise return explicit unavailable or warming states, never a
+  partial plan.
 - Deployment caveat: both Railway services run in exact EU-West region `europe-west4-drams3a`. The
   level-up endpoint runs inside the existing backend service; it adds no service, process,
   scheduler, region, or volume. The backend attaches the `backend-data` volume at `/data` and
@@ -394,11 +393,11 @@ was last updated on 2026-08-29.
   without a currency symbol. The optimizer displays money only after the complete verified
   `LEVEL_UP_*` contract supplies the currency code, minor digits, exact `buyer_total` basis, fee
   rates, per-item minimum, and freshness windows. It converts values exactly to integer minor
-  units and applies fees per item. If any value is absent or invalid, or if badge data, prices,
-  depth, catalog metadata, or freshness cannot be verified, the endpoint returns an explicit
-  unavailable or warming state and no partial plan. `estimated seller receipt` and `unspent swap
-  proceeds` are estimates, not received funds; taxes, holds, and the current wallet balance are
-  excluded.
+  units and applies fees per item. An absent or cleared contract member returns an unavailable
+  state; an invalid complete group prevents backend startup. Unverified badge data, prices, depth,
+  catalog metadata, or freshness return an explicit unavailable or warming state and no partial
+  plan. `estimated seller receipt` and `unspent swap proceeds` are estimates, not received funds;
+  taxes, holds, and the current wallet balance are excluded.
 - Manual Steam navigation: Market listing and gamecards links are constructed from fixed
   `steamcommunity.com` origins. They are ordinary navigation only; Steam Optimizer never lists,
   orders, buys, sells, trades, or crafts on the user's behalf, and it never accepts provider URLs.

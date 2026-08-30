@@ -140,7 +140,7 @@ function jsonResponse(payload: unknown, status = 200) {
 
 function cacheRecord(inventory: unknown) {
   return {
-    schema_version: 5,
+    schema_version: 6,
     steam_id: steamId,
     refreshed_at: "2026-08-28T12:34:56.000Z",
     inventory
