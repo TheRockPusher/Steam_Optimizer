@@ -61,10 +61,10 @@ const REASON_COPY: Record<LevelUpReason, string> = {
     "The market did not provide enough top-of-book quote depth for this calculation.",
   catalog_warming:
     "Steam card-set metadata is still being validated.",
-  no_complete_sellable_set:
-    "No complete sellable normal-card set is available in this inventory snapshot.",
+  no_sellable_card:
+    "No sellable normal card with a usable current bid is available in this inventory snapshot.",
   no_positive_xp_swap:
-    "Every self-funded swap would provide no more XP than crafting the owned set."
+    "No one-card sale funds a badge path with more XP than the immediate craft opportunity it gives up."
 };
 
 function formatXp(value: number): string {
@@ -188,17 +188,18 @@ function SellTable({
   const money = responseMoney(response);
   return (
     <div className="level-up-sell-section">
-      <h4>Sell one owned {source.game_name} set</h4>
+      <h4>Sell one {source.game_name} card</h4>
       <p>
-        Normal badge level {source.badge_level}; {source.set_size} cards.
+        Normal badge level {source.badge_level}; one card from a {source.set_size}-card
+        set.
       </p>
       <p>
-        Sell one copy of each card into the current highest bid. These are estimates,
-        not actions performed by this application.
+        Sell this single card into the current highest bid. This is an estimate and
+        manual Steam navigation, not an action performed by this application.
       </p>
       <div className="level-up-table-wrapper">
         <table className="level-up-card-table">
-          <caption>Cards in the source set</caption>
+          <caption>Card to sell</caption>
           <thead>
             <tr>
               <th scope="col">Card</th>
@@ -288,11 +289,16 @@ function DestinationGroup({
       <header>
         <h5>{destination.game_name}</h5>
         <p>
-          Normal badge level {destination.badge_level_before} → {destination.badge_level_after}; {destination.set_size} cards; +100 XP
+          Normal badge level {destination.badge_level_before} → {destination.badge_level_after}; +{formatXp(destination.craft_xp)}
+        </p>
+        <p>
+          {destination.owned_card_count} of {destination.set_size} cards already
+          owned; buy {destination.rows.length} missing{" "}
+          {destination.rows.length === 1 ? "card" : "cards"}.
         </p>
       </header>
       <p className="level-up-destination-subtotal">
-        Set subtotal: {formatAmount(destination.set_subtotal, money)}
+        Missing-card total: {formatAmount(destination.missing_cards_total, money)}
       </p>
       <ul className="level-up-buy-cards">
         {destination.rows.map((row) => (
@@ -365,7 +371,7 @@ function ReadyContent({
         </dl>
         {response.scope_limited && (
           <p className="level-up-scope-note">
-            Best within the five-badge MVP cap; this is not a global maximum.
+            Best within the five-badge recommendation cap; more affordable badges may exist.
           </p>
         )}
         {!expired && (
@@ -374,18 +380,18 @@ function ReadyContent({
       </div>
 
       <dl className="level-up-comparison-metrics">
-        <Metric label="Craft owned set" value={formatXp(totals.direct_craft_xp)} />
-        <Metric label="Recommended swap path" value={formatXp(totals.swap_path_xp)} />
+        <Metric label="Foregone craft XP" value={formatXp(totals.foregone_craft_xp)} />
+        <Metric label="Funded badge XP" value={formatXp(totals.funded_craft_xp)} />
         <Metric label="XP advantage" value={`+${formatXp(totals.xp_advantage)}`} />
         <Metric label="Projected level" value={`${player.current_level} → ${player.projected_level}`} />
       </dl>
 
       <dl className="level-up-money-metrics">
-        <Metric label="Estimated seller receipts" value={formatAmount(totals.seller_receipt_total, money)} />
+        <Metric label="Estimated seller receipt" value={formatAmount(totals.seller_receipt_total, money)} />
         <Metric label="Steam fee" value={formatAmount(totals.steam_fee_total, money)} />
         <Metric label="Game-publisher fee" value={formatAmount(totals.publisher_fee_total, money)} />
-        <Metric label="Replacement purchase total" value={formatAmount(totals.purchase_total, money)} />
-        <Metric label="Unspent swap proceeds" value={formatAmount(totals.unspent_swap_proceeds, money)} />
+        <Metric label="Missing-card purchase total" value={formatAmount(totals.purchase_total, money)} />
+        <Metric label="Unspent sale proceeds" value={formatAmount(totals.unspent_swap_proceeds, money)} />
       </dl>
 
       <div className="level-up-action-rail">
@@ -396,16 +402,20 @@ function ReadyContent({
         <section className="level-up-action-step">
           <span className="level-up-action-number" aria-hidden="true">2</span>
           <div>
-            <h4>Wait and verify fills</h4>
+            <h4>Wait and verify the fill</h4>
             <p>
-              Proceeds are not available until every sale fills. Recheck every price and Steam confirmation before continuing.
+              Proceeds are not available until the sale fills. Recheck the price and
+              Steam confirmation before continuing.
             </p>
           </div>
         </section>
         <section className="level-up-action-step">
           <span className="level-up-action-number" aria-hidden="true">3</span>
           <div>
-            <h4>Buy {response.destinations.length} replacement sets</h4>
+            <h4>
+              Buy missing cards for {response.destinations.length}{" "}
+              {response.destinations.length === 1 ? "badge" : "badges"}
+            </h4>
             <div className="level-up-destination-groups">
               {response.destinations.map((destination) => (
                 <DestinationGroup
@@ -423,7 +433,8 @@ function ReadyContent({
           <div>
             <h4>Craft the badges</h4>
             <p>
-              Manually open each destination game's Steam gamecards page and review the normal badge craft. Each selected set contributes exactly 100 XP.
+              Manually open each destination game's Steam gamecards page and review
+              the normal badge craft. Each funded badge contributes exactly 100 XP.
             </p>
             <ul className="level-up-craft-links">
               {response.destinations.map((destination) => (
@@ -445,7 +456,10 @@ function ReadyContent({
           <div>
             <h4>Projected result</h4>
             <p>
-              {formatXp(player.projected_xp)} · level {player.projected_level} · +{formatXp(totals.xp_advantage)} versus crafting the owned set.
+              {formatXp(player.projected_xp)} · level {player.projected_level} · +
+              {formatXp(totals.funded_craft_xp)} from funded badges, with{" "}
+              {formatXp(totals.foregone_craft_xp)} in foregone craft XP shown
+              separately.
             </p>
           </div>
         </section>
@@ -455,7 +469,8 @@ function ReadyContent({
         <h4>Assumptions</h4>
         <ul>
           <li>Prices can move, and final Steam confirmation is authoritative.</li>
-          <li>Estimated proceeds are unavailable until all sales fill.</li>
+          <li>Estimated proceeds are unavailable until the single sale fills.</li>
+          <li>Owned destination cards are reused; only missing cards are purchased.</li>
           <li>Taxes, market holds, and the current wallet balance are excluded.</li>
           <li>Rewards other than the normal badge XP are excluded.</li>
         </ul>
@@ -495,9 +510,9 @@ function ResponseSurface({
       );
     case "no_opportunity":
       return (
-        <StatusSurface status="no-opportunity" title="No level-up swap opportunity">
+        <StatusSurface status="no-opportunity" title="No one-card level-up opportunity">
           <p>{REASON_COPY[response.reason]}</p>
-          <p>No action cards are shown because there is no positive XP advantage to recommend.</p>
+          <p>No manual action plan is shown because there is no strictly positive XP advantage to recommend.</p>
         </StatusSurface>
       );
     case "warming":
@@ -830,8 +845,8 @@ export function LevelUpOptimizationPanel({
     content = null;
   } else if (isInventoryLoading) {
     content = (
-      <StatusSurface status="loading" title="Calculating current swap options…">
-        <p>Checking current ownership, prices, and badge data.</p>
+      <StatusSurface status="loading" title="Calculating a one-card level-up plan…">
+        <p>Checking current ownership, prices, fees, and badge data.</p>
       </StatusSurface>
     );
   } else if (inventoryStatus !== "public") {
@@ -870,8 +885,8 @@ export function LevelUpOptimizationPanel({
     );
   } else if (activeState.kind === "loading") {
     content = (
-      <StatusSurface status="loading" title="Calculating current swap options…">
-        <p>Checking current ownership, prices, and badge data.</p>
+      <StatusSurface status="loading" title="Calculating a one-card level-up plan…">
+        <p>Checking current ownership, prices, fees, and badge data.</p>
       </StatusSurface>
     );
   } else if (activeState.kind === "error") {
@@ -896,8 +911,8 @@ export function LevelUpOptimizationPanel({
     );
   } else {
     content = (
-      <StatusSurface status="loading" title="Calculating current swap options…">
-        <p>Checking current ownership, prices, and badge data.</p>
+      <StatusSurface status="loading" title="Calculating a one-card level-up plan…">
+        <p>Checking current ownership, prices, fees, and badge data.</p>
       </StatusSurface>
     );
   }
@@ -905,7 +920,7 @@ export function LevelUpOptimizationPanel({
   let announcement = "";
   if (isActive) {
     if (isInventoryLoading) {
-      announcement = "Calculating current swap options…";
+      announcement = "Calculating a one-card level-up plan…";
     } else if (inventoryStatus !== "public") {
       announcement = "Level-up optimization unavailable.";
     } else if (expiredResponse !== null) {
@@ -915,15 +930,15 @@ export function LevelUpOptimizationPanel({
     } else if (snapshotKey === null || !inventoryIsFresh) {
       announcement = "Refresh inventory to calculate a plan.";
     } else if (activeState.kind === "loading") {
-      announcement = "Calculating current swap options…";
+      announcement = "Calculating a one-card level-up plan…";
     } else if (activeState.kind === "error") {
       announcement = "Level-up optimization unavailable.";
     } else if (activeState.kind === "response") {
       announcement =
         activeState.response.status === "ready"
-          ? "Level-up optimization ready."
+          ? "One-card level-up recommendation ready."
           : activeState.response.status === "no_opportunity"
-            ? "No level-up swap opportunity."
+            ? "No one-card level-up opportunity."
             : activeState.response.status === "warming"
               ? "Steam card-set metadata is still being validated."
               : "Level-up optimization unavailable.";

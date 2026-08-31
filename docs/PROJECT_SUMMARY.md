@@ -113,22 +113,24 @@ unchanged. It is never written to IndexedDB, `localStorage`, cookies, or a serve
 Logout, account changes, inventory refresh, and unmount invalidate it; quote expiry downgrades any
 retained rows to an expired, non-actionable state until the user refreshes.
 
-For that request, the backend derives eligible normal-card AppIDs from the complete normalized
-market catalog. If no eligible group exists, it returns without calling the badge provider;
-otherwise it makes at most one bounded server-only SteamApis v2
+For that request, the backend derives normal-card AppIDs from the complete normalized market
+catalog and makes at most one bounded server-only SteamApis v2
 `/v2/steam/users/{steamid}/badges` call for the signed SteamID64. It parses player XP and level plus
-normal badge records for those catalog AppIDs. Foil and non-game records are ignored, as are
-syntactically valid records outside the catalog, including unrelated event and collection badges.
-Relevant records with malformed border metadata, and relevant normal records with malformed level
-metadata, fail closed. The raw response and badge payload are not persisted; only validated
-badge-derived fields needed for the advisory response can reach the browser.
+normal badge records for those catalog AppIDs. Every held sellable normal card is evaluated as a
+one-copy source candidate, including cards from maxed badges; destinations must remain below normal
+badge level five. Foil and non-game records are ignored, as are syntactically valid records outside
+the catalog, including unrelated event and collection badges. Relevant records with malformed
+border metadata, and relevant normal records with malformed level metadata, fail closed. The raw
+response and badge payload are not persisted; only validated badge-derived fields needed for the
+advisory response can reach the browser.
 
 The endpoint returns exactly one of these read-only states:
 
-- `ready`: one complete deterministic, fully funded plan, with source sale rows, destination
-  purchase rows, per-item fees, quote depth/times, XP comparison, and configured currency metadata.
-- `no_opportunity`: valid complete inputs but no qualifying source or positive-XP self-funded swap;
-  no zero-valued action cards are rendered.
+- `ready`: one complete deterministic, fully funded plan that sells one selected card, reuses
+  retained destination cards, buys only missing cards, and reports per-item fees, quote
+  depth/times, foregone versus funded XP, and configured currency metadata.
+- `no_opportunity`: valid complete inputs but no card with a usable current bid or no strictly
+  better fee-funded badge route; no zero-valued action cards are rendered.
 - `warming`: bounded card-set metadata is still being validated; progress and **Try again** are
   returned, without a partial plan.
 - `unavailable`: a required contract, badge, price, depth, catalog, identity, or freshness gate
@@ -137,22 +139,23 @@ The endpoint returns exactly one of these read-only states:
 Initial unavailable reasons are `currency_contract_missing`, `steamapi_key_missing`,
 `badge_data_unavailable`, `inventory_snapshot_too_old`, `price_generation_unavailable`,
 `price_generation_stale`, and `quote_depth_unavailable`; warming uses `catalog_warming`, while
-no-opportunity uses `no_complete_sellable_set` or `no_positive_xp_swap`. Every success response
-uses `Cache-Control: no-store`.
+no-opportunity uses `no_sellable_card` or `no_positive_xp_swap`. Every success response uses
+`Cache-Control: no-store`.
 
 Money is fail-closed behind one explicit, verified contract. The checked-in service group defines
 `USD`, two minor digits, the exact `buyer_total` price basis, 500 Steam fee basis points, 1,000
 publisher fee basis points, a one-cent per-component minimum, and freshness limits. Settings
 validate the contract as one atomic group: clearing a field returns `currency_contract_missing`,
 while an invalid complete group prevents startup. Operators must review and replace every
-monetary value together. The optimizer converts decimal quotes exactly to integer minor units and
-applies fees separately to each item rather than calculating a fee once on a set total.
+monetary value together. The optimizer converts decimal quotes exactly to integer minor units,
+inverts the configured Steam and publisher fees for the one proposed sale, and uses the resulting
+seller receipt—not the buyer's gross bid—as the missing-card purchase budget.
 
 The optimizer example limits are `LEVEL_UP_MAX_QUOTE_AGE_SECONDS=900` (15 minutes) and
 `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS=3600` (one hour). Quotes, generation, and ownership must all
-meet their configured limits. Missing top-bid/top-ask depth, stale generations, stale quotes,
-unresolved set metadata, provider failures, or invalid badge data fail closed as unavailable or
-warming; the endpoint never substitutes a partial plan.
+meet their configured limits. Unresolved relevant set metadata and global catalog, freshness,
+provider, or badge failures fail closed as unavailable or warming. Missing, stale, or depthless
+candidate quotes are excluded locally; the endpoint never substitutes an underfunded partial plan.
 
 All market listing and gamecards links are constructed from fixed Steam Community origins and are
 ordinary manual navigation. The application does not accept provider-supplied URLs and never
@@ -285,9 +288,10 @@ The following follow-on scope is planned later, not missing pieces of that imple
 
 - Marketplace, purchase, sale, trade, or any other transaction automation.
 - A persisted transaction checklist, saved plans, or automatic repricing after source sales.
-- Multiple source sets in one plan, more than five destination badges, additional levels of one
-  game badge, or partially owned destination sets.
-- Selective duplicate-card sales, leftover-portfolio optimization, or a claim of global maximum XP.
+- Multiple source cards in one plan, more than five destination badges, or additional levels of one
+  game badge in the same recommendation.
+- Selling multiple copies of one source card, leftover-portfolio optimization, or a claim of
+  global maximum XP.
 - User-entered wallet balance, cash budget, XP target, level target, locks, preferences, or
   exclusions.
 - Patient listings, buy orders, order-book walking, fill-probability models, taxes, regional

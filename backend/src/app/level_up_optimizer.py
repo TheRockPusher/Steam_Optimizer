@@ -406,8 +406,9 @@ class DestinationPlan:
     badge_level_before: int
     badge_level_after: int
     set_size: int
+    owned_card_count: int
     rows: tuple[BuyRow, ...]
-    set_subtotal: int
+    missing_cards_total: int
     craft_xp: int = NORMAL_BADGE_XP
 
     def __post_init__(self) -> None:
@@ -432,8 +433,8 @@ class PlanTotals:
     seller_receipt_total: int
     purchase_total: int
     unspent_swap_proceeds: int
-    direct_craft_xp: int
-    swap_path_xp: int
+    foregone_craft_xp: int
+    funded_craft_xp: int
     xp_advantage: int
     destination_count: int
     scope_limited: bool
@@ -548,8 +549,9 @@ def _destination_json(destination: DestinationPlan) -> dict[str, object]:
         "badge_level_before": destination.badge_level_before,
         "badge_level_after": destination.badge_level_after,
         "set_size": destination.set_size,
+        "owned_card_count": destination.owned_card_count,
         "rows": [_buy_row_json(row) for row in destination.rows],
-        "set_subtotal": destination.set_subtotal,
+        "missing_cards_total": destination.missing_cards_total,
         "craft_xp": destination.craft_xp,
     }
 
@@ -564,8 +566,8 @@ def _totals_json(totals: PlanTotals | None) -> dict[str, object] | None:
         "seller_receipt_total": totals.seller_receipt_total,
         "purchase_total": totals.purchase_total,
         "unspent_swap_proceeds": totals.unspent_swap_proceeds,
-        "direct_craft_xp": totals.direct_craft_xp,
-        "swap_path_xp": totals.swap_path_xp,
+        "foregone_craft_xp": totals.foregone_craft_xp,
+        "funded_craft_xp": totals.funded_craft_xp,
         "xp_advantage": totals.xp_advantage,
         "destination_count": totals.destination_count,
         "scope_limited": totals.scope_limited,
@@ -635,12 +637,16 @@ def is_normal_card_hash(value: object) -> bool:
     return parse_normal_card_hash(value) is not None
 
 
+def _minimum_xp_threshold(level: int) -> int:
+    decades, remainder = divmod(level, 10)
+    return 500 * decades * (decades + 1) + 100 * (decades + 1) * remainder
+
+
 def minimum_xp(level: int) -> int:
     """Return the minimum total XP at the start of ``level``."""
 
     _require_bounded_int(level, "level", 0, MAX_PLAYER_LEVEL)
-    decades, remainder = divmod(level, 10)
-    return 500 * decades * (decades + 1) + 100 * (decades + 1) * remainder
+    return _minimum_xp_threshold(level)
 
 
 def level_for_xp(xp: int) -> int:
@@ -674,7 +680,7 @@ def xp_to_next_level(xp: int, level: int | None = None) -> int:
         _require_bounded_int(level, "level", 0, MAX_PLAYER_LEVEL)
         if level != actual_level:
             raise OptimizerInputError("badge_data_unavailable", "XP and level disagree")
-    return minimum_xp(actual_level + 1) - xp
+    return _minimum_xp_threshold(actual_level + 1) - xp
 
 
 def project_xp(xp: int, added_xp: int) -> XPProjection:
@@ -687,7 +693,7 @@ def project_xp(xp: int, added_xp: int) -> XPProjection:
     return XPProjection(
         xp=projected,
         level=level,
-        xp_to_next_level=minimum_xp(level + 1) - projected,
+        xp_to_next_level=_minimum_xp_threshold(level + 1) - projected,
     )
 
 
@@ -712,8 +718,7 @@ def optimize_level_up(
         raise OptimizerInputError("badge_data_unavailable", "badges must be validated")
     _validate_fee_contract(fee_contract)
     catalog_value = catalog
-    normalized_holdings = _normalize_holdings(holdings)
-    normalized_badges = badges
+    holdings_by_hash = _normalize_holdings(holdings)
     current = _coerce_utc(now, "now")
     inventory_time = _coerce_utc(inventory_refreshed_at, "inventory_refreshed_at")
     contract_value = fee_contract
@@ -754,7 +759,6 @@ def optimize_level_up(
             taxes_included=False,
         )
 
-    holdings_by_hash = normalized_holdings
     sets = tuple(sorted(catalog_value.resolved_sets, key=lambda value: value.app_id))
     catalog_hashes = {
         card.market_hash_name for current_set in sets for card in current_set.cards
@@ -766,78 +770,94 @@ def optimize_level_up(
             "catalog_invalid",
             "inventory contains a normal card outside the resolved catalog",
         )
+
     candidates: list[_SourceCandidate] = []
     saw_source = False
     for source_set in sets:
-        source_level = normalized_badges.level_for_game(source_set.app_id)
-        if source_level >= 5:
-            continue
-        source_rows = _source_rows(
-            source_set, holdings_by_hash, current, quote_window, contract_value
-        )
-        if source_rows is None:
-            continue
-        saw_source = True
-        source = _build_source_plan(source_set, source_level, source_rows)
-        destination_options = _destination_options(
-            source_set,
-            sets,
-            holdings_by_hash,
-            normalized_badges,
-            current,
-            quote_window,
-            contract_value,
-            source.seller_receipt,
-        )
-        selected = _select_destinations(destination_options, source.seller_receipt)
-        if len(selected) < 2:
-            continue
-        purchase_total = sum(value.set_subtotal for value in selected)
-        if purchase_total > source.seller_receipt:
-            raise OptimizerInputError(
-                "optimizer_internal_error", "selected destinations exceed proceeds"
+        source_level = badges.level_for_game(source_set.app_id)
+        for source_card in source_set.cards:
+            source_rows = _source_rows(
+                source_card,
+                holdings_by_hash,
+                current,
+                quote_window,
+                contract_value,
             )
-        scope_limited = (
-            len(selected) == MAX_DESTINATION_SETS
-            and len(destination_options) > MAX_DESTINATION_SETS
-        )
-        if scope_limited:
-            sixth = destination_options[MAX_DESTINATION_SETS]
-            scope_limited = purchase_total + sixth.set_subtotal <= source.seller_receipt
-        destinations = tuple(selected)
-        swap_xp = NORMAL_BADGE_XP * len(destinations)
-        totals = PlanTotals(
-            source_buyer_total=source.buyer_total,
-            steam_fee_total=source.steam_fee,
-            publisher_fee_total=source.publisher_fee,
-            seller_receipt_total=source.seller_receipt,
-            purchase_total=purchase_total,
-            unspent_swap_proceeds=source.seller_receipt - purchase_total,
-            direct_craft_xp=NORMAL_BADGE_XP,
-            swap_path_xp=swap_xp,
-            xp_advantage=swap_xp - NORMAL_BADGE_XP,
-            destination_count=len(destinations),
-            scope_limited=scope_limited,
-        )
-        all_quote_times = [row.quote_timestamp for row in source.rows] + [
-            row.quote_timestamp
-            for destination in destinations
-            for row in destination.rows
-        ]
-        oldest_quote_age = max(current - value for value in all_quote_times)
-        candidates.append(
-            _SourceCandidate(
-                source=source,
-                destinations=destinations,
-                totals=totals,
-                oldest_quote=oldest_quote_age,
-                card_actions=source.set_size
-                + sum(value.set_size for value in destinations),
+            if source_rows is None:
+                continue
+            saw_source = True
+            source = _build_source_plan(source_set, source_level, source_rows)
+            destination_options = _destination_options(
+                source_card.market_hash_name,
+                sets,
+                holdings_by_hash,
+                badges,
+                current,
+                quote_window,
+                contract_value,
             )
-        )
+            selected = _select_destinations(destination_options, source.seller_receipt)
+            if not selected:
+                continue
+            purchase_total = sum(value.missing_cards_total for value in selected)
+            if purchase_total > source.seller_receipt:
+                raise OptimizerInputError(
+                    "optimizer_internal_error", "selected destinations exceed proceeds"
+                )
+
+            before_crafts = _craftable_count(source_set, holdings_by_hash, source_level)
+            after_crafts = _craftable_count(
+                source_set,
+                holdings_by_hash,
+                source_level,
+                sold_hash=source_card.market_hash_name,
+            )
+            foregone_craft_xp = (before_crafts - after_crafts) * NORMAL_BADGE_XP
+            funded_craft_xp = sum(value.craft_xp for value in selected)
+            xp_advantage = funded_craft_xp - foregone_craft_xp
+            if xp_advantage <= 0:
+                continue
+            scope_limited = (
+                len(selected) == MAX_DESTINATION_SETS
+                and len(destination_options) > MAX_DESTINATION_SETS
+            )
+            if scope_limited:
+                sixth = destination_options[MAX_DESTINATION_SETS]
+                scope_limited = (
+                    purchase_total + sixth.missing_cards_total <= source.seller_receipt
+                )
+            destinations = tuple(selected)
+            totals = PlanTotals(
+                source_buyer_total=source.buyer_total,
+                steam_fee_total=source.steam_fee,
+                publisher_fee_total=source.publisher_fee,
+                seller_receipt_total=source.seller_receipt,
+                purchase_total=purchase_total,
+                unspent_swap_proceeds=source.seller_receipt - purchase_total,
+                foregone_craft_xp=foregone_craft_xp,
+                funded_craft_xp=funded_craft_xp,
+                xp_advantage=xp_advantage,
+                destination_count=len(destinations),
+                scope_limited=scope_limited,
+            )
+            all_quote_times = [row.quote_timestamp for row in source.rows] + [
+                row.quote_timestamp
+                for destination in destinations
+                for row in destination.rows
+            ]
+            oldest_quote_age = max(current - value for value in all_quote_times)
+            candidates.append(
+                _SourceCandidate(
+                    source=source,
+                    destinations=destinations,
+                    totals=totals,
+                    oldest_quote=oldest_quote_age,
+                    card_actions=1 + sum(len(value.rows) for value in destinations),
+                )
+            )
 
     if not candidates:
-        reason = "no_complete_sellable_set" if not saw_source else "no_positive_xp_swap"
+        reason = "no_positive_xp_swap" if saw_source else "no_sellable_card"
         return LevelUpOptimizationResponse(
             status="no_opportunity",
             reason=reason,
@@ -859,13 +879,16 @@ def optimize_level_up(
         candidates,
         key=lambda value: (
             -value.totals.xp_advantage,
+            -value.totals.funded_craft_xp,
             -value.totals.unspent_swap_proceeds,
             value.oldest_quote,
             value.card_actions,
             value.source.app_id,
+            value.source.rows[0].market_hash_name,
+            tuple(destination.app_id for destination in value.destinations),
         ),
     )
-    player = _player_projection(normalized_badges, best.totals.swap_path_xp)
+    player = _player_projection(badges, best.totals.funded_craft_xp)
     valid_until = min(
         inventory_time + timedelta(seconds=inventory_window),
         catalog_value.generated_at + timedelta(seconds=quote_window),
@@ -903,42 +926,55 @@ def optimize_level_up(
     )
 
 
-def _source_rows(
+def _craftable_count(
     source_set: CatalogSet,
+    holdings: Mapping[str, Holding],
+    badge_level: int,
+    *,
+    sold_hash: str | None = None,
+) -> int:
+    if badge_level >= 5:
+        return 0
+    minimum_owned: int | None = None
+    for card in source_set.cards:
+        holding = holdings.get(card.market_hash_name)
+        owned_quantity = holding.owned_quantity if holding is not None else 0
+        if card.market_hash_name == sold_hash:
+            owned_quantity = max(0, owned_quantity - 1)
+        if minimum_owned is None or owned_quantity < minimum_owned:
+            minimum_owned = owned_quantity
+    return min(5 - badge_level, minimum_owned or 0)
+
+
+def _source_rows(
+    source_card: CatalogCard,
     holdings: Mapping[str, Holding],
     now: datetime,
     quote_window: int,
     contract: MarketFeeContract,
 ) -> tuple[SellRow, ...] | None:
-    rows: list[SellRow] = []
-    for card in source_set.cards:
-        holding = holdings.get(card.market_hash_name)
-        if (
-            holding is None
-            or holding.owned_quantity < 1
-            or holding.sellable_quantity < 1
-        ):
-            return None
-        quote = _side_quote(card, "buy", now, quote_window, contract)
-        if quote is None:
-            return None
-        fees = _source_fee_breakdown(quote.price_minor, contract)
-        if fees is None:
-            return None
-        rows.append(
-            SellRow(
-                market_hash_name=card.market_hash_name,
-                card_name=card.card_name,
-                quantity=1,
-                buyer_total=quote.price_minor,
-                steam_fee=fees[0],
-                publisher_fee=fees[1],
-                seller_receipt=fees[2],
-                top_bid_quantity=quote.quantity,
-                quote_timestamp=quote.timestamp,
-            )
-        )
-    return tuple(rows)
+    holding = holdings.get(source_card.market_hash_name)
+    if holding is None or holding.owned_quantity < 1 or holding.sellable_quantity < 1:
+        return None
+    quote = _side_quote(source_card, "buy", now, quote_window, contract)
+    if quote is None:
+        return None
+    fees = _source_fee_breakdown(quote.price_minor, contract)
+    if fees is None:
+        return None
+    return (
+        SellRow(
+            market_hash_name=source_card.market_hash_name,
+            card_name=source_card.card_name,
+            quantity=1,
+            buyer_total=quote.price_minor,
+            steam_fee=fees[0],
+            publisher_fee=fees[1],
+            seller_receipt=fees[2],
+            top_bid_quantity=quote.quantity,
+            quote_timestamp=quote.timestamp,
+        ),
+    )
 
 
 def _build_source_plan(
@@ -950,7 +986,7 @@ def _build_source_plan(
         app_id=source_set.app_id,
         game_name=source_set.game_name or "",
         badge_level=badge_level,
-        set_size=source_set.set_size or len(rows),
+        set_size=source_set.set_size or len(source_set.cards),
         rows=rows,
         buyer_total=sum(row.buyer_total for row in rows),
         steam_fee=sum(row.steam_fee for row in rows),
@@ -960,34 +996,32 @@ def _build_source_plan(
 
 
 def _destination_options(
-    source_set: CatalogSet,
+    sold_hash: str,
     sets: Sequence[CatalogSet],
     holdings: Mapping[str, Holding],
     badges: BadgeState,
     now: datetime,
     quote_window: int,
     contract: MarketFeeContract,
-    proceeds: int,
 ) -> tuple[DestinationPlan, ...]:
     options: list[DestinationPlan] = []
-    owned_games = {
-        parsed[0]
-        for market_hash_name in holdings
-        if (parsed := parse_normal_card_hash(market_hash_name)) is not None
-    }
     for destination_set in sets:
-        if destination_set.app_id == source_set.app_id:
-            continue
-        if destination_set.app_id in owned_games:
-            continue
-        if badges.level_for_game(destination_set.app_id) >= 5:
+        badge_level = badges.level_for_game(destination_set.app_id)
+        if badge_level >= 5:
             continue
         rows: list[BuyRow] = []
-        valid = True
+        owned_card_count = 0
         for card in destination_set.cards:
+            holding = holdings.get(card.market_hash_name)
+            owned_quantity = holding.owned_quantity if holding is not None else 0
+            if card.market_hash_name == sold_hash:
+                owned_quantity -= 1
+            if owned_quantity >= 1:
+                owned_card_count += 1
+                continue
             quote = _side_quote(card, "sell", now, quote_window, contract)
-            if quote is None:
-                valid = False
+            if quote is None or quote.quantity < 1:
+                rows = []
                 break
             rows.append(
                 BuyRow(
@@ -999,30 +1033,35 @@ def _destination_options(
                     quote_timestamp=quote.timestamp,
                 )
             )
-        if not valid:
+        if not rows:
+            # A fully owned destination is not a sale-funded craft.  A set
+            # whose first missing quote is invalid also has no usable option.
             continue
-        subtotal = sum(row.buyer_total for row in rows)
-        if subtotal > proceeds:
-            # A later option can be cheaper only if sorting says so; delaying
-            # the check until after sorting preserves deterministic behavior.
-            pass
+        set_size = destination_set.set_size or len(destination_set.cards)
+        if owned_card_count + len(rows) != set_size:
+            raise OptimizerInputError(
+                "optimizer_internal_error",
+                "destination ownership does not cover full catalog",
+            )
         options.append(
             DestinationPlan(
                 app_id=destination_set.app_id,
                 game_name=destination_set.game_name or "",
-                badge_level_before=badges.level_for_game(destination_set.app_id),
-                badge_level_after=badges.level_for_game(destination_set.app_id) + 1,
-                set_size=destination_set.set_size or len(rows),
+                badge_level_before=badge_level,
+                badge_level_after=badge_level + 1,
+                set_size=set_size,
+                owned_card_count=owned_card_count,
                 rows=tuple(rows),
-                set_subtotal=subtotal,
+                missing_cards_total=sum(row.buyer_total * row.quantity for row in rows),
             )
         )
     options.sort(
         key=lambda value: (
-            value.set_subtotal,
+            value.missing_cards_total,
             max(now - row.quote_timestamp for row in value.rows),
-            value.set_size,
+            len(value.rows),
             value.app_id,
+            tuple(row.market_hash_name for row in value.rows),
         )
     )
     return tuple(options)
@@ -1037,10 +1076,10 @@ def _select_destinations(
     for option in options:
         if len(selected) >= MAX_DESTINATION_SETS:
             break
-        if cumulative + option.set_subtotal > proceeds:
+        if cumulative + option.missing_cards_total > proceeds:
             break
         selected.append(option)
-        cumulative += option.set_subtotal
+        cumulative += option.missing_cards_total
     return tuple(selected)
 
 

@@ -52,7 +52,7 @@ export type LevelUpReason =
   | "price_generation_stale"
   | "quote_depth_unavailable"
   | "catalog_warming"
-  | "no_complete_sellable_set"
+  | "no_sellable_card"
   | "no_positive_xp_swap";
 
 export type LevelUpStatus =
@@ -115,8 +115,9 @@ export type LevelUpDestinationPlan = {
   badge_level_before: number;
   badge_level_after: number;
   set_size: number;
+  owned_card_count: number;
   rows: LevelUpBuyRow[];
-  set_subtotal: number;
+  missing_cards_total: number;
   craft_xp: 100;
 };
 
@@ -127,8 +128,8 @@ export type LevelUpTotals = {
   seller_receipt_total: number;
   purchase_total: number;
   unspent_swap_proceeds: number;
-  direct_craft_xp: 100;
-  swap_path_xp: number;
+  foregone_craft_xp: 0 | 100;
+  funded_craft_xp: number;
   xp_advantage: number;
   destination_count: number;
   scope_limited: boolean;
@@ -178,7 +179,7 @@ export type LevelUpReadyResponse = LevelUpResponseCommon & {
 
 export type LevelUpNoOpportunityResponse = LevelUpResponseCommon & {
   status: "no_opportunity";
-  reason: "no_complete_sellable_set" | "no_positive_xp_swap";
+  reason: "no_sellable_card" | "no_positive_xp_swap";
   valid_until: null;
   player: null;
   source: null;
@@ -527,25 +528,18 @@ function validateSource(value: unknown, generatedAt: number): value is LevelUpSo
     !hasExactKeys(value, ["app_id", "game_name", "badge_level", "set_size", "rows"]) ||
     !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
     !isNonEmptyText(value.game_name, 512) ||
-    !isSafeInteger(value.badge_level, 0, 4) ||
+    !isSafeInteger(value.badge_level, 0, 5) ||
     !isSafeInteger(value.set_size, MIN_SET_SIZE, MAX_SET_SIZE) ||
     !Array.isArray(value.rows) ||
-    value.rows.length !== value.set_size
+    value.rows.length !== 1
   ) {
     return false;
   }
-  const hashes = new Set<string>();
-  for (const row of value.rows) {
-    if (
-      !validateSellRow(row, generatedAt) ||
-      hashes.has(row.market_hash_name) ||
-      normalCardAppId(row.market_hash_name) !== value.app_id
-    ) {
-      return false;
-    }
-    hashes.add(row.market_hash_name);
-  }
-  return true;
+  const row = value.rows[0];
+  return (
+    validateSellRow(row, generatedAt) &&
+    normalCardAppId(row.market_hash_name) === value.app_id
+  );
 }
 
 function validateDestination(
@@ -560,8 +554,9 @@ function validateDestination(
       "badge_level_before",
       "badge_level_after",
       "set_size",
+      "owned_card_count",
       "rows",
-      "set_subtotal",
+      "missing_cards_total",
       "craft_xp"
     ]) ||
     !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
@@ -569,15 +564,18 @@ function validateDestination(
     !isSafeInteger(value.badge_level_before, 0, 4) ||
     value.badge_level_after !== value.badge_level_before + 1 ||
     !isSafeInteger(value.set_size, MIN_SET_SIZE, MAX_SET_SIZE) ||
+    !isSafeInteger(value.owned_card_count, 0, value.set_size - 1) ||
     !Array.isArray(value.rows) ||
-    value.rows.length !== value.set_size ||
-    !isSafeInteger(value.set_subtotal, 0, MAX_MINOR_AMOUNT) ||
+    value.rows.length < 1 ||
+    value.rows.length > value.set_size ||
+    value.rows.length + value.owned_card_count !== value.set_size ||
+    !isSafeInteger(value.missing_cards_total, 0, MAX_MINOR_AMOUNT) ||
     value.craft_xp !== 100
   ) {
     return false;
   }
   const hashes = new Set<string>();
-  let subtotal = 0;
+  let missingCardsTotal = 0;
   for (const row of value.rows) {
     if (
       !validateBuyRow(row, generatedAt) ||
@@ -587,12 +585,12 @@ function validateDestination(
       return false;
     }
     hashes.add(row.market_hash_name);
-    subtotal += row.buyer_total;
-    if (!Number.isSafeInteger(subtotal)) {
+    missingCardsTotal += row.buyer_total;
+    if (!Number.isSafeInteger(missingCardsTotal)) {
       return false;
     }
   }
-  return subtotal === value.set_subtotal;
+  return missingCardsTotal === value.missing_cards_total;
 }
 
 function validateTotals(
@@ -611,8 +609,8 @@ function validateTotals(
       "seller_receipt_total",
       "purchase_total",
       "unspent_swap_proceeds",
-      "direct_craft_xp",
-      "swap_path_xp",
+      "foregone_craft_xp",
+      "funded_craft_xp",
       "xp_advantage",
       "destination_count",
       "scope_limited"
@@ -625,9 +623,11 @@ function validateTotals(
   const steamFeeTotal = sumSafe(source.rows.map((row) => row.steam_fee));
   const publisherFeeTotal = sumSafe(source.rows.map((row) => row.publisher_fee));
   const sellerReceiptTotal = sumSafe(source.rows.map((row) => row.seller_receipt));
-  const purchaseTotal = sumSafe(destinations.map((destination) => destination.set_subtotal));
+  const purchaseTotal = sumSafe(
+    destinations.map((destination) => destination.missing_cards_total)
+  );
   const destinationCount = destinations.length;
-  const swapPathXp = destinationCount * 100;
+  const fundedCraftXp = destinationCount * 100;
   if (
     sourceBuyerTotal === null ||
     steamFeeTotal === null ||
@@ -648,10 +648,11 @@ function validateTotals(
     isSafeInteger(totals.steam_fee_total, 0, MAX_MINOR_AMOUNT) &&
     isSafeInteger(totals.publisher_fee_total, 0, MAX_MINOR_AMOUNT) &&
     isSafeInteger(totals.seller_receipt_total, 0, MAX_MINOR_AMOUNT) &&
-    isSafeInteger(totals.direct_craft_xp, 0, MAX_XP) &&
-    isSafeInteger(totals.swap_path_xp, 0, MAX_XP) &&
-    isSafeInteger(totals.xp_advantage, 0, MAX_XP) &&
-    isSafeInteger(totals.destination_count, 0, 5) &&
+    (totals.foregone_craft_xp === 0 || totals.foregone_craft_xp === 100) &&
+    (source.badge_level < 5 || totals.foregone_craft_xp === 0) &&
+    isSafeInteger(totals.funded_craft_xp, 100, 500) &&
+    isSafeInteger(totals.xp_advantage, 1, 500) &&
+    isSafeInteger(totals.destination_count, 1, 5) &&
     typeof totals.scope_limited === "boolean" &&
     Number.isSafeInteger(unspentAndPurchase) &&
     Number.isSafeInteger(xpDelta) &&
@@ -661,12 +662,12 @@ function validateTotals(
     totals.seller_receipt_total === sellerReceiptTotal &&
     totals.purchase_total === purchaseTotal &&
     unspentAndPurchase === totals.seller_receipt_total &&
-    totals.direct_craft_xp === 100 &&
-    totals.swap_path_xp === swapPathXp &&
-    totals.xp_advantage === totals.swap_path_xp - totals.direct_craft_xp &&
+    totals.funded_craft_xp === fundedCraftXp &&
+    totals.xp_advantage ===
+    totals.funded_craft_xp - totals.foregone_craft_xp &&
     totals.destination_count === destinationCount &&
     totals.scope_limited === scopeLimited &&
-    totals.swap_path_xp === xpDelta
+    totals.funded_craft_xp === xpDelta
   );
 }
 
@@ -679,7 +680,7 @@ function validateReadyPlan(
   if (
     !isRecord(value.source) ||
     !Array.isArray(value.destinations) ||
-    value.destinations.length < 2 ||
+    value.destinations.length < 1 ||
     value.destinations.length > 5 ||
     (scopeLimited && value.destinations.length !== 5)
   ) {
@@ -696,7 +697,13 @@ function validateReadyPlan(
   }
   const appIds = new Set<string>();
   for (const destination of value.destinations) {
-    if (appIds.has(destination.app_id) || destination.app_id === value.source.app_id) {
+    if (
+      appIds.has(destination.app_id) ||
+      (destination.app_id === value.source.app_id &&
+        (destination.badge_level_before !== value.source.badge_level ||
+          destination.game_name !== value.source.game_name ||
+          destination.set_size !== value.source.set_size))
+    ) {
       return false;
     }
     appIds.add(destination.app_id);
@@ -778,7 +785,7 @@ export function isLevelUpOptimizationResponse(
     }
     case "no_opportunity":
       return (
-        (response.reason === "no_complete_sellable_set" ||
+        (response.reason === "no_sellable_card" ||
           response.reason === "no_positive_xp_swap") &&
         response.catalog_pending_sets === 0 &&
         response.valid_until === null &&
