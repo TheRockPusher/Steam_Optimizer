@@ -11,8 +11,10 @@ import {
   LevelUpOptimizationPanel
 } from "./LevelUpOptimizationPanel";
 import {
+  isLevelUpIsoTimestamp,
   levelForXp,
-  minimumXpForLevel
+  minimumXpForLevel,
+  type LevelUpNormalBadgeLevel
 } from "./levelUpOptimization";
 import {
   clearInventoryCache,
@@ -35,6 +37,8 @@ type BadgeCheck = {
   message: string;
   player_xp: number | null;
   player_level: number | null;
+  checked_at: string | null;
+  normal_badge_levels: LevelUpNormalBadgeLevel[];
 };
 
 type PriceStatus = "complete" | "partial" | "unavailable";
@@ -247,6 +251,8 @@ const PRIVACY_POLICY_URL =
 const NON_ASCII_DECIMAL_PATTERN = /[^0-9]/;
 const MAX_BADGE_XP = 1_000_000_000_000;
 const MAX_BADGE_LEVEL = 100_000;
+const MAX_BADGE_APP_ID = 2_147_483_647;
+const MAX_NORMAL_BADGE_LEVEL_ROWS = 10_000;
 const MAX_LEVEL_UP_TARGET_LEVEL = 100_000;
 const MAX_RETRY_AFTER_SECONDS = 900;
 const MAX_DECIMAL_LENGTH = 16_384;
@@ -431,12 +437,21 @@ function isBadgeCheck(value: unknown): value is BadgeCheck {
   }
 
   const check = value as Partial<BadgeCheck>;
-  if (typeof check.message !== "string") {
+  if (
+    typeof check.message !== "string" ||
+    !Array.isArray(check.normal_badge_levels) ||
+    check.normal_badge_levels.length > MAX_NORMAL_BADGE_LEVEL_ROWS
+  ) {
     return false;
   }
 
   if (check.status === "unavailable") {
-    return check.player_xp === null && check.player_level === null;
+    return (
+      check.player_xp === null &&
+      check.player_level === null &&
+      check.checked_at === null &&
+      check.normal_badge_levels.length === 0
+    );
   }
 
   if (
@@ -444,9 +459,29 @@ function isBadgeCheck(value: unknown): value is BadgeCheck {
     !isSafeInteger(check.player_xp, 0) ||
     check.player_xp > MAX_BADGE_XP ||
     !isSafeInteger(check.player_level, 0) ||
-    check.player_level > MAX_BADGE_LEVEL
+    check.player_level > MAX_BADGE_LEVEL ||
+    !isLevelUpIsoTimestamp(check.checked_at)
   ) {
     return false;
+  }
+
+  let previousAppId = 0;
+  for (const badge of check.normal_badge_levels) {
+    if (
+      typeof badge !== "object" ||
+      badge === null ||
+      Object.keys(badge).length !== 2 ||
+      !Object.prototype.hasOwnProperty.call(badge, "app_id") ||
+      !Object.prototype.hasOwnProperty.call(badge, "level") ||
+      !isSafeInteger(badge.app_id, 1) ||
+      badge.app_id > MAX_BADGE_APP_ID ||
+      !isSafeInteger(badge.level, 0) ||
+      badge.level > 5 ||
+      badge.app_id <= previousAppId
+    ) {
+      return false;
+    }
+    previousAppId = badge.app_id;
   }
 
   return levelForXp(check.player_xp) === check.player_level;
@@ -2839,6 +2874,7 @@ function InventoryResults({
   isRefreshingGems,
   refreshMessage,
   onRefreshInventory,
+  onRefreshBadges,
   onGemCashBasisChange,
   onRefreshGems
 }: {
@@ -2852,6 +2888,7 @@ function InventoryResults({
   isRefreshingGems: boolean;
   refreshMessage: string | null;
   onRefreshInventory: () => void;
+  onRefreshBadges: () => void;
   onGemCashBasisChange: (basis: GemCashBasis) => void;
   onRefreshGems: () => void;
 }) {
@@ -3029,14 +3066,17 @@ function InventoryResults({
           badges={badges}
         />
         <LevelUpOptimizationPanel
-          key={`level-up-optimizer-${steamId}-${badges.status}-${badges.player_xp ?? "missing"}-${badges.player_level ?? "missing"}`}
+          key={`level-up-optimizer-${steamId}-${badges.status}-${badges.checked_at ?? "missing"}`}
           steamId={steamId}
           inventoryStatus={inventory?.status ?? "unavailable"}
           items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
+          boosters={inventory?.boosters ?? []}
+          badges={badges}
           inventoryRefreshedAt={inventoryRefreshedAt}
           isInventoryLoading={isInventoryLoading}
           isActive={activeResultView === "level-up"}
           onRefreshInventory={onRefreshInventory}
+          onRefreshBadges={onRefreshBadges}
         />
       </div>
     </section>
@@ -3210,6 +3250,7 @@ function SignedInView({
   inventoryActionMessage,
   gemRefreshMessage,
   onRefreshInventory,
+  onRefreshBadges,
   onRefreshGems
 }: {
   session: SignedInSession;
@@ -3222,6 +3263,7 @@ function SignedInView({
   inventoryActionMessage: string | null;
   gemRefreshMessage: string | null;
   onRefreshInventory: () => void;
+  onRefreshBadges: () => void;
   onRefreshGems: () => void;
 }) {
   const [gemCashBasis, setGemCashBasis] =
@@ -3299,6 +3341,7 @@ function SignedInView({
         isRefreshingGems={isRefreshingGems}
         refreshMessage={gemRefreshMessage}
         onRefreshInventory={onRefreshInventory}
+        onRefreshBadges={onRefreshBadges}
         onGemCashBasisChange={setGemCashBasis}
         onRefreshGems={onRefreshGems}
       />
@@ -4089,6 +4132,7 @@ function HomePage() {
             inventoryActionMessage={inventoryActionMessage}
             gemRefreshMessage={gemRefreshMessage}
             onRefreshInventory={() => void handleInventoryRefresh()}
+            onRefreshBadges={() => void handleRecheck()}
             onRefreshGems={() => void handleGemRefresh()}
           />
         )}

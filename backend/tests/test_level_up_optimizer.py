@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -33,6 +34,10 @@ from app.market_fees import (
 from app.market_fees import (
     seller_receipt_from_buyer_total as real_seller_receipt_from_buyer_total,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
 
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
 
@@ -138,13 +143,11 @@ def game(
     )
 
 
-def catalog(*sets: CatalogSet, complete: bool = True) -> ResolvedCatalog:
+def catalog(*sets: CatalogSet) -> ResolvedCatalog:
     return ResolvedCatalog(
         generation=1,
         generated_at=NOW,
         sets=sets,
-        complete=complete,
-        pending_app_ids=() if complete else (999,),
     )
 
 
@@ -323,6 +326,69 @@ def test_real_fee_contract_inverts_each_source_card_and_budgets_on_receipt(
     assert result.destinations[0].missing_cards_total == 10
 
 
+def test_high_value_fee_threshold_compares_net_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(optimizer, "_decimal_to_minor", real_decimal_to_minor)
+    monkeypatch.setattr(
+        optimizer,
+        "_seller_receipt_from_buyer_total",
+        real_seller_receipt_from_buyer_total,
+    )
+    monkeypatch.setattr(optimizer, "_calculate_item_fees", real_calculate_item_fees)
+    source = game(440, buy="0.15")
+    destination = game(441, sell="0.14")
+    holdings = holdings_for_cards(source.cards[0]) + holdings_for_cards(
+        *destination.cards[:4],
+        sellable_quantity=0,
+    )
+
+    rejected = run_optimizer(catalog(source, destination), holdings)
+    assert rejected.status == "no_opportunity"
+    assert rejected.reason == "no_positive_xp_swap"
+
+    accepted_source = game(442, buy="0.16")
+    accepted = run_optimizer(
+        catalog(accepted_source, destination),
+        holdings_for_cards(accepted_source.cards[0])
+        + holdings_for_cards(
+            *destination.cards[:4],
+            sellable_quantity=0,
+        ),
+    )
+    assert accepted.status == "ready"
+    assert accepted.destinations[0].app_id == 441
+    assert accepted.totals is not None
+    assert accepted.totals.seller_receipt_total == 14
+
+    expensive_destination = game(445, sell="0.20")
+    boundary_source = game(446, buy="0.23")
+    boundary = run_optimizer(
+        catalog(boundary_source, expensive_destination),
+        holdings_for_cards(boundary_source.cards[0])
+        + holdings_for_cards(
+            *expensive_destination.cards[:4],
+            sellable_quantity=0,
+        ),
+    )
+    assert boundary.status == "ready"
+    assert boundary.totals is not None
+    assert boundary.totals.seller_receipt_total == 20
+    assert boundary.totals.purchase_total == 20
+
+    skipped_source = game(447, buy="0.22")
+    skipped = run_optimizer(
+        catalog(skipped_source, expensive_destination),
+        holdings_for_cards(skipped_source.cards[0])
+        + holdings_for_cards(
+            *expensive_destination.cards[:4],
+            sellable_quantity=0,
+        ),
+    )
+    assert skipped.status == "no_opportunity"
+    assert skipped.reason == "no_sellable_card"
+
+
 def test_partial_destination_buys_only_missing_hashes() -> None:
     source = game(440, buy="2.00")
     destination_cards = tuple(
@@ -364,6 +430,24 @@ def test_same_app_destination_uses_effective_post_sale_holdings() -> None:
     }
     assert source.cards[0].market_hash_name in {
         row.market_hash_name for row in result.destinations[0].rows
+    }
+
+
+def test_same_app_sole_copy_can_create_latent_fully_owned_destination() -> None:
+    source = game(440, buy="10.00", sell="0.10")
+    external = game(441, sell="0.10")
+    result = run_optimizer(
+        catalog(source, external),
+        holdings_for(source),
+        badges((440, 0)),
+    )
+
+    assert result.status == "ready"
+    assert [destination.app_id for destination in result.destinations] == [440, 441]
+    same_app = result.destinations[0]
+    assert same_app.owned_card_count == 4
+    assert source.cards[0].market_hash_name in {
+        row.market_hash_name for row in same_app.rows
     }
 
 
@@ -431,6 +515,45 @@ def test_incomplete_and_maxed_sources_have_zero_foregone_craft_xp() -> None:
     assert maxed.totals is not None
     assert maxed.totals.foregone_craft_xp == 0
     assert maxed.totals.funded_craft_xp == 100
+
+
+def test_destination_options_are_built_once_for_many_sellable_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = game(440, buy="3.00")
+    destinations = tuple(game(app_id, sell="0.10") for app_id in range(441, 445))
+    calls = 0
+    original = optimizer._destination_options
+
+    def counted(
+        sets: Sequence[CatalogSet],
+        holdings: Mapping[str, Holding],
+        badges: BadgeState,
+        now: datetime,
+        quote_window: int,
+        contract: MarketFeeContract,
+        sell_quotes: Mapping[str, optimizer._SideQuote | None] | None = None,
+    ) -> tuple[optimizer.DestinationPlan, ...]:
+        nonlocal calls
+        calls += 1
+        return original(
+            sets,
+            holdings,
+            badges,
+            now,
+            quote_window,
+            contract,
+            sell_quotes,
+        )
+
+    monkeypatch.setattr(optimizer, "_destination_options", counted)
+    result = run_optimizer(
+        catalog(source, *destinations),
+        holdings_for_cards(*source.cards, owned_quantity=2),
+    )
+
+    assert result.status == "ready"
+    assert calls == 1
 
 
 def test_maxed_destinations_are_excluded_and_level_four_advances_to_five() -> None:
@@ -560,6 +683,9 @@ def test_serialization_uses_final_singular_and_missing_card_fields() -> None:
     assert "funded_craft_xp" in totals_payload
     assert "direct_craft_xp" not in totals_payload
     assert "swap_path_xp" not in totals_payload
+    assert "catalog_total_sets" not in payload
+    assert "catalog_resolved_sets" not in payload
+    assert "catalog_pending_sets" not in payload
 
 
 @pytest.mark.parametrize(
@@ -585,11 +711,10 @@ def test_stale_generation_and_inventory_are_input_errors(
     assert error.value.reason == reason
 
 
-def test_unresolved_catalog_is_warming_not_no_opportunity() -> None:
-    unresolved = CatalogSet(440, None, (), set_size=5, resolved=False)
-    result = run_optimizer(catalog(unresolved, complete=False), ())
-    assert result.status == "warming"
-    assert result.reason == "catalog_warming"
+def test_empty_catalog_is_no_opportunity() -> None:
+    result = run_optimizer(catalog(), ())
+    assert result.status == "no_opportunity"
+    assert result.reason == "no_sellable_card"
 
 
 def test_duplicate_holdings_and_invalid_badges_fail_closed() -> None:

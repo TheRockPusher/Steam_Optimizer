@@ -46,21 +46,25 @@ class LifecycleGateway:
 
     async def check_level_up(
         self,
-        steam_id: str,
         holdings: object,
+        game_metadata: object,
+        badge_state: object,
         inventory_refreshed_at: object,
+        badge_refreshed_at: object,
         *,
         now: object = None,
     ) -> LevelUpOptimizationResponse:
-        del steam_id, holdings, inventory_refreshed_at, now
+        del holdings
+        del game_metadata
+        del badge_state
+        del inventory_refreshed_at
+        del badge_refreshed_at
+        del now
         return LevelUpOptimizationResponse(
             status="unavailable",
             reason="badge_data_unavailable",
             generated_at=datetime.now(UTC),
             inventory_refreshed_at=datetime.now(UTC),
-            catalog_total_sets=0,
-            catalog_resolved_sets=0,
-            catalog_pending_sets=0,
         )
 
     async def refresh_gems(

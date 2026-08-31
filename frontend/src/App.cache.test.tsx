@@ -31,6 +31,7 @@ vi.mock("./inventoryCache", () => cacheMocks);
 import { App } from "./App";
 
 const steamId = "76561198000000001";
+const badgeCheckedAt = new Date().toISOString();
 const signedInSession = {
   authenticated: true,
   user: {
@@ -47,7 +48,9 @@ const signedInSession = {
       status: "public",
       message: "Steam badge data is available.",
       player_xp: 1250,
-      player_level: 11
+      player_level: 11,
+      checked_at: badgeCheckedAt,
+      normal_badge_levels: []
     }
   }
 };

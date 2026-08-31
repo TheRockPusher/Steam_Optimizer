@@ -126,6 +126,20 @@ class FakeHTTPClient:
         yield self.stream_response
 
 
+STEAM_MARKET_LIVE_NO_TAGS_PAYLOAD: dict[str, object] = {
+    "success": True,
+    "total_count": 7,
+    "results": [
+        {
+            "asset_description": {
+                "appid": "123",
+                "type": "Democracy 3 Trading Card",
+            }
+        }
+    ],
+}
+
+
 def settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "environment": "development",
@@ -442,7 +456,14 @@ def test_transient_metadata_failure_remains_pending_and_retries(
         assert second.pending_count == 1
         await service.wait_until_idle()
         assert provider.calls == ["123", "123"]
-        assert service.read_metadata_state(("123",)).pending_app_ids == ("123",)
+        assert (
+            service.read_cached(
+                ("123",),
+                require_game_name=True,
+                require_fresh=True,
+            ).pending_count
+            == 1
+        )
         await service.stop()
 
     run(exercise())
@@ -554,6 +575,56 @@ def test_provider_returns_validated_game_tag_name_without_changing_count() -> No
     result = run(provider.lookup("123"))
 
     assert result == BoosterLookup(card_set_size=7, game_name="Example Game")
+
+
+def test_provider_derives_game_name_from_live_market_type_without_tags() -> None:
+    client = FakeHTTPClient([FakeResponse(200, STEAM_MARKET_LIVE_NO_TAGS_PAYLOAD)])
+    provider = SteamCommunityBoosterProvider(settings(), http_client=client)
+
+    result = run(provider.lookup("123"))
+
+    assert result == BoosterLookup(card_set_size=7, game_name="Democracy 3")
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        [
+            {"asset_description": {"type": "Democracy 3 Trading Card"}},
+            {"asset_description": {"type": "Another Game Trading Card"}},
+        ],
+        [
+            {
+                "asset_description": {
+                    "tags": [
+                        {
+                            "category": "Game",
+                            "internal_name": "app_123",
+                            "localized_tag_name": "Example Game",
+                        }
+                    ],
+                    "type": "Democracy 3 Trading Card",
+                }
+            }
+        ],
+    ],
+)
+def test_provider_rejects_ambiguous_or_inconsistent_game_names(
+    results: list[dict[str, object]],
+) -> None:
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                {"success": True, "total_count": 7, "results": results},
+            )
+        ]
+    )
+    provider = SteamCommunityBoosterProvider(settings(), http_client=client)
+
+    result = run(provider.lookup("123"))
+
+    assert result == BoosterLookup(card_set_size=7)
 
 
 def test_count_only_booster_lookup_and_cache_remain_valid_without_game_name(

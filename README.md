@@ -64,9 +64,9 @@ The current connection, inventory, and read-only recommendation stage provides:
 
 - Browser-based Steam OpenID 2.0 authentication.
 - An application-owned, signed, HTTP-only session.
-- A concurrent server session check: `GET /api/auth/session` checks profile visibility and
-  validated current badge XP/level without requesting inventory. Either check can be unavailable
-  without invalidating the authenticated session.
+- A concurrent server session check: `GET /api/auth/session` checks profile visibility and returns
+  a validated badge snapshot (XP, level, `checked_at`, and normal badge levels) without requesting
+  inventory. Either check can be unavailable without invalidating the authenticated session.
 - Inventory is requested once on an authenticated client cache miss (including an account-change
   or invalid-schema miss) or when the user explicitly selects **Refresh inventory**. Session
   rechecks do not request inventory. Each request names the expected SteamID64, which the backend
@@ -94,28 +94,35 @@ The current connection, inventory, and read-only recommendation stage provides:
   Inventory starts with quantity-aware highest-buy and lowest-sell totals, reports independent
   quote coverage for each side, and keeps sortable, paginated item data, booster details, optional
   game grouping, selectable gem cash valuation, and the worth-more-as-gems filter together.
-- During authenticated session loading, the backend checks profile visibility and reads one
-  bounded SteamApis badge response concurrently. It exposes only validated current XP and level
-  under `checks.badges`; failures remain an explicit unavailable badge state and do not prevent
-  profile, inventory-cache, or inventory loading. Badge XP and level remain in React memory and
-  are not written to IndexedDB, `localStorage`, cookies, or a server-side user cache.
+- During authenticated session loading, the backend checks profile visibility and reads one bounded
+  SteamApis badge response concurrently. It exposes a validated badge snapshot under
+  `checks.badges`: current XP and level, `checked_at`, and bounded normal badge levels. Failures
+  remain an explicit unavailable badge state and do not prevent profile, inventory-cache, or
+  inventory loading. The snapshot remains in React memory and is not written to IndexedDB,
+  `localStorage`, cookies, or a server-side user cache.
 - The **Level-up** page shows current total XP and level immediately, accepts a target level, and
   calculates the exact XP threshold delta plus the number of 100-XP badge crafts required. Its
   fee-aware card-sale optimizer remains read-only and does not request anything until the user
   opens this page. It requires a public inventory and an eligible ownership timestamp; otherwise
   it shows the existing recovery or **Refresh inventory** state.
-- On optimizer activation, the frontend aggregates only normal trading-card rows from the current
-  IndexedDB inventory record into a bounded transient snapshot: exact `market_hash_name`,
-  `owned_quantity`, `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that
-  snapshot to `POST /api/auth/level-up` with the signed session and matching
-  `x-expected-steam-id` header. The endpoint never calls the inventory provider, logs holdings, or
-  stores the submitted snapshot.
-- The optimizer derives normal-card AppIDs from the complete normalized market catalog, evaluates
-  every held sellable normal card as a one-copy source candidate, and reads at most one bounded
-  SteamApis badges response for the signed SteamID64. Badge levels determine whether a destination
-  can still be crafted and how much immediately craftable XP a proposed sale would forgo. Foil,
-  non-game, unrelated event, and collection records are excluded. Catalog-scoped badge levels are
-  neither persisted nor exposed to the browser.
+- On optimizer activation, `LevelUpOptimizationPanel` reuses already-loaded inventory items, game
+  metadata, badges, and boosters. It joins every normal-card AppID to its inventory game name and
+  card-set size and to the in-memory session badge snapshot in linear maps, including games that
+  have no sellable source card. The bounded request includes `inventory_refreshed_at`,
+  `badge_refreshed_at`, validated player XP/level, all normal-card `games`, and exact card
+  hashes and quantities. `sellable_quantity` follows `marketable`; `tradable` is unrelated to
+  Steam Market eligibility. The endpoint never calls the inventory or badge providers, never
+  resolves booster/card-set metadata, never logs holdings, or stores the submitted snapshot.
+- Planning reads the current cached catalog generation synchronously and never waits for SteamApis'
+  bulk catalog download. A missing or stale generation queues one shared background refresh and
+  immediately returns a non-actionable `price_generation_unavailable` or
+  `price_generation_stale` response; the next request can use the completed generation.
+- The optimizer validates the submitted game IDs against normal-card hashes and reads the price
+  catalog only for those AppIDs through the `(generation, normal_card_app_id)` index; unrelated
+  catalog groups are not loaded. It evaluates every held sellable normal card as a one-copy
+  source candidate, including cards from maxed badges, while destinations remain below normal
+  badge level five. Foil, non-game, unrelated event, and collection records are excluded. The
+  validated session badge snapshot remains the sole badge-state input for the recommendation.
 - A complete `ready` response is one deterministic, fully funded advisory plan: sell one selected
   normal card into its current highest bid, reuse destination cards still owned after that sale,
   buy only the missing cards for up to five non-maxed normal badges at current lowest asks, and
@@ -123,11 +130,18 @@ The current connection, inventory, and read-only recommendation stage provides:
   includes exact card rows, top-of-book depth and quote times, per-item Steam and publisher fees,
   estimated seller receipt, missing-card purchase totals, unspent proceeds, and player/level
   projections.
-- Plans remain in React memory only while the account and ownership snapshot are unchanged. They
-  are never written to IndexedDB, `localStorage`, cookies, or a server-side user cache. Account
-  changes, logout, inventory refresh, and component unmount invalidate or discard the in-memory
-  plan; quote expiry downgrades any retained rows to an expired, non-actionable state until the
-  user refreshes the recommendation.
+- Destination options are constructed once and sorted once by `(cost, oldest quote age, missing
+  row count, app_id, row hashes)`. The source rows are scanned once; each source considers the
+  first at most six candidates (five outputs plus a scope sentinel), adjusts only its same-game
+  option when selling the sole copy, and derives the minimum required crafts as
+  `foregone_craft_xp / 100 + 1`. It compares the exact seller receipt with the cumulative
+  threshold and funds the maximum prefix of five, never comparing a gross bid directly with a
+  purchase subtotal.
+- Plans remain in React memory only while the account, inventory snapshot, and badge snapshot are
+  unchanged. They are never written to IndexedDB, `localStorage`, cookies, or a server-side user
+  cache. Account changes, logout, inventory refresh, session badge changes, and component unmount
+  invalidate or discard the in-memory plan; quote expiry downgrades any retained rows to an expired,
+  non-actionable state until the user refreshes the recommendation.
 - Every Steam Market and gamecards link is fixed to the Steam Community origin and is ordinary
   manual navigation. The application does not accept provider-supplied URLs and never lists,
   orders, buys, sells, trades, or crafts on the user's behalf. Steam's live confirmation remains
@@ -138,14 +152,16 @@ price snapshots depend on provider data and may differ from Steam Community at a
 inventory display generation is fresh for 24 hours, refreshes lazily, and can use the last valid
 generation as a stale fallback when a refresh fails. The optimizer has a stricter, independent
 freshness contract: quote data must be within `LEVEL_UP_MAX_QUOTE_AGE_SECONDS` (the example is
-900 seconds) and the submitted inventory snapshot must be within
-`LEVEL_UP_MAX_INVENTORY_AGE_SECONDS` (the example is 3600 seconds). It never uses the 24-hour
-stale fallback to produce a recommendation. Global stale generations and unresolved relevant set
-metadata produce unavailable or warming states rather than partial plans. A missing, stale, or
-depthless candidate quote excludes that card or destination; valid inputs with no fully quoted
+900 seconds), the submitted inventory snapshot must be within
+`LEVEL_UP_MAX_INVENTORY_AGE_SECONDS` (the example is 3600 seconds), and the session badge snapshot
+must be no older than the configured inventory freshness window. It never uses the 24-hour stale
+fallback to produce a recommendation. Missing submitted game metadata produces an unavailable
+result. Missing, inconsistent, stale, or depthless scoped catalog candidates are excluded; if no
+complete candidate remains, the result is `no_sellable_card`. Valid inputs with no fully quoted
 positive route return an explicit no-opportunity reason. The UI distinguishes `complete`,
-`partial`, and `unavailable` inventory price coverage; those display states do not make
-provider-denominated decimals monetary values.
+`partial`, and `unavailable`
+inventory price coverage; those display states do not make provider-denominated decimals monetary
+values.
 The raw provider feed is streamed and discarded after normalization. A generation becomes
 optimizer-eligible only when its AppID 753 metadata declares an item count exactly equal to the
 number of completely parsed item rows; mismatched or missing completeness metadata preserves the
@@ -156,16 +172,21 @@ configuration uses USD with two minor digits, the `buyer_total` price basis, a 5
 10% publisher fee, and a one-cent minimum for each per-item fee component. Settings validate the
 contract as one atomic group: clearing a field disables recommendations, while an invalid complete
 group prevents startup. Operators must review and replace every monetary value together.
-Each item is converted exactly to integer minor units, and fees are calculated per item under the
-returned contract, with taxes, holds, and an existing wallet balance excluded.
+Each price is converted exactly to integer minor units before arithmetic, and fees are calculated
+per item under the returned contract. The sale is inverted to an exact seller receipt; source rows
+must exactly invert the quoted buyer total, and fee gaps reject the candidate. The receipt, not the
+buyer's gross bid, funds missing-card purchases. Any gross comparison is derived with
+`calculate_item_fees(required_receipt, contract)`, never by comparing gross directly with a
+purchase subtotal. Taxes, holds, and an existing wallet balance are excluded.
 
-Known unavailable and warming states are explicit: `currency_contract_missing`,
-`steamapi_key_missing`, `badge_data_unavailable`, `inventory_snapshot_too_old`,
-`price_generation_unavailable`, `price_generation_stale`, `quote_depth_unavailable`, and
-`catalog_warming`. Valid inputs with no sellable card carrying a usable current bid return
-`no_sellable_card`; evaluated cards with no strictly better funded badge route return
-`no_positive_xp_swap`. They do not render a zero-valued recommendation. No response is treated as
-actionable when any contract, identity, badge, catalog, or global freshness gate is unresolved.
+Known unavailable states are explicit: `currency_contract_missing`, `steamapi_key_missing`,
+`badge_data_unavailable`, `inventory_snapshot_too_old`, `price_generation_unavailable`,
+`price_generation_stale`, and `quote_depth_unavailable`. Missing or stale submitted game metadata
+and scoped catalog data also fail closed as unavailable. Valid inputs with no sellable card
+carrying a usable current bid return `no_sellable_card`; evaluated cards with no strictly better
+funded badge route return `no_positive_xp_swap`. They do not render a zero-valued recommendation.
+No response is treated as actionable when any contract, identity, badge, catalog, or global
+freshness gate is unresolved.
 
 The browser inventory cache and server market cache have separate retention boundaries. Ordinary
 browser sessions reuse valid matching public/private records until logout, account change,
@@ -320,16 +341,16 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 - Non-free components: Steam is a proprietary external service; no non-free component is bundled
   in this repository.
 - Centralized services and terms: authentication uses Steam Community/OpenID. Inventory retrieval,
-  authenticated badge-state reads, and lazy global AppID 753 market-price refreshes use the
+  authenticated session badge checks, and lazy global AppID 753 market-price refreshes use the
   third-party SteamApis v2 provider. Profile visibility uses Valve's documented
   [Steam Web API](https://steamcommunity.com/dev) when `STEAM_WEB_API_KEY` is configured.
   `STEAMAPI_KEY` and `STEAM_WEB_API_KEY` are server-only; neither credential is sent to the
   browser or persisted in caches. Each authenticated call to the session endpoint, including a
   reload or explicit recheck, reads one bounded SteamApis badges response for the signed SteamID64
-  and returns only validated current XP and level. Opening the
-  Level-up optimizer may make one additional bounded read for catalog-scoped normal badge levels;
-  those levels and the raw provider response are discarded after calculation. Foil, non-game, and
-  unrelated records never become optimizer inputs.
+  and returns validated current XP and level, `checked_at`, and bounded normal badge levels.
+  Opening the Level-up optimizer reuses that in-memory session badge snapshot and does not contact
+  the badge provider during planning. Foil, non-game, and unrelated records never become optimizer
+  inputs.
 - Provider caveat: SteamApis response availability, fields, pagination, price snapshots, and
   top-of-book depth are provider/data-source facts rather than Valve guarantees. Price coverage is
   `complete` when all priceable rows are priced, `partial` when some but not all priceable rows are
@@ -342,12 +363,14 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   ordinary order-book values remain exact provider-denominated decimals and display without a
   currency symbol. The optimizer is enabled only by a complete, verified `LEVEL_UP_*` contract
   with an uppercase currency code, integer minor digits, the exact `buyer_total` basis, fee rates,
-  per-item minimum, and freshness windows. It converts prices exactly to integer minor units and
-  applies fees per item. An absent or cleared contract member fails closed as
-  `currency_contract_missing`; an invalid complete group prevents backend startup. Missing badge
-  data, stale/unavailable price generations, missing quote depth, old ownership snapshots, and
-  unresolved catalog metadata likewise return explicit unavailable or warming states, never a
-  partial plan.
+  per-item minimum, and freshness windows. It converts prices exactly to integer minor units,
+  calculates each fee per item, and inverts the sale quote to an exact seller receipt. Missing-card
+  purchases are funded from that receipt, not the buyer's gross bid; a gross comparison is derived
+  with `calculate_item_fees(required_receipt, contract)`. An absent or cleared contract member
+  fails closed as `currency_contract_missing`; an invalid complete group prevents backend startup.
+  Missing badge data, stale/unavailable price generations, missing quote depth, old ownership
+  snapshots, or unresolved submitted game/catalog data likewise return explicit unavailable
+  states, never a partial plan.
 - Deployment caveat: both Railway services run in exact EU-West region `europe-west4-drams3a`. The
   level-up endpoint runs inside the existing backend service; it adds no service, process,
   scheduler, region, or volume. The backend attaches the `backend-data` volume at `/data` and
@@ -369,10 +392,10 @@ was last updated on 2026-08-30.
   receives the verified SteamID64. The signed, HTTP-only session cookie contains that identifier
   on the user's device for up to 24 hours by default; it is sent to the Railway-hosted backend for
   authenticated requests and cleared by logout or expiry. The session endpoint checks profile
-  visibility and current badge XP/level concurrently; it does not request inventory. Only
-  validated XP and level are returned to React memory, and no badge data or inventory data is
-  placed in a cookie. Steam handles passwords and Steam Guard; Steam Optimizer never receives or
-  stores either.
+  visibility and the current badge snapshot concurrently; it does not request inventory. Only
+  validated XP, level, `checked_at`, and normal badge levels reach React memory, and no badge data
+  or inventory data is placed in a cookie. Steam handles passwords and Steam Guard; Steam Optimizer
+  never receives or stores either.
 - Inventory retention and refresh: after authentication, the client reads one current-user browser
   IndexedDB record keyed to SteamID64. A valid matching public/private record is rendered without
   an inventory API call. A missing, mismatched, corrupt, or incompatible-schema record triggers one
@@ -382,22 +405,26 @@ was last updated on 2026-08-30.
   records, and invalid schema data is removed. Transient `unavailable` responses are not persisted
   and do not overwrite a prior successful record. Inventory is not persisted server-side, in
   cookies, or in `localStorage`.
-- Level-up snapshot and plan handling: opening the manually activated tab aggregates only normal
-  trading-card ownership from that current IndexedDB record and submits a bounded transient
-  snapshot containing exact market hashes, owned/sellable quantities, and
-  `inventory_refreshed_at` to the authenticated `POST /api/auth/level-up` endpoint. The snapshot
-  is used only for that request: it is not logged, linked to a persistent server row, or stored by
-  the backend, and the endpoint never calls the inventory provider. The returned advisory plan is
-  held in React memory only while the account and snapshot remain unchanged; it is never written to
-  IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
+- Level-up snapshot and plan handling: opening the manually activated tab reuses the already-loaded
+  inventory items and game metadata plus the in-memory session badge snapshot. It aggregates every
+  normal-card game, not only sellable source games, and submits a bounded transient request
+  containing `inventory_refreshed_at`, `badge_refreshed_at`, validated player XP/level, game names,
+  card-set sizes, badge levels, and exact market hashes and quantities to the authenticated
+  `POST /api/auth/level-up` endpoint. The frontend joins these maps linearly; `sellable_quantity`
+  follows `marketable`, not `tradable`. The request is used only for that calculation: it is not
+  logged, linked to a persistent server row, or stored by the backend, and the endpoint never calls
+  the inventory or badge provider or resolves booster/card-set metadata. The returned advisory plan
+  is held in React memory only while the account and snapshot remain unchanged; it is never written
+  to IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
   inventory refresh, and unmount discard it. Quote expiry retains the rows only in React memory as
   non-actionable audit information until refresh or another lifecycle invalidation.
-- Badge-state handling: after finding at least one eligible normal-card catalog group, the backend
-  makes at most one bounded server-only SteamApis v2 `/v2/steam/users/{steamid}/badges` request for
-  the signed SteamID64. It reads player XP, player level, and normal badge records for catalog
-  AppIDs. Foil, non-game, and syntactically valid records outside the catalog are ignored. The
-  SteamApis API key and raw badge response remain server-side and are not persisted; only validated
-  badge-derived fields needed in the response can reach the browser.
+- Badge-state handling: the authenticated session check makes one bounded server-only SteamApis v2
+  `/v2/steam/users/{steamid}/badges` request for the signed SteamID64. It validates player XP,
+  player level, and bounded normal badge levels, then stamps the validated snapshot with
+  server-generated `checked_at`. The Level-up request carries that value as `badge_refreshed_at`;
+  the optimizer reuses the in-memory snapshot and performs no badge-provider call during planning.
+  Foil, non-game, and syntactically valid records outside the normal-card catalog are ignored. The
+  SteamApis API key and raw badge response remain server-side and are not persisted.
 - Market-price retention and provider freshness: market prices are a global AppID 753 generation,
   not user-specific inventory data. The backend stores normalized fields only in a separate SQLite
   cache, fresh for 24 hours for inventory display. It refreshes lazily when a request finds the
@@ -415,11 +442,13 @@ was last updated on 2026-08-30.
   without a currency symbol. The optimizer displays money only after the complete verified
   `LEVEL_UP_*` contract supplies the currency code, minor digits, exact `buyer_total` basis, fee
   rates, per-item minimum, and freshness windows. It converts values exactly to integer minor
-  units and applies fees per item. An absent or cleared contract member returns an unavailable
-  state; an invalid complete group prevents backend startup. Unverified badge data, prices, depth,
-  catalog metadata, or freshness return an explicit unavailable or warming state and no partial
-  plan. `estimated seller receipt` and `unspent swap proceeds` are estimates, not received funds;
-  taxes, holds, and the current wallet balance are excluded.
+  units, calculates fees per item, and uses the exact seller receipt as the purchase budget. Any
+  gross comparison is derived with `calculate_item_fees(required_receipt, contract)`, never by
+  comparing gross directly with a purchase subtotal. An absent or cleared contract member returns
+  an unavailable state; an invalid complete group prevents backend startup. Unverified badge data,
+  prices, depth, submitted game metadata, scoped catalog data, or freshness return an explicit
+  unavailable state and no partial plan. `estimated seller receipt` and `unspent swap proceeds`
+  are estimates, not received funds; taxes, holds, and the current wallet balance are excluded.
 - Manual Steam navigation: Market listing and gamecards links are constructed from fixed
   `steamcommunity.com` origins. They are ordinary navigation only; Steam Optimizer never lists,
   orders, buys, sells, trades, or crafts on the user's behalf, and it never accepts provider URLs.

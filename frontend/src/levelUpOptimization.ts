@@ -4,6 +4,7 @@ export const LEVEL_UP_OPTIMIZATION_URL = `${(
 export const STEAM_COMMUNITY_ORIGIN = "https://steamcommunity.com";
 export const MAX_LEVEL_UP_CARD_ROWS = 10_000;
 export const MAX_MARKET_HASH_NAME_LENGTH = 512;
+export const MAX_GAME_NAME_LENGTH = 8192;
 export const MAX_STEAM_ID_LENGTH = 20;
 export const MAX_APP_ID_LENGTH = 20;
 export const MAX_CARD_QUANTITY = 1_000_000;
@@ -11,9 +12,12 @@ export const MAX_SET_SIZE = 15;
 export const MIN_SET_SIZE = 5;
 export const MAX_LEVEL = 1_000_000;
 export const MAX_XP = Number.MAX_SAFE_INTEGER;
-export const MAX_CATALOG_COUNT = 1_000_000;
+export const MAX_NORMAL_GAME_ROWS = 10_000;
+export const MAX_NORMAL_BADGE_LEVEL_ROWS = 10_000;
 export const MAX_MINOR_AMOUNT = Number.MAX_SAFE_INTEGER;
 export const LEVEL_UP_INVENTORY_MAX_AGE_MS = 60 * 60 * 1000;
+
+const MAX_BADGE_APP_ID = 2_147_483_647;
 
 const NORMAL_CARD_HASH_PATTERN = /^([1-9][0-9]*)-(.+) \(Trading Card\)$/;
 const POSITIVE_DECIMAL_ID_PATTERN = /^[1-9][0-9]*$/;
@@ -29,6 +33,35 @@ export type LevelUpInventoryItem = {
   /** Existing inventory responses carry this discriminator. */
   item_type?: string;
   icon_url?: string | null;
+  game_app_id?: string | null;
+  game_name?: string | null;
+};
+
+export type LevelUpBooster = {
+  game_app_id: string;
+  game_name: string | null;
+  card_set_size: number | null;
+};
+
+export type LevelUpNormalBadgeLevel = {
+  app_id: number;
+  level: number;
+};
+
+export type LevelUpBadgeSnapshot = {
+  status: "public" | "unavailable";
+  message: string;
+  player_xp: number | null;
+  player_level: number | null;
+  checked_at: string | null;
+  normal_badge_levels: readonly LevelUpNormalBadgeLevel[];
+};
+
+export type LevelUpGame = {
+  app_id: string;
+  game_name: string;
+  card_set_size: number | null;
+  badge_level: number;
 };
 
 export type LevelUpCardOwnership = {
@@ -39,6 +72,10 @@ export type LevelUpCardOwnership = {
 
 export type LevelUpOptimizationRequest = {
   inventory_refreshed_at: string;
+  badge_refreshed_at: string;
+  player_xp: number;
+  player_level: number;
+  games: LevelUpGame[];
   cards: LevelUpCardOwnership[];
 };
 
@@ -51,15 +88,14 @@ export type LevelUpReason =
   | "price_generation_unavailable"
   | "price_generation_stale"
   | "quote_depth_unavailable"
-  | "catalog_warming"
   | "no_sellable_card"
   | "no_positive_xp_swap";
 
 export type LevelUpStatus =
   | "ready"
   | "no_opportunity"
-  | "warming"
   | "unavailable";
+
 
 export type LevelUpMoneyMetadata = {
   currency_code: string;
@@ -141,9 +177,6 @@ type LevelUpResponseCommon = {
   reason: LevelUpReason | null;
   generated_at: string;
   inventory_refreshed_at: string;
-  catalog_total_sets: number;
-  catalog_resolved_sets: number;
-  catalog_pending_sets: number;
   currency_code: string | null;
   minor_digits: number | null;
   price_basis: "instant_top_of_book" | null;
@@ -187,15 +220,6 @@ export type LevelUpNoOpportunityResponse = LevelUpResponseCommon & {
   totals: null;
 };
 
-export type LevelUpWarmingResponse = LevelUpResponseCommon & {
-  status: "warming";
-  reason: "catalog_warming";
-  valid_until: null;
-  player: null;
-  source: null;
-  destinations: [];
-  totals: null;
-};
 
 export type LevelUpUnavailableResponse = LevelUpResponseCommon & {
   status: "unavailable";
@@ -208,7 +232,6 @@ export type LevelUpUnavailableResponse = LevelUpResponseCommon & {
   | "price_generation_stale"
   | "quote_depth_unavailable";
   valid_until: null;
-  player: null;
   source: null;
   destinations: [];
   totals: null;
@@ -217,7 +240,6 @@ export type LevelUpUnavailableResponse = LevelUpResponseCommon & {
 export type LevelUpOptimizationResponse =
   | LevelUpReadyResponse
   | LevelUpNoOpportunityResponse
-  | LevelUpWarmingResponse
   | LevelUpUnavailableResponse;
 
 
@@ -386,14 +408,6 @@ function isCurrencyCode(value: unknown): value is string {
   return typeof value === "string" && CURRENCY_CODE_PATTERN.test(value);
 }
 
-function validateCatalogCounts(value: Record<string, unknown>): boolean {
-  return (
-    isSafeInteger(value.catalog_total_sets, 0, MAX_CATALOG_COUNT) &&
-    isSafeInteger(value.catalog_resolved_sets, 0, MAX_CATALOG_COUNT) &&
-    isSafeInteger(value.catalog_pending_sets, 0, MAX_CATALOG_COUNT) &&
-    value.catalog_resolved_sets + value.catalog_pending_sets === value.catalog_total_sets
-  );
-}
 
 function validateMoneyFields(value: Record<string, unknown>): boolean {
   const fields = [
@@ -527,7 +541,7 @@ function validateSource(value: unknown, generatedAt: number): value is LevelUpSo
     !isRecord(value) ||
     !hasExactKeys(value, ["app_id", "game_name", "badge_level", "set_size", "rows"]) ||
     !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
-    !isNonEmptyText(value.game_name, 512) ||
+    !isNonEmptyText(value.game_name, MAX_GAME_NAME_LENGTH) ||
     !isSafeInteger(value.badge_level, 0, 5) ||
     !isSafeInteger(value.set_size, MIN_SET_SIZE, MAX_SET_SIZE) ||
     !Array.isArray(value.rows) ||
@@ -560,7 +574,7 @@ function validateDestination(
       "craft_xp"
     ]) ||
     !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
-    !isNonEmptyText(value.game_name, 512) ||
+    !isNonEmptyText(value.game_name, MAX_GAME_NAME_LENGTH) ||
     !isSafeInteger(value.badge_level_before, 0, 4) ||
     value.badge_level_after !== value.badge_level_before + 1 ||
     !isSafeInteger(value.set_size, MIN_SET_SIZE, MAX_SET_SIZE) ||
@@ -720,9 +734,6 @@ function validateCommon(value: Record<string, unknown>): boolean {
         "reason",
         "generated_at",
         "inventory_refreshed_at",
-        "catalog_total_sets",
-        "catalog_resolved_sets",
-        "catalog_pending_sets",
         "currency_code",
         "minor_digits",
         "price_basis",
@@ -742,7 +753,6 @@ function validateCommon(value: Record<string, unknown>): boolean {
     isIsoTimestamp(value.generated_at) &&
     isIsoTimestamp(value.inventory_refreshed_at) &&
     timestampMilliseconds(value.inventory_refreshed_at) <= timestampMilliseconds(value.generated_at) &&
-    validateCatalogCounts(value) &&
     validateMoneyFields(value) &&
     typeof value.scope_limited === "boolean" &&
     Array.isArray(value.destinations) &&
@@ -762,7 +772,6 @@ export function isLevelUpOptimizationResponse(
     case "ready": {
       if (
         response.reason !== "ready" ||
-        response.catalog_pending_sets !== 0 ||
         !isCurrencyCode(response.currency_code) ||
         !isSafeInteger(response.minor_digits, 0, 3) ||
         response.price_basis !== "instant_top_of_book" ||
@@ -787,24 +796,12 @@ export function isLevelUpOptimizationResponse(
       return (
         (response.reason === "no_sellable_card" ||
           response.reason === "no_positive_xp_swap") &&
-        response.catalog_pending_sets === 0 &&
         response.valid_until === null &&
         response.player === null &&
         response.source === null &&
         response.destinations.length === 0 &&
         response.totals === null &&
         response.scope_limited === false
-      );
-    case "warming":
-      return (
-        response.reason === "catalog_warming" &&
-        response.valid_until === null &&
-        response.player === null &&
-        response.source === null &&
-        response.destinations.length === 0 &&
-        response.totals === null &&
-        response.scope_limited === false &&
-        response.catalog_pending_sets > 0
       );
     case "unavailable":
       return (
@@ -837,6 +834,79 @@ export function assertLevelUpOptimizationResponse(
     throw new Error("The level-up optimization service returned an invalid response.");
   }
 }
+function responseMatchesRequest(
+  response: LevelUpOptimizationResponse,
+  request: LevelUpOptimizationRequest
+): boolean {
+  if (
+    timestampMilliseconds(response.inventory_refreshed_at) !==
+    timestampMilliseconds(request.inventory_refreshed_at)
+  ) {
+    return false;
+  }
+  if (response.status !== "ready") {
+    return true;
+  }
+  if (
+    response.player.current_xp !== request.player_xp ||
+    response.player.current_level !== request.player_level
+  ) {
+    return false;
+  }
+  const games = new Map(request.games.map((game) => [game.app_id, game]));
+  const sourceGame = games.get(response.source.app_id);
+  if (
+    sourceGame === undefined ||
+    response.source.game_name !== sourceGame.game_name ||
+    response.source.badge_level !== sourceGame.badge_level ||
+    (sourceGame.card_set_size !== null &&
+      response.source.set_size !== sourceGame.card_set_size)
+  ) {
+    return false;
+  }
+  const sourceRow = response.source.rows[0];
+  const sourceOwnership = request.cards.find(
+    (card) => card.market_hash_name === sourceRow.market_hash_name
+  );
+  if (sourceOwnership === undefined || sourceOwnership.sellable_quantity < 1) {
+    return false;
+  }
+  for (const destination of response.destinations) {
+    const game = games.get(destination.app_id);
+    if (
+      game === undefined ||
+      destination.game_name !== game.game_name ||
+      destination.badge_level_before !== game.badge_level ||
+      (game.card_set_size !== null &&
+        destination.set_size !== game.card_set_size)
+    ) {
+      return false;
+    }
+    const missingHashes = new Set(
+      destination.rows.map((row) => row.market_hash_name)
+    );
+    let ownedCardCount = 0;
+    for (const card of request.cards) {
+      if (normalCardAppId(card.market_hash_name) !== destination.app_id) {
+        continue;
+      }
+      const soldQuantity =
+        card.market_hash_name === sourceRow.market_hash_name ? 1 : 0;
+      if (card.owned_quantity <= soldQuantity) {
+        continue;
+      }
+      if (missingHashes.has(card.market_hash_name)) {
+        return false;
+      }
+      ownedCardCount += 1;
+    }
+    if (ownedCardCount !== destination.owned_card_count) {
+      return false;
+    }
+  }
+  return true;
+}
+
 
 function isSnapshotItem(
   value: LevelUpInventoryItem
@@ -862,7 +932,7 @@ export function aggregateNormalCardOwnership(
     const ownedQuantity = (existing?.owned_quantity ?? 0) + item.quantity;
     const sellableQuantity =
       (existing?.sellable_quantity ?? 0) +
-      (item.marketable && item.tradable ? item.quantity : 0);
+      (item.marketable ? item.quantity : 0);
     if (ownedQuantity > MAX_CARD_QUANTITY || sellableQuantity > ownedQuantity) {
       continue;
     }
@@ -881,24 +951,199 @@ export function aggregateNormalCardOwnership(
   );
 }
 
+function isGameName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_GAME_NAME_LENGTH &&
+    value === value.trim()
+  );
+}
+
+function isLevelUpBooster(value: unknown): value is LevelUpBooster {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["game_app_id", "game_name", "card_set_size"], [
+      "market_hash_name",
+      "card_count",
+      "gem_cost",
+      "price"
+    ]) &&
+    isPositiveDecimalId(value.game_app_id, MAX_APP_ID_LENGTH) &&
+    (value.game_name === null ||
+      (typeof value.game_name === "string" &&
+        isGameName(value.game_name.trim()))) &&
+    (value.card_set_size === null ||
+      isSafeInteger(value.card_set_size, MIN_SET_SIZE, MAX_SET_SIZE))
+  );
+}
+
+function isLevelUpBadgeLevel(value: unknown): value is LevelUpNormalBadgeLevel {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["app_id", "level"]) &&
+    isSafeInteger(value.app_id, 1, MAX_BADGE_APP_ID) &&
+    isSafeInteger(value.level, 0, 5)
+  );
+}
+
+type GameMetadata = {
+  game_name: string | null;
+  card_set_size: number | null;
+};
+
+function mergeGameMetadata(
+  metadata: Map<string, GameMetadata>,
+  appId: string,
+  gameName: string | null,
+  cardSetSize: number | null
+): void {
+  const existing = metadata.get(appId);
+  if (
+    existing !== undefined &&
+    ((existing.game_name !== null &&
+      gameName !== null &&
+      existing.game_name !== gameName) ||
+      (existing.card_set_size !== null &&
+        cardSetSize !== null &&
+        existing.card_set_size !== cardSetSize))
+  ) {
+    throw new Error("Inventory game metadata is inconsistent.");
+  }
+  metadata.set(appId, {
+    game_name: existing?.game_name ?? gameName,
+    card_set_size: existing?.card_set_size ?? cardSetSize
+  });
+}
+
+function comparePositiveDecimalIds(left: string, right: string): number {
+  if (left.length !== right.length) {
+    return left.length - right.length;
+  }
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function levelUpBadgeSnapshot(
+  badges: LevelUpBadgeSnapshot
+): {
+  player_xp: number;
+  player_level: number;
+  badge_refreshed_at: string;
+  normal_badge_levels: Map<string, number>;
+} {
+  if (
+    badges.status !== "public" ||
+    !isSafeInteger(badges.player_xp, 0, MAX_XP) ||
+    !isSafeInteger(badges.player_level, 0, MAX_LEVEL - 1) ||
+    levelForXp(badges.player_xp) !== badges.player_level ||
+    !isIsoTimestamp(badges.checked_at) ||
+    !Array.isArray(badges.normal_badge_levels) ||
+    badges.normal_badge_levels.length > MAX_NORMAL_BADGE_LEVEL_ROWS
+  ) {
+    throw new Error("Badge data is unavailable for a recommendation.");
+  }
+  const levels = new Map<string, number>();
+  for (const badge of badges.normal_badge_levels) {
+    if (!isLevelUpBadgeLevel(badge)) {
+      throw new Error("Badge data is unavailable for a recommendation.");
+    }
+    const appId = String(badge.app_id);
+    if (levels.has(appId)) {
+      throw new Error("Badge data is unavailable for a recommendation.");
+    }
+    levels.set(appId, badge.level);
+  }
+  return {
+    player_xp: badges.player_xp,
+    player_level: badges.player_level,
+    badge_refreshed_at: badges.checked_at,
+    normal_badge_levels: levels
+  };
+}
 
 export function buildLevelUpOptimizationRequest(
   items: readonly LevelUpInventoryItem[],
+  boosters: readonly LevelUpBooster[],
+  badges: LevelUpBadgeSnapshot,
   inventoryRefreshedAt: string
 ): LevelUpOptimizationRequest {
   if (!isIsoTimestamp(inventoryRefreshedAt)) {
     throw new Error("The inventory refresh timestamp is invalid.");
   }
+  const badgeSnapshot = levelUpBadgeSnapshot(badges);
+  const cards = aggregateNormalCardOwnership(items);
+  const metadata = new Map<string, GameMetadata>();
+  for (const item of items) {
+    if (!isSnapshotItem(item)) {
+      continue;
+    }
+    const appId = normalCardAppId(item.market_hash_name);
+    if (appId === null) {
+      continue;
+    }
+    if (
+      item.game_app_id !== undefined &&
+      item.game_app_id !== null &&
+      (!isPositiveDecimalId(item.game_app_id, MAX_APP_ID_LENGTH) ||
+        item.game_app_id !== appId)
+    ) {
+      throw new Error("Inventory game metadata is inconsistent.");
+    }
+    const gameName =
+      item.game_name === undefined || item.game_name === null
+        ? null
+        : item.game_name.trim();
+    if (gameName !== null && !isGameName(gameName)) {
+      throw new Error("Inventory game metadata is unavailable.");
+    }
+    mergeGameMetadata(metadata, appId, gameName, null);
+  }
+  for (const booster of boosters) {
+    if (!isLevelUpBooster(booster)) {
+      throw new Error("Inventory booster metadata is unavailable.");
+    }
+    mergeGameMetadata(
+      metadata,
+      booster.game_app_id,
+      booster.game_name === null ? null : booster.game_name.trim(),
+      booster.card_set_size
+    );
+  }
+  const appIds = new Set<string>();
+  for (const card of cards) {
+    const appId = normalCardAppId(card.market_hash_name);
+    if (appId === null) {
+      throw new Error("Inventory ownership could not be normalized.");
+    }
+    appIds.add(appId);
+  }
+  const games: LevelUpGame[] = [];
+  for (const appId of appIds) {
+    const game = metadata.get(appId);
+    if (game === undefined || game.game_name === null) {
+      throw new Error("Inventory game metadata is unavailable.");
+    }
+    games.push({
+      app_id: appId,
+      game_name: game.game_name,
+      card_set_size: game.card_set_size,
+      badge_level: badgeSnapshot.normal_badge_levels.get(appId) ?? 0
+    });
+  }
+  games.sort((left, right) => comparePositiveDecimalIds(left.app_id, right.app_id));
   const request: LevelUpOptimizationRequest = {
     inventory_refreshed_at: inventoryRefreshedAt,
-    cards: aggregateNormalCardOwnership(items)
+    badge_refreshed_at: badgeSnapshot.badge_refreshed_at,
+    player_xp: badgeSnapshot.player_xp,
+    player_level: badgeSnapshot.player_level,
+    games,
+    cards
   };
   if (!isLevelUpOptimizationRequest(request)) {
     throw new Error("The level-up optimization request is invalid.");
   }
   return request;
 }
-
 
 function isLevelUpCardOwnership(value: unknown): value is LevelUpCardOwnership {
   return (
@@ -911,26 +1156,67 @@ function isLevelUpCardOwnership(value: unknown): value is LevelUpCardOwnership {
   );
 }
 
+function isLevelUpGame(value: unknown): value is LevelUpGame {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["app_id", "game_name", "card_set_size", "badge_level"]) &&
+    isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) &&
+    isGameName(value.game_name) &&
+    (value.card_set_size === null ||
+      isSafeInteger(value.card_set_size, MIN_SET_SIZE, MAX_SET_SIZE)) &&
+    isSafeInteger(value.badge_level, 0, 5)
+  );
+}
+
 export function isLevelUpOptimizationRequest(
   value: unknown
 ): value is LevelUpOptimizationRequest {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["inventory_refreshed_at", "cards"]) ||
+    !hasExactKeys(value, [
+      "inventory_refreshed_at",
+      "badge_refreshed_at",
+      "player_xp",
+      "player_level",
+      "games",
+      "cards"
+    ]) ||
     !isIsoTimestamp(value.inventory_refreshed_at) ||
+    !isIsoTimestamp(value.badge_refreshed_at) ||
+    !isSafeInteger(value.player_xp, 0, MAX_XP) ||
+    !isSafeInteger(value.player_level, 0, MAX_LEVEL - 1) ||
+    levelForXp(value.player_xp) !== value.player_level ||
+    !Array.isArray(value.games) ||
+    value.games.length > MAX_NORMAL_GAME_ROWS ||
     !Array.isArray(value.cards) ||
     value.cards.length > MAX_LEVEL_UP_CARD_ROWS
   ) {
     return false;
   }
+  const gameIds = new Set<string>();
+  for (const game of value.games) {
+    if (!isLevelUpGame(game) || gameIds.has(game.app_id)) {
+      return false;
+    }
+    gameIds.add(game.app_id);
+  }
+  const cardAppIds = new Set<string>();
   const hashes = new Set<string>();
   for (const card of value.cards) {
     if (!isLevelUpCardOwnership(card) || hashes.has(card.market_hash_name)) {
       return false;
     }
+    const appId = normalCardAppId(card.market_hash_name);
+    if (appId === null) {
+      return false;
+    }
     hashes.add(card.market_hash_name);
+    cardAppIds.add(appId);
   }
-  return true;
+  return (
+    gameIds.size === cardAppIds.size &&
+    [...cardAppIds].every((appId) => gameIds.has(appId))
+  );
 }
 
 function validateSteamId(steamId: string): void {
@@ -1083,6 +1369,9 @@ export async function requestLevelUpOptimization(
   }
   const payload: unknown = await response.json();
   assertLevelUpOptimizationResponse(payload);
+  if (!responseMatchesRequest(payload, request)) {
+    throw new Error("The level-up optimization service returned an invalid response.");
+  }
   return payload;
 }
 
@@ -1097,9 +1386,11 @@ export function isInventorySnapshotFresh(
     return false;
   }
   const nowMilliseconds = now instanceof Date ? now.getTime() : now;
+  const ageMilliseconds = nowMilliseconds - timestampMilliseconds(inventoryRefreshedAt);
   return (
     Number.isFinite(nowMilliseconds) &&
-    nowMilliseconds - timestampMilliseconds(inventoryRefreshedAt) <= LEVEL_UP_INVENTORY_MAX_AGE_MS
+    ageMilliseconds >= 0 &&
+    ageMilliseconds <= LEVEL_UP_INVENTORY_MAX_AGE_MS
   );
 }
 export type LevelUpState =
@@ -1108,12 +1399,19 @@ export type LevelUpState =
   | { kind: "response"; key: string; response: LevelUpOptimizationResponse }
   | { kind: "expired"; key: string; response: LevelUpReadyResponse }
   | { kind: "error"; key: string; message: string };
-
 export function levelUpSnapshotKey(
   steamId: string | null,
-  inventoryRefreshedAt: string | null
+  inventoryRefreshedAt: string | null,
+  badgeRefreshedAt: string | null,
+  request: LevelUpOptimizationRequest | null = null
 ): string | null {
-  return steamId !== null && inventoryRefreshedAt !== null
-    ? `${steamId}\u0000${inventoryRefreshedAt}`
-    : null;
+  if (
+    steamId === null ||
+    inventoryRefreshedAt === null ||
+    badgeRefreshedAt === null
+  ) {
+    return null;
+  }
+  const snapshot = `${steamId}\u0000${inventoryRefreshedAt}\u0000${badgeRefreshedAt}`;
+  return request === null ? snapshot : `${snapshot}\u0000${JSON.stringify(request)}`;
 }

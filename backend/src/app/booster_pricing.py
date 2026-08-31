@@ -81,6 +81,7 @@ _BOOSTER_CACHE_TABLE_INFO = (
     ("expires_at", "REAL", 1, None, 0),
 )
 _ASCII_DIGITS = re.compile(r"[0-9]+")
+_STEAM_CARD_TYPE_SUFFIX = " Trading Card"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -137,17 +138,6 @@ class BoosterScanResult:
     rate_limited: bool = False
     retry_after_seconds: int | None = None
     used_stale_cache: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class BoosterMetadataState:
-    """Fresh metadata state used by the level-up catalog adapter."""
-
-    values: Mapping[str, BoosterResolution]
-    pending_app_ids: tuple[str, ...] = ()
-    rejected_app_ids: tuple[str, ...] = ()
-    rate_limited: bool = False
-    retry_after_seconds: int | None = None
 
 
 class BoosterProviderProtocol(Protocol):
@@ -242,6 +232,13 @@ def _validated_game_tag(
     return found
 
 
+def _validated_game_type(value: object) -> str | None:
+    normalized = _validated_game_name(value)
+    if normalized is None or not normalized.endswith(_STEAM_CARD_TYPE_SUFFIX):
+        return None
+    return _validated_game_name(normalized[: -len(_STEAM_CARD_TYPE_SUFFIX)])
+
+
 def _game_name_from_result(
     payload: Mapping[str, object],
     game_app_id: str,
@@ -249,16 +246,25 @@ def _game_name_from_result(
     results = payload.get("results")
     if not isinstance(results, list) or not results:
         return None
+    candidates: list[str] = []
     for result in results:
         if not isinstance(result, Mapping):
             continue
         description = result.get("asset_description")
         if not isinstance(description, Mapping):
             description = result
-        game_name = _validated_game_tag(description.get("tags"), game_app_id)
-        if game_name is not None:
-            return game_name
-    return None
+        tags = description.get("tags")
+        tagged_name = _validated_game_tag(tags, game_app_id)
+        typed_name = _validated_game_type(description.get("type"))
+        if tagged_name is not None:
+            if typed_name is not None and typed_name != tagged_name:
+                return None
+            candidates.append(tagged_name)
+        elif "tags" not in description or tags == []:
+            if typed_name is not None:
+                candidates.append(typed_name)
+    unique_candidates = tuple(dict.fromkeys(candidates))
+    return unique_candidates[0] if len(unique_candidates) == 1 else None
 
 
 def _bounded_json_size(value: object, maximum: int) -> int | None:
@@ -1048,57 +1054,6 @@ class BoosterPricingService:
             used_stale_cache=used_stale_cache,
         )
 
-    def read_metadata(self, game_app_ids: Iterable[str]) -> BoosterScanResult:
-        """Read fresh, validated set-size/name metadata for level-up planning.
-
-        This adapter intentionally exposes no cache rows and never queues work.
-        A missing, expired, negative, or nameless result is represented as
-        pending so callers can enqueue only a bounded shortlist through
-        :meth:`resolve`.
-        """
-
-        return self.read_cached(
-            game_app_ids,
-            require_game_name=True,
-            require_fresh=True,
-        )
-
-    def read_metadata_state(
-        self,
-        game_app_ids: Iterable[str],
-    ) -> BoosterMetadataState:
-        """Expose fresh positive, negative, and pending metadata states."""
-
-        unique_ids = tuple(dict.fromkeys(game_app_ids))
-        cached_entries = self.cache.get_many(unique_ids)
-        values: dict[str, BoosterResolution] = {}
-        pending: list[str] = []
-        rejected: list[str] = []
-        for game_app_id in unique_ids:
-            if not _valid_game_app_id(game_app_id):
-                pending.append(game_app_id)
-                continue
-            cached = cached_entries.get(game_app_id)
-            if cached is None or cached.expired:
-                pending.append(game_app_id)
-                continue
-            if cached.status == "negative":
-                rejected.append(game_app_id)
-                continue
-            resolution = cached.resolution()
-            if resolution is None or resolution.game_name is None:
-                pending.append(game_app_id)
-                continue
-            values[game_app_id] = resolution
-        rate_limited, retry_after_seconds = self._rate_limit_status()
-        return BoosterMetadataState(
-            values=values,
-            pending_app_ids=tuple(pending),
-            rejected_app_ids=tuple(rejected),
-            rate_limited=rate_limited,
-            retry_after_seconds=retry_after_seconds,
-        )
-
     async def resolve(
         self,
         game_app_ids: Iterable[str],
@@ -1172,7 +1127,6 @@ __all__ = [
     "STEAM_MARKET_SEARCH_RENDER_ENDPOINT",
     "BoosterCacheEntry",
     "BoosterLookup",
-    "BoosterMetadataState",
     "BoosterPriceCache",
     "BoosterPricingService",
     "BoosterProviderProtocol",

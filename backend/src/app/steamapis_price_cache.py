@@ -26,6 +26,7 @@ MAX_PRICE_QUANTITY = 1_000_000_000
 MAX_NORMAL_CARD_APP_ID = 2**63 - 1
 MAX_NORMAL_CARD_NAME_LENGTH = MAX_PRICE_TEXT_LENGTH
 MAX_NORMAL_CARD_CATALOG_ROWS = 250_000
+MAX_NORMAL_CARD_APP_IDS = 10_000
 _MAX_OBSERVED_AT_MILLISECONDS = Decimal(253402300799999)
 _MAX_GENERATION = 2**63 - 1
 _MAX_FAILURE_COUNT = 16
@@ -850,13 +851,33 @@ class SteamApisPriceCache:
         self,
         *,
         max_rows: int = MAX_NORMAL_CARD_CATALOG_ROWS,
+        app_ids: Iterable[int] | None = None,
     ) -> NormalCardCatalogRead:
-        """Read only bounded normal-card rows from the active generation."""
+        """Read bounded normal-card rows from the active generation."""
 
         if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 0:
             return NormalCardCatalogRead(0, None, {})
         max_rows = min(max_rows, MAX_NORMAL_CARD_CATALOG_ROWS)
-        if max_rows == 0:
+        requested_app_ids: tuple[int, ...] | None = None
+        if app_ids is not None:
+            unique_app_ids: dict[int, None] = {}
+            try:
+                for index, app_id in enumerate(app_ids):
+                    if index >= MAX_NORMAL_CARD_APP_IDS:
+                        return NormalCardCatalogRead(0, None, {})
+                    unique_app_ids.setdefault(app_id, None)
+            except (TypeError, ValueError):
+                return NormalCardCatalogRead(0, None, {})
+            raw_app_ids = tuple(unique_app_ids)
+            if any(
+                isinstance(app_id, bool)
+                or not isinstance(app_id, int)
+                or not 0 < app_id <= MAX_NORMAL_CARD_APP_ID
+                for app_id in raw_app_ids
+            ):
+                return NormalCardCatalogRead(0, None, {})
+            requested_app_ids = tuple(sorted(raw_app_ids))
+        if max_rows == 0 and requested_app_ids != ():
             return NormalCardCatalogRead(0, None, {})
         connection: sqlite3.Connection | None = None
         transaction_started = False
@@ -877,48 +898,89 @@ class SteamApisPriceCache:
                 connection.commit()
                 transaction_started = False
                 return NormalCardCatalogRead(0, None, {})
-            cursor = connection.execute(
-                """
-                SELECT generation, market_hash_name, highest_buy,
-                       lowest_sell, highest_buy_quantity,
-                       lowest_sell_quantity, normal_card_app_id,
-                       normal_card_name, observed_at
-                  FROM steamapis_price_cache
-                 WHERE generation = ?
-                   AND normal_card_app_id IS NOT NULL
-                   AND normal_card_name IS NOT NULL
-                 ORDER BY normal_card_app_id, market_hash_name
-                 LIMIT ?
-                """,
-                (meta.generation, max_rows + 1),
-            )
+            if requested_app_ids == ():
+                result = NormalCardCatalogRead(
+                    generation=meta.generation,
+                    refreshed_at=meta.refreshed_at,
+                    groups={},
+                    row_count=0,
+                    truncated=False,
+                    optimizer_complete=meta.optimizer_complete,
+                )
+                connection.commit()
+                transaction_started = False
+                return result
             grouped: dict[int, list[CachedPrice]] = {}
             row_count = 0
             raw_count = 0
             truncated = False
-            while True:
-                batch_size = min(_BATCH_SIZE, max_rows + 1)
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
-                for row in rows:
-                    raw_count += 1
-                    if raw_count > max_rows:
-                        truncated = True
+            app_id_chunks: Iterable[tuple[int, ...] | None]
+            if requested_app_ids is None:
+                app_id_chunks = (None,)
+            else:
+                app_id_chunks = (
+                    requested_app_ids[start : start + _BATCH_SIZE]
+                    for start in range(0, len(requested_app_ids), _BATCH_SIZE)
+                )
+            for app_id_chunk in app_id_chunks:
+                remaining = max_rows - raw_count
+                limit = remaining + 1
+                if app_id_chunk is None:
+                    query = """
+                        SELECT generation, market_hash_name, highest_buy,
+                               lowest_sell, highest_buy_quantity,
+                               lowest_sell_quantity, normal_card_app_id,
+                               normal_card_name, observed_at
+                          FROM steamapis_price_cache
+                         WHERE generation = ?
+                           AND normal_card_app_id IS NOT NULL
+                           AND normal_card_name IS NOT NULL
+                         ORDER BY normal_card_app_id, market_hash_name
+                         LIMIT ?
+                    """
+                    parameters: tuple[object, ...] = (meta.generation, limit)
+                else:
+                    placeholders = ",".join("?" for _ in app_id_chunk)
+                    query = f"""
+                        SELECT generation, market_hash_name, highest_buy,
+                               lowest_sell, highest_buy_quantity,
+                               lowest_sell_quantity, normal_card_app_id,
+                               normal_card_name, observed_at
+                          FROM steamapis_price_cache
+                         WHERE generation = ?
+                           AND normal_card_app_id IN ({placeholders})
+                           AND normal_card_name IS NOT NULL
+                         ORDER BY normal_card_app_id, market_hash_name
+                         LIMIT ?
+                    """  # noqa: S608 - placeholders contain only literal "?"
+                    parameters = (meta.generation, *app_id_chunk, limit)
+                cursor = connection.execute(query, parameters)
+                while True:
+                    batch_size = min(_BATCH_SIZE, remaining + 1)
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
                         break
-                    entry = self._entry(row, allow_empty_prices=True)
-                    if entry is None or entry.normal_card_app_id is None:
-                        continue
-                    grouped.setdefault(entry.normal_card_app_id, []).append(entry)
-                    row_count += 1
+                    for row in rows:
+                        raw_count += 1
+                        if raw_count > max_rows:
+                            truncated = True
+                            break
+                        entry = self._entry(row, allow_empty_prices=True)
+                        if entry is None or entry.normal_card_app_id is None:
+                            continue
+                        grouped.setdefault(entry.normal_card_app_id, []).append(entry)
+                        row_count += 1
+                    if truncated:
+                        break
+                    if len(rows) < batch_size:
+                        break
+                    remaining = max_rows - raw_count
                 if truncated:
-                    break
-                if len(rows) < batch_size:
                     break
             result = NormalCardCatalogRead(
                 generation=meta.generation,
                 refreshed_at=meta.refreshed_at,
-                groups={app_id: tuple(entries) for app_id, entries in grouped.items()},
+                groups={app_id: tuple(grouped[app_id]) for app_id in sorted(grouped)},
                 row_count=row_count,
                 truncated=truncated,
                 optimizer_complete=meta.optimizer_complete,
@@ -939,8 +1001,9 @@ class SteamApisPriceCache:
         self,
         *,
         max_rows: int = MAX_NORMAL_CARD_CATALOG_ROWS,
+        app_ids: Iterable[int] | None = None,
     ) -> NormalCardCatalogRead:
-        return self.read_catalog(max_rows=max_rows)
+        return self.read_catalog(max_rows=max_rows, app_ids=app_ids)
 
     def begin_refresh(self) -> SteamApisPriceRefresh:
         connection: sqlite3.Connection | None = None
