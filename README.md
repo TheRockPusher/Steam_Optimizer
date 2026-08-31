@@ -101,25 +101,28 @@ The current connection, inventory, and read-only recommendation stage provides:
   are not written to IndexedDB, `localStorage`, cookies, or a server-side user cache.
 - The **Level-up** page shows current total XP and level immediately, accepts a target level, and
   calculates the exact XP threshold delta plus the number of 100-XP badge crafts required. Its
-  existing swap optimizer remains read-only and does not request anything until the user opens
-  this page. It requires a public inventory and an eligible ownership timestamp; otherwise it
-  shows the existing recovery or **Refresh inventory** state.
+  fee-aware card-sale optimizer remains read-only and does not request anything until the user
+  opens this page. It requires a public inventory and an eligible ownership timestamp; otherwise
+  it shows the existing recovery or **Refresh inventory** state.
 - On optimizer activation, the frontend aggregates only normal trading-card rows from the current
   IndexedDB inventory record into a bounded transient snapshot: exact `market_hash_name`,
   `owned_quantity`, `sellable_quantity`, and the record's `inventory_refreshed_at`. It submits that
   snapshot to `POST /api/auth/level-up` with the signed session and matching
   `x-expected-steam-id` header. The endpoint never calls the inventory provider, logs holdings, or
   stores the submitted snapshot.
-- The optimizer derives eligible normal-card AppIDs from the complete normalized market catalog.
-  If no eligible group exists, it returns without another badge-provider call; otherwise it reads
-  at most one bounded SteamApis badges response for the signed SteamID64 and uses catalog-scoped
-  normal badge levels. Foil, non-game, unrelated event, and collection records are excluded.
-  Catalog-scoped badge levels are neither persisted nor exposed to the browser.
-- A complete `ready` response is one deterministic, fully funded advisory plan: sell one copy of
-  every card in one owned normal set into current highest bids, buy up to five cheaper complete
-  normal sets at current lowest asks, and compare the resulting badge XP. The response includes
-  exact card rows, top-of-book depth and quote times, per-item Steam and publisher fees, estimated
-  seller receipts, purchase totals, unspent swap proceeds, and player/level projections.
+- The optimizer derives normal-card AppIDs from the complete normalized market catalog, evaluates
+  every held sellable normal card as a one-copy source candidate, and reads at most one bounded
+  SteamApis badges response for the signed SteamID64. Badge levels determine whether a destination
+  can still be crafted and how much immediately craftable XP a proposed sale would forgo. Foil,
+  non-game, unrelated event, and collection records are excluded. Catalog-scoped badge levels are
+  neither persisted nor exposed to the browser.
+- A complete `ready` response is one deterministic, fully funded advisory plan: sell one selected
+  normal card into its current highest bid, reuse destination cards still owned after that sale,
+  buy only the missing cards for up to five non-maxed normal badges at current lowest asks, and
+  compare funded badge XP with any immediately craftable XP the sale gives up. The response
+  includes exact card rows, top-of-book depth and quote times, per-item Steam and publisher fees,
+  estimated seller receipt, missing-card purchase totals, unspent proceeds, and player/level
+  projections.
 - Plans remain in React memory only while the account and ownership snapshot are unchanged. They
   are never written to IndexedDB, `localStorage`, cookies, or a server-side user cache. Account
   changes, logout, inventory refresh, and component unmount invalidate or discard the in-memory
@@ -137,10 +140,12 @@ generation as a stale fallback when a refresh fails. The optimizer has a stricte
 freshness contract: quote data must be within `LEVEL_UP_MAX_QUOTE_AGE_SECONDS` (the example is
 900 seconds) and the submitted inventory snapshot must be within
 `LEVEL_UP_MAX_INVENTORY_AGE_SECONDS` (the example is 3600 seconds). It never uses the 24-hour
-stale fallback to produce a recommendation. Missing top-bid/top-ask depth, unresolved set
-metadata, stale generations, or provider failures produce an unavailable or warming state rather
-than a partial plan. The UI distinguishes `complete`, `partial`, and `unavailable` inventory
-price coverage; those display states do not make provider-denominated decimals monetary values.
+stale fallback to produce a recommendation. Global stale generations and unresolved relevant set
+metadata produce unavailable or warming states rather than partial plans. A missing, stale, or
+depthless candidate quote excludes that card or destination; valid inputs with no fully quoted
+positive route return an explicit no-opportunity reason. The UI distinguishes `complete`,
+`partial`, and `unavailable` inventory price coverage; those display states do not make
+provider-denominated decimals monetary values.
 The raw provider feed is streamed and discarded after normalization. A generation becomes
 optimizer-eligible only when its AppID 753 metadata declares an item count exactly equal to the
 number of completely parsed item rows; mismatched or missing completeness metadata preserves the
@@ -157,10 +162,10 @@ returned contract, with taxes, holds, and an existing wallet balance excluded.
 Known unavailable and warming states are explicit: `currency_contract_missing`,
 `steamapi_key_missing`, `badge_data_unavailable`, `inventory_snapshot_too_old`,
 `price_generation_unavailable`, `price_generation_stale`, `quote_depth_unavailable`, and
-`catalog_warming`. Valid inputs with no qualifying source or positive-XP swap return
-`no_complete_sellable_set` or `no_positive_xp_swap`; they do not render a zero-valued
-recommendation. No response is treated as actionable when any contract, identity, badge, price,
-depth, catalog, or freshness gate is unresolved.
+`catalog_warming`. Valid inputs with no sellable card carrying a usable current bid return
+`no_sellable_card`; evaluated cards with no strictly better funded badge route return
+`no_positive_xp_swap`. They do not render a zero-valued recommendation. No response is treated as
+actionable when any contract, identity, badge, catalog, or global freshness gate is unresolved.
 
 The browser inventory cache and server market cache have separate retention boundaries. Ordinary
 browser sessions reuse valid matching public/private records until logout, account change,
@@ -171,8 +176,9 @@ services run in exact EU-West region `europe-west4-drams3a`.
 
 ## Why
 
-Owned cards have an opportunity cost: crafting an expensive owned set can be worse than selling it
-and buying cheaper badges. The shipped optimizer makes that trade-off explicit with exact
+Individual cards have an opportunity cost: selling one card can be better for leveling when its
+fee-adjusted receipt buys the missing cards for one or more non-maxed badges without giving up as
+much immediately craftable XP. The shipped optimizer evaluates that trade-off with exact
 configured-currency arithmetic and a clearly labeled estimate. It remains an advisory read-only
 comparison: sale proceeds are estimated rather than received, destination purchases and badge
 crafts remain manual, and Steam's final confirmation is authoritative.

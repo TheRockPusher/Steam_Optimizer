@@ -158,7 +158,7 @@ function publicInventory(
   };
 }
 function levelUpNoOpportunityResponse(
-  reason: "no_complete_sellable_set" | "no_positive_xp_swap" = "no_complete_sellable_set",
+  reason: "no_sellable_card" | "no_positive_xp_swap" = "no_sellable_card",
   inventoryRefreshedAt = "2026-08-29T11:30:00Z"
 ) {
   return {
@@ -828,7 +828,7 @@ describe("App", () => {
       }
     };
     const responseForRequest = (
-      reason: "no_complete_sellable_set" | "no_positive_xp_swap"
+      reason: "no_sellable_card" | "no_positive_xp_swap"
     ) => async (_input: RequestInfo | URL, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as {
         inventory_refreshed_at: string;
@@ -845,7 +845,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory))
       .mockImplementationOnce(
-        responseForRequest("no_complete_sellable_set")
+        responseForRequest("no_sellable_card")
       )
       .mockResolvedValueOnce(jsonResponse(levelTwelveSession))
       .mockImplementationOnce(responseForRequest("no_positive_xp_swap"));
@@ -858,7 +858,7 @@ describe("App", () => {
     fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
     expect(
       await screen.findByText(
-        "No complete sellable normal-card set is available in this inventory snapshot."
+        "No sellable normal card with a usable current bid is available in this inventory snapshot."
       )
     ).toBeInTheDocument();
 
@@ -868,7 +868,7 @@ describe("App", () => {
 
     expect(
       await screen.findByText(
-        "Every self-funded swap would provide no more XP than crafting the owned set."
+        "No one-card sale funds a badge path with more XP than the immediate craft opportunity it gives up."
       )
     ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(5);
@@ -1518,7 +1518,7 @@ describe("App", () => {
       screen.queryByRole("region", { name: "Booster details by game" })
     ).not.toBeInTheDocument();
     expect(
-      await screen.findByText(/No complete sellable normal-card set/)
+      await screen.findByText(/No sellable normal card with a usable current bid/)
     ).toBeInTheDocument();
 
     fireEvent.click(inventoryTab);
@@ -1610,7 +1610,7 @@ describe("App", () => {
     expect(inventoryTab).toHaveAttribute("aria-selected", "false");
     expect(levelUpPanel).not.toHaveAttribute("hidden");
     expect(
-      await screen.findByText(/No complete sellable normal-card set/)
+      await screen.findByText(/No sellable normal card with a usable current bid/)
     ).toBeInTheDocument();
     expect(screen.getByText("Current total XP")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -1667,7 +1667,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(initialInventory))
       .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_complete_sellable_set"))
+        jsonResponse(levelUpNoOpportunityResponse("no_sellable_card"))
       )
       .mockResolvedValueOnce(jsonResponse(refreshedInventory))
       .mockResolvedValueOnce(
@@ -1684,7 +1684,7 @@ describe("App", () => {
     });
     fireEvent.click(levelUpTab);
     expect(
-      await screen.findByText(/No complete sellable normal-card set/)
+      await screen.findByText(/No sellable normal card with a usable current bid/)
     ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
 
@@ -1693,11 +1693,11 @@ describe("App", () => {
     );
 
     expect(
-      await screen.findByText(/Every self-funded swap would provide no more XP/)
+      await screen.findByText(/No one-card sale funds a badge path with more XP/)
     ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(5);
     expect(
-      screen.queryByText(/No complete sellable normal-card set/)
+      screen.queryByText(/No sellable normal card with a usable current bid/)
     ).not.toBeInTheDocument();
   });
 
@@ -1718,7 +1718,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(initialInventory))
       .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_complete_sellable_set"))
+        jsonResponse(levelUpNoOpportunityResponse("no_sellable_card"))
       )
       .mockResolvedValueOnce(jsonResponse(changedSession))
       .mockResolvedValueOnce(jsonResponse(changedInventory))
@@ -1735,7 +1735,7 @@ describe("App", () => {
       within(tablist).getByRole("tab", { name: "Level-up" })
     );
     expect(
-      await screen.findByText(/No complete sellable normal-card set/)
+      await screen.findByText(/No sellable normal card with a usable current bid/)
     ).toBeInTheDocument();
 
     fireEvent.click(
@@ -1745,7 +1745,7 @@ describe("App", () => {
       await screen.findByText(/Account changed\. Steam profile: Public\./)
     ).toBeInTheDocument();
     expect(
-      screen.queryByText(/No complete sellable normal-card set/)
+      screen.queryByText(/No sellable normal card with a usable current bid/)
     ).not.toBeInTheDocument();
     expect(
       screen.getByLabelText("Connected Steam account: Barney")
@@ -1758,7 +1758,7 @@ describe("App", () => {
       within(tablist).getByRole("tab", { name: "Level-up" })
     );
     expect(
-      await screen.findByText(/Every self-funded swap would provide no more XP/)
+      await screen.findByText(/No one-card sale funds a badge path with more XP/)
     ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(6);
     expect(fetchMock).toHaveBeenNthCalledWith(

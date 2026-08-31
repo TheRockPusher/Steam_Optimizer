@@ -11,7 +11,8 @@ import {
   buildSteamProfileGamecardsUrl,
   formatMinorUnits,
   isLevelUpOptimizationResponse,
-  type LevelUpOptimizationResponse
+  type LevelUpOptimizationResponse,
+  type LevelUpReadyResponse
 } from "./levelUpOptimization";
 
 const generatedAt = "2026-08-29T12:00:00Z";
@@ -43,17 +44,18 @@ function buyRow(appId: string, index: number) {
   };
 }
 
-function readyResponse(): LevelUpOptimizationResponse {
-  const sourceRows = Array.from({ length: 5 }, (_, index) => sellRow("440", index));
-  const destinationRows = Array.from({ length: 5 }, (_, index) => buyRow("570", index));
-  const secondRows = Array.from({ length: 5 }, (_, index) => buyRow("580", index));
+function readyResponse(): LevelUpReadyResponse {
+  const sourceRows = [sellRow("440", 0)];
+  const destinationRows = Array.from({ length: 2 }, (_, index) =>
+    buyRow("570", index)
+  );
   return {
     status: "ready",
     reason: "ready",
     generated_at: generatedAt,
     inventory_refreshed_at: inventoryRefreshedAt,
-    catalog_total_sets: 3,
-    catalog_resolved_sets: 3,
+    catalog_total_sets: 2,
+    catalog_resolved_sets: 2,
     catalog_pending_sets: 0,
     currency_code: "USD",
     minor_digits: 2,
@@ -68,9 +70,9 @@ function readyResponse(): LevelUpOptimizationResponse {
       current_xp: 1_250,
       current_level: 11,
       xp_to_next_level: 150,
-      projected_xp: 1_450,
-      projected_level: 12,
-      projected_xp_to_next_level: 150
+      projected_xp: 1_350,
+      projected_level: 11,
+      projected_xp_to_next_level: 50
     },
     source: {
       app_id: "440",
@@ -86,32 +88,23 @@ function readyResponse(): LevelUpOptimizationResponse {
         badge_level_before: 0,
         badge_level_after: 1,
         set_size: 5,
+        owned_card_count: 3,
         rows: destinationRows,
-        set_subtotal: 30,
-        craft_xp: 100
-      },
-      {
-        app_id: "580",
-        game_name: "Left 4 Dead 2",
-        badge_level_before: 0,
-        badge_level_after: 1,
-        set_size: 5,
-        rows: secondRows,
-        set_subtotal: 30,
+        missing_cards_total: 12,
         craft_xp: 100
       }
     ],
     totals: {
-      source_buyer_total: 75,
-      steam_fee_total: 5,
-      publisher_fee_total: 5,
-      seller_receipt_total: 65,
-      purchase_total: 60,
-      unspent_swap_proceeds: 5,
-      direct_craft_xp: 100,
-      swap_path_xp: 200,
+      source_buyer_total: 15,
+      steam_fee_total: 1,
+      publisher_fee_total: 1,
+      seller_receipt_total: 13,
+      purchase_total: 12,
+      unspent_swap_proceeds: 1,
+      foregone_craft_xp: 0,
+      funded_craft_xp: 100,
       xp_advantage: 100,
-      destination_count: 2,
+      destination_count: 1,
       scope_limited: false
     }
   };
@@ -120,7 +113,8 @@ function readyResponse(): LevelUpOptimizationResponse {
 function responseWithStatus(
   status: "no_opportunity" | "warming" | "unavailable",
   reason:
-    | "no_complete_sellable_set"
+    | "no_sellable_card"
+    | "no_positive_xp_swap"
     | "catalog_warming"
     | "price_generation_stale"
     | "steamapi_key_missing"
@@ -248,15 +242,135 @@ describe("normal-card ownership snapshots", () => {
 });
 
 describe("strict response validation", () => {
-  it("accepts a complete ready response and rejects contradictory totals", () => {
+  it("accepts a singular, partial, one-destination plan and rejects contradictory totals", () => {
     const response = readyResponse();
     expect(isLevelUpOptimizationResponse(response)).toBe(true);
-    response.totals!.purchase_total = 61;
+    response.totals.purchase_total = 13;
     expect(isLevelUpOptimizationResponse(response)).toBe(false);
   });
 
-  it("accepts no-opportunity, warming, and unavailable states", () => {
-    expect(isLevelUpOptimizationResponse(responseWithStatus("no_opportunity", "no_complete_sellable_set"))).toBe(true);
+  it("requires exactly one source row and consistent owned/missing destination counts", () => {
+    const multipleSources = readyResponse();
+    multipleSources.source.rows.push(sellRow("440", 1));
+    multipleSources.totals.source_buyer_total = 30;
+    multipleSources.totals.steam_fee_total = 2;
+    multipleSources.totals.publisher_fee_total = 2;
+    multipleSources.totals.seller_receipt_total = 26;
+    multipleSources.totals.unspent_swap_proceeds = 14;
+    expect(isLevelUpOptimizationResponse(multipleSources)).toBe(false);
+
+    const contradictoryProgress = readyResponse();
+    contradictoryProgress.destinations[0].owned_card_count = 2;
+    expect(isLevelUpOptimizationResponse(contradictoryProgress)).toBe(false);
+  });
+
+  it("allows a sell source from a maxed badge game", () => {
+    const response = readyResponse();
+    response.source.badge_level = 5;
+    expect(isLevelUpOptimizationResponse(response)).toBe(true);
+
+    const contradictoryOpportunityCost = readyResponse();
+    contradictoryOpportunityCost.source.badge_level = 5;
+    contradictoryOpportunityCost.destinations.push({
+      app_id: "580",
+      game_name: "Left 4 Dead 2",
+      badge_level_before: 0,
+      badge_level_after: 1,
+      set_size: 5,
+      owned_card_count: 4,
+      rows: [{ ...buyRow("580", 0), buyer_total: 1 }],
+      missing_cards_total: 1,
+      craft_xp: 100
+    });
+    contradictoryOpportunityCost.player.projected_xp = 1_450;
+    contradictoryOpportunityCost.player.projected_level = 12;
+    contradictoryOpportunityCost.player.projected_xp_to_next_level = 150;
+    contradictoryOpportunityCost.totals.purchase_total = 13;
+    contradictoryOpportunityCost.totals.unspent_swap_proceeds = 0;
+    contradictoryOpportunityCost.totals.foregone_craft_xp = 100;
+    contradictoryOpportunityCost.totals.funded_craft_xp = 200;
+    contradictoryOpportunityCost.totals.xp_advantage = 100;
+    contradictoryOpportunityCost.totals.destination_count = 2;
+    expect(isLevelUpOptimizationResponse(contradictoryOpportunityCost)).toBe(false);
+  });
+
+  it("allows consistent post-sale destinations in the source app", () => {
+    function sameAppResponse(): LevelUpReadyResponse {
+      const response = readyResponse();
+      response.destinations[0].app_id = "440";
+      response.destinations[0].game_name = "Team Fortress 2";
+      response.destinations[0].rows = [
+        {
+          ...buyRow("440", 0),
+          market_hash_name: response.source.rows[0].market_hash_name,
+          card_name: response.source.rows[0].card_name
+        },
+        buyRow("440", 1)
+      ];
+      return response;
+    }
+
+    const response = sameAppResponse();
+    expect(isLevelUpOptimizationResponse(response)).toBe(true);
+    response.destinations[0].badge_level_before = 1;
+    response.destinations[0].badge_level_after = 2;
+    expect(isLevelUpOptimizationResponse(response)).toBe(false);
+
+    const wrongName = sameAppResponse();
+    wrongName.destinations[0].game_name = "Different game";
+    expect(isLevelUpOptimizationResponse(wrongName)).toBe(false);
+
+    const wrongSetSize = sameAppResponse();
+    wrongSetSize.destinations[0].set_size = 6;
+    wrongSetSize.destinations[0].owned_card_count = 4;
+    expect(isLevelUpOptimizationResponse(wrongSetSize)).toBe(false);
+  });
+
+  it("rejects a funded badge that does not exceed foregone craft XP", () => {
+    const response = readyResponse();
+    response.totals.foregone_craft_xp = 100;
+    response.totals.xp_advantage = 0;
+    expect(isLevelUpOptimizationResponse(response)).toBe(false);
+  });
+
+  it("accepts two funded badges when one immediate craft is foregone", () => {
+    const response = readyResponse();
+    const secondMissingRow = {
+      ...buyRow("580", 0),
+      buyer_total: 1
+    };
+    response.catalog_total_sets = 3;
+    response.catalog_resolved_sets = 3;
+    response.destinations.push({
+      app_id: "580",
+      game_name: "Left 4 Dead 2",
+      badge_level_before: 2,
+      badge_level_after: 3,
+      set_size: 5,
+      owned_card_count: 4,
+      rows: [secondMissingRow],
+      missing_cards_total: 1,
+      craft_xp: 100
+    });
+    response.player.projected_xp = 1_450;
+    response.player.projected_level = 12;
+    response.player.projected_xp_to_next_level = 150;
+    response.totals.purchase_total = 13;
+    response.totals.unspent_swap_proceeds = 0;
+    response.totals.foregone_craft_xp = 100;
+    response.totals.funded_craft_xp = 200;
+    response.totals.xp_advantage = 100;
+    response.totals.destination_count = 2;
+    expect(isLevelUpOptimizationResponse(response)).toBe(true);
+  });
+
+  it("accepts current no-opportunity, warming, and unavailable states", () => {
+    expect(isLevelUpOptimizationResponse(responseWithStatus("no_opportunity", "no_sellable_card"))).toBe(true);
+    expect(
+      isLevelUpOptimizationResponse(
+        responseWithStatus("no_opportunity", "no_positive_xp_swap")
+      )
+    ).toBe(true);
     expect(isLevelUpOptimizationResponse(responseWithStatus("warming", "catalog_warming"))).toBe(true);
     expect(isLevelUpOptimizationResponse(responseWithStatus("unavailable", "price_generation_stale"))).toBe(true);
     expect(
@@ -264,22 +378,28 @@ describe("strict response validation", () => {
         responseWithStatus("unavailable", "steamapi_key_missing")
       )
     ).toBe(true);
+
+    const staleReason = {
+      ...responseWithStatus("no_opportunity", "no_sellable_card"),
+      reason: "no_complete_sellable_set"
+    };
+    expect(isLevelUpOptimizationResponse(staleReason)).toBe(false);
   });
 
   it("rejects a scope-limited response that does not contain five destinations", () => {
     const response = readyResponse();
     response.scope_limited = true;
-    response.totals!.scope_limited = true;
+    response.totals.scope_limited = true;
     expect(isLevelUpOptimizationResponse(response)).toBe(false);
   });
   it("rejects conclusive responses with unresolved catalog sets", () => {
     const readyWithPending = readyResponse();
-    readyWithPending.catalog_total_sets = 4;
+    readyWithPending.catalog_total_sets = 3;
     readyWithPending.catalog_pending_sets = 1;
     expect(isLevelUpOptimizationResponse(readyWithPending)).toBe(false);
     const noOpportunityWithPending = responseWithStatus(
       "no_opportunity",
-      "no_complete_sellable_set"
+      "no_sellable_card"
     );
     noOpportunityWithPending.catalog_total_sets = 4;
     noOpportunityWithPending.catalog_pending_sets = 1;
@@ -341,7 +461,7 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(
       screen.getByRole("heading", {
         level: 3,
-        name: "Calculating current swap options…"
+        name: "Calculating a one-card level-up plan…"
       })
     ).toBeInTheDocument();
     expect(
@@ -474,6 +594,37 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(panel).not.toHaveAttribute("aria-labelledby");
   });
 
+  it("renders one manual sale and only the missing destination cards", async () => {
+    renderPanel();
+    await flushPanelEffects();
+
+    expect(
+      screen.getByRole("heading", { level: 4, name: "Sell one Team Fortress 2 card" })
+    ).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: "Card to sell" })).toBeInTheDocument();
+    expect(screen.getByText(/one card from a 5-card set/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", {
+        level: 4,
+        name: "Buy missing cards for 1 badge"
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/3 of 5 cards already owned; buy 2 missing cards/)
+    ).toBeInTheDocument();
+    expect(screen.getByText("Missing-card total: $0.12")).toBeInTheDocument();
+    expect(screen.getByText("Destination 0")).toBeInTheDocument();
+    expect(screen.getByText("Destination 1")).toBeInTheDocument();
+    expect(screen.getByText("Foregone craft XP")).toBeInTheDocument();
+    expect(screen.getByText("Funded badge XP")).toBeInTheDocument();
+    expect(screen.getByText("Missing-card purchase total")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Owned destination cards are reused; only missing cards/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/replacement sets/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/sell one owned .* set/i)).not.toBeInTheDocument();
+  });
+
   it("uses one polite live region without status or alert surfaces", async () => {
     renderPanel();
     await flushPanelEffects();
@@ -481,6 +632,9 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(panel).not.toBeNull();
     expect(panel!.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
     expect(panel!.querySelectorAll('[role="status"], [role="alert"]')).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "One-card level-up recommendation ready."
+    );
   });
 
   it("announces optimizer request failures", async () => {
@@ -510,9 +664,11 @@ describe("lazy panel lifecycle and state surfaces", () => {
   });
 
   it("renders no-opportunity, warming, and unavailable recovery copy", async () => {
-    renderPanel(responseWithStatus("no_opportunity", "no_complete_sellable_set"));
+    renderPanel(responseWithStatus("no_opportunity", "no_sellable_card"));
     await flushPanelEffects();
-    expect(screen.getByText(/No complete sellable normal-card set/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No sellable normal card with a usable current bid/)
+    ).toBeInTheDocument();
   });
 
   it("renders the SteamApis key configuration failure", async () => {

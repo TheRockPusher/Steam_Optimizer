@@ -1006,95 +1006,45 @@ def _catalog_groups(
     return groups
 
 
-def _set_purchase_cost(
-    cards: Sequence[CatalogCard],
-    contract: MarketFeeContract,
-) -> int | None:
-    total = 0
-    for card in cards:
-        if card.lowest_sell is None:
-            return None
-        amount = decimal_to_minor(card.lowest_sell, contract.minor_digits)
-        if amount is None:
-            return None
-        total += amount
-        if total > 2**63 - 1:
-            return None
-    return total
-
-
-def _source_proceeds_upper_bound(
-    cards: Sequence[CatalogCard],
-    contract: MarketFeeContract,
-) -> int | None:
-    total = 0
-    for card in cards:
-        if card.highest_buy is None or card.highest_buy_quantity is None:
-            return None
-        amount = decimal_to_minor(card.highest_buy, contract.minor_digits)
-        if amount is None or card.highest_buy_quantity < 1:
-            return None
-        receipt = seller_receipt_from_buyer_total(amount, contract)
-        if receipt is None:
-            return None
-        total += receipt
-        if total > 2**63 - 1:
-            return None
-    return total
-
-
-def _catalog_quote_issue(
-    cards: Sequence[CatalogCard],
+def _level_up_quote_amount(
+    card: CatalogCard,
     *,
     side: Literal["buy", "sell"],
     now: datetime,
     quote_window: int,
     contract: MarketFeeContract,
-    require_depth: bool = True,
-) -> str | None:
-    """Validate every quote needed by a potentially actionable set.
+    require_depth: bool = False,
+) -> int | None:
+    """Return one fresh exact quote amount for local candidate prefiltering."""
 
-    A row with a missing top-of-book value, a non-exact amount, or required
-    quantity is unavailable. A present row outside the configured window is
-    stale. The distinction matters because stale generations and unavailable
-    depth have different recovery actions at the API boundary.
-    """
-
-    stale = False
-    depth_unavailable = False
-    for card in cards:
-        if side == "buy":
-            price = card.highest_buy
-            quantity = card.highest_buy_quantity
-        else:
-            price = card.lowest_sell
-            quantity = card.lowest_sell_quantity
-        timestamp = _level_up_timestamp(card.observed_at)
-        if timestamp is None:
-            depth_unavailable = True
-            continue
+    if side == "buy":
+        price = card.highest_buy
+        quantity = card.highest_buy_quantity
+        timestamp_value = card.highest_buy_observed_at or card.observed_at
+    else:
+        price = card.lowest_sell
+        quantity = card.lowest_sell_quantity
+        timestamp_value = card.lowest_sell_observed_at or card.observed_at
+    if price is None:
+        return None
+    timestamp = _level_up_timestamp(timestamp_value)
+    if timestamp is None:
+        return None
+    try:
         if timestamp > now or now - timestamp > timedelta(seconds=quote_window):
-            stale = True
-            continue
-        if price is None:
-            depth_unavailable = True
-            continue
-        if require_depth and (
-            isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1
-        ):
-            depth_unavailable = True
-            continue
-        amount = decimal_to_minor(price, contract.minor_digits)
-        if amount is None:
-            depth_unavailable = True
-            continue
-        if side == "buy" and seller_receipt_from_buyer_total(amount, contract) is None:
-            depth_unavailable = True
-    if stale:
-        return "price_generation_stale"
-    if depth_unavailable:
-        return "quote_depth_unavailable"
-    return None
+            return None
+    except (OverflowError, TypeError, ValueError, ArithmeticError):
+        return None
+    if require_depth and (
+        isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1
+    ):
+        return None
+    amount = decimal_to_minor(price, contract.minor_digits)
+    if amount is None:
+        return None
+    if side == "buy" and seller_receipt_from_buyer_total(amount, contract) is None:
+        return None
+    return amount
 
 
 def _level_up_snapshot_issue(
@@ -1117,85 +1067,6 @@ def _level_up_snapshot_issue(
     except (OverflowError, TypeError, ValueError, ArithmeticError):
         return "price_generation_unavailable"
     return None
-
-
-def _strict_catalog_candidates(
-    groups: Mapping[int, tuple[CatalogCard, ...]],
-    holdings: Mapping[str, Holding],
-    badges: BadgeState,
-    *,
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
-    qualified_source_ids: frozenset[int],
-) -> tuple[list[int], list[int], list[tuple[int, int]], str | None]:
-    """Price qualified sources and identify fresh, affordable destinations."""
-
-    source_ids: list[int] = []
-    source_proceeds: list[int] = []
-    for app_id, cards in groups.items():
-        if app_id not in qualified_source_ids:
-            continue
-        if badges.level_for_game(app_id) >= 5:
-            continue
-        if not all(
-            (
-                (holding := holdings.get(card.market_hash_name)) is not None
-                and holding.owned_quantity >= 1
-                and holding.sellable_quantity >= 1
-            )
-            for card in cards
-        ):
-            continue
-        issue = _catalog_quote_issue(
-            cards,
-            side="buy",
-            now=now,
-            quote_window=quote_window,
-            contract=contract,
-        )
-        if issue is not None:
-            return source_ids, source_proceeds, [], issue
-        proceeds = _source_proceeds_upper_bound(cards, contract)
-        if proceeds is None:
-            return source_ids, source_proceeds, [], "quote_depth_unavailable"
-        source_ids.append(app_id)
-        source_proceeds.append(proceeds)
-
-    if not source_ids:
-        return source_ids, source_proceeds, [], None
-
-    max_proceeds = max(source_proceeds)
-    owned_games = {
-        parsed[0]
-        for market_hash_name in holdings
-        if (parsed := parse_normal_card_hash(market_hash_name)) is not None
-    }
-    destination_costs: list[tuple[int, int]] = []
-    for app_id, cards in groups.items():
-        if app_id in owned_games or badges.level_for_game(app_id) >= 5:
-            continue
-        issue = _catalog_quote_issue(
-            cards,
-            side="sell",
-            now=now,
-            quote_window=quote_window,
-            contract=contract,
-            require_depth=False,
-        )
-        if issue is not None:
-            return source_ids, source_proceeds, [], issue
-        cost = _set_purchase_cost(cards, contract)
-        if cost is None:
-            # Without an exact subtotal we cannot prove that this destination
-            # is unaffordable, so fail closed instead of warming metadata for
-            # an ambiguous candidate.
-            return source_ids, source_proceeds, [], "quote_depth_unavailable"
-        if cost > max_proceeds:
-            continue
-        destination_costs.append((cost, app_id))
-    destination_costs.sort(key=lambda value: (value[0], value[1]))
-    return source_ids, source_proceeds, destination_costs, None
 
 
 def _level_up_response(
@@ -2924,14 +2795,6 @@ class SteamGateway:
             contract = self.settings.level_up_money_contract
         except (AttributeError, TypeError, ValueError, ArithmeticError):
             contract = None
-        if not holdings:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_complete_sellable_set",
-                now=current,
-                inventory_time=safe_inventory_time,
-                contract=contract,
-            )
         if contract is None:
             return _level_up_response(
                 status="unavailable",
@@ -3056,17 +2919,87 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
             )
+        if not holdings:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_sellable_card",
+                now=current,
+                inventory_time=safe_inventory_time,
+                contract=contract,
+            )
 
         groups = _catalog_groups(catalog_read)
         if not groups:
             return _level_up_response(
                 status="no_opportunity",
-                reason="no_complete_sellable_set",
+                reason="no_sellable_card",
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
             )
 
+        # Validate the caller-owned snapshot before constructing any maps.  In
+        # particular, silently overwriting a duplicate hash could change which
+        # quantity is sold and would make the recommendation non-deterministic.
+        normalized_holdings: list[Holding] = []
+        seen_holding_hashes: set[str] = set()
+        for holding in holdings:
+            if not isinstance(holding, Holding):
+                return _level_up_response(
+                    status="unavailable",
+                    reason="quote_depth_unavailable",
+                    now=current,
+                    inventory_time=inventory_time,
+                    contract=contract,
+                    total_sets=len(groups),
+                    resolved_sets=len(groups),
+                )
+            if holding.market_hash_name in seen_holding_hashes:
+                return _level_up_response(
+                    status="unavailable",
+                    reason="quote_depth_unavailable",
+                    now=current,
+                    inventory_time=inventory_time,
+                    contract=contract,
+                    total_sets=len(groups),
+                    resolved_sets=len(groups),
+                )
+            seen_holding_hashes.add(holding.market_hash_name)
+            normalized_holdings.append(holding)
+        holdings_by_hash = {
+            holding.market_hash_name: holding for holding in normalized_holdings
+        }
+
+        # Source discovery is intentionally card-granular and does not consult
+        # badge level.  A maxed source game can still provide a sellable card
+        # that funds a badge in another (or the same) game.
+        source_app_ids = tuple(
+            app_id
+            for app_id, cards in groups.items()
+            if any(
+                (
+                    (holding := holdings_by_hash.get(card.market_hash_name)) is not None
+                    and holding.owned_quantity >= 1
+                    and holding.sellable_quantity >= 1
+                )
+                for card in cards
+            )
+        )
+        if not source_app_ids:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_sellable_card",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+                total_sets=len(groups),
+                resolved_sets=len(groups),
+            )
+
+        # The badge request remains bounded to one response, but its relevance
+        # covers every catalog group so an omitted normal badge correctly
+        # defaults to level zero and cannot make an eligible destination look
+        # maxed (or vice versa).
         try:
             badge_state = await self._fetch_badge_state(steam_id, groups)
         except (
@@ -3104,47 +3037,14 @@ class SteamGateway:
                 contract=contract,
             )
 
-        if not all(isinstance(holding, Holding) for holding in holdings):
-            return _level_up_response(
-                status="unavailable",
-                reason="quote_depth_unavailable",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-            )
-        normalized_holdings = tuple(holdings)
-        holdings_by_hash = {
-            holding.market_hash_name: holding for holding in normalized_holdings
-        }
-        apparent_source_ids = tuple(
-            app_id
-            for app_id, cards in groups.items()
-            if badge_state.level_for_game(app_id) < 5
-            and all(
-                (
-                    (holding := holdings_by_hash.get(card.market_hash_name)) is not None
-                    and holding.owned_quantity >= 1
-                    and holding.sellable_quantity >= 1
-                )
-                for card in cards
-            )
-        )
-        if not apparent_source_ids:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_complete_sellable_set",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(groups),
-            )
-
         provider = self.steamapis.booster_pricing
 
         async def resolve_metadata(
             candidate_ids: tuple[str, ...],
         ) -> tuple[dict[str, BoosterResolution], tuple[str, ...]]:
+            """Read metadata and warm at most one bounded pending shortlist."""
+
+            candidate_ids = tuple(dict.fromkeys(candidate_ids))
             if not candidate_ids:
                 return {}, ()
 
@@ -3154,17 +3054,33 @@ class SteamGateway:
                 state = provider.read_metadata_state(candidate_ids)
                 if not isinstance(state, BoosterMetadataState):
                     return {}, candidate_ids
-                values = {
-                    str(key): value
-                    for key, value in state.values.items()
-                    if str(key) in candidate_ids
+                candidate_set = set(candidate_ids)
+                values: dict[str, BoosterResolution] = {}
+                for key, value in state.values.items():
+                    key_text = str(key)
+                    if (
+                        key_text in candidate_set
+                        and isinstance(value, BoosterResolution)
+                        and value.game_name is not None
+                    ):
+                        values[key_text] = value
+                pending: list[str] = []
+                for value in state.pending_app_ids:
+                    if value in candidate_set and value not in pending:
+                        pending.append(value)
+                rejected = {
+                    value for value in state.rejected_app_ids if value in candidate_set
                 }
-                pending = tuple(
-                    app_id
-                    for app_id in state.pending_app_ids
-                    if app_id in candidate_ids
-                )
-                return values, pending
+                # A malformed/incomplete state must warm rather than being
+                # treated as a deliberately rejected game.
+                for value in candidate_ids:
+                    if (
+                        value not in values
+                        and value not in rejected
+                        and value not in pending
+                    ):
+                        pending.append(value)
+                return values, tuple(pending)
 
             try:
                 fresh_values, pending_ids = read_metadata_state()
@@ -3175,6 +3091,7 @@ class SteamGateway:
                 ValueError,
                 ArithmeticError,
                 RuntimeError,
+                sqlite3.Error,
             ):
                 fresh_values, pending_ids = {}, candidate_ids
             if pending_ids:
@@ -3187,39 +3104,45 @@ class SteamGateway:
                     ValueError,
                     ArithmeticError,
                     RuntimeError,
+                    sqlite3.Error,
                 ):
                     await provider.resolve(
                         shortlist,
                         require_game_name=True,
                     )
-                with suppress(
+                try:
+                    fresh_values, pending_ids = read_metadata_state()
+                except (
                     AttributeError,
                     OSError,
                     TypeError,
                     ValueError,
                     ArithmeticError,
                     RuntimeError,
+                    sqlite3.Error,
                 ):
-                    fresh_values, pending_ids = read_metadata_state()
+                    fresh_values, pending_ids = {}, candidate_ids
             return fresh_values, pending_ids
 
         def qualified_resolution(
             app_id: int,
-            values: dict[str, BoosterResolution],
+            values: Mapping[str, BoosterResolution],
         ) -> BoosterResolution | None:
             resolution = values.get(str(app_id))
             if not isinstance(resolution, BoosterResolution):
                 return None
-            cards = groups[app_id]
+            cards = groups.get(app_id)
+            game_name = resolution.game_name
             if (
-                resolution.card_set_size != len(cards)
-                or not isinstance(resolution.game_name, str)
-                or not resolution.game_name.strip()
+                cards is None
+                or resolution.card_set_size != len(cards)
+                or not isinstance(game_name, str)
+                or not game_name.strip()
             ):
                 return None
             return resolution
 
-        source_candidate_ids = tuple(str(app_id) for app_id in apparent_source_ids)
+        source_candidate_ids = tuple(str(app_id) for app_id in source_app_ids)
         source_values, pending_ids = await resolve_metadata(source_candidate_ids)
         if now is None:
             current = datetime.now(UTC)
@@ -3237,12 +3160,11 @@ class SteamGateway:
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
-                total_sets=len(groups),
+                total_sets=len(source_candidate_ids),
                 resolved_sets=len(source_values),
             )
         if pending_ids:
             total_sets = len(source_candidate_ids)
-            pending = len(pending_ids)
             return _level_up_response(
                 status="warming",
                 reason="catalog_warming",
@@ -3250,18 +3172,18 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
                 total_sets=total_sets,
-                resolved_sets=max(0, total_sets - pending),
-                pending_sets=pending,
+                resolved_sets=max(0, total_sets - len(pending_ids)),
+                pending_sets=len(pending_ids),
             )
-        qualified_resolutions = {
+        qualified_source_resolutions = {
             app_id: resolution
-            for app_id in apparent_source_ids
+            for app_id in source_app_ids
             if (resolution := qualified_resolution(app_id, source_values)) is not None
         }
-        if not qualified_resolutions:
+        if not qualified_source_resolutions:
             return _level_up_response(
                 status="no_opportunity",
-                reason="no_complete_sellable_set",
+                reason="no_sellable_card",
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
@@ -3269,42 +3191,88 @@ class SteamGateway:
                 resolved_sets=len(source_candidate_ids),
             )
 
-        (
-            source_ids,
-            _source_proceeds,
-            destination_costs,
-            quote_issue,
-        ) = _strict_catalog_candidates(
-            groups,
-            holdings_by_hash,
-            badge_state,
-            now=current,
-            quote_window=quote_limit,
-            contract=contract,
-            qualified_source_ids=frozenset(qualified_resolutions),
-        )
-        if quote_issue is not None:
-            return _level_up_response(
-                status="unavailable",
-                reason=quote_issue,
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(qualified_resolutions),
-            )
-        if not source_ids:
+        # Build a safe destination metadata shortlist.  The pure optimizer
+        # performs the authoritative side quote/depth/fee checks; this pass
+        # only avoids warming destinations whose original missing-card subtotal
+        # cannot fit under any individually sellable source receipt.  Source
+        # apps are retained even when selling the only copy creates a new
+        # missing card, so same-app routes remain visible to the optimizer.
+        max_receipt: int | None = None
+        for app_id in qualified_source_resolutions:
+            for card in groups[app_id]:
+                holding = holdings_by_hash.get(card.market_hash_name)
+                if (
+                    holding is None
+                    or holding.owned_quantity < 1
+                    or holding.sellable_quantity < 1
+                ):
+                    continue
+                buyer_total = _level_up_quote_amount(
+                    card,
+                    side="buy",
+                    now=current,
+                    quote_window=quote_limit,
+                    contract=contract,
+                    require_depth=True,
+                )
+                if buyer_total is None:
+                    continue
+                receipt = seller_receipt_from_buyer_total(buyer_total, contract)
+                if receipt is not None and (
+                    max_receipt is None or receipt > max_receipt
+                ):
+                    max_receipt = receipt
+        if max_receipt is None:
             return _level_up_response(
                 status="no_opportunity",
-                reason="no_complete_sellable_set",
+                reason="no_sellable_card",
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(qualified_resolutions),
+                total_sets=len(source_candidate_ids),
+                resolved_sets=len(qualified_source_resolutions),
             )
 
-        destination_ids = tuple(str(app_id) for _, app_id in destination_costs)
+        destination_app_ids: list[int] = []
+        qualified_source_ids = frozenset(qualified_source_resolutions)
+        for app_id, cards in groups.items():
+            if badge_state.level_for_game(app_id) >= 5:
+                continue
+            if app_id in qualified_source_ids:
+                destination_app_ids.append(app_id)
+                continue
+            missing_cards = tuple(
+                card
+                for card in cards
+                if (
+                    holdings_by_hash.get(card.market_hash_name) is None
+                    or holdings_by_hash[card.market_hash_name].owned_quantity < 1
+                )
+            )
+            if not missing_cards:
+                continue
+            subtotal = 0
+            valid = True
+            for card in missing_cards:
+                amount = _level_up_quote_amount(
+                    card,
+                    side="sell",
+                    now=current,
+                    quote_window=quote_limit,
+                    contract=contract,
+                    require_depth=True,
+                )
+                if amount is None:
+                    valid = False
+                    break
+                subtotal += amount
+                if subtotal > 2**63 - 1:
+                    valid = False
+                    break
+            if valid and subtotal <= max_receipt:
+                destination_app_ids.append(app_id)
+        destination_app_ids = sorted(set(destination_app_ids))
+        destination_ids = tuple(str(app_id) for app_id in destination_app_ids)
         destination_values, pending_ids = await resolve_metadata(destination_ids)
         if now is None:
             current = datetime.now(UTC)
@@ -3322,12 +3290,11 @@ class SteamGateway:
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(qualified_resolutions),
+                total_sets=len(destination_ids),
+                resolved_sets=len(destination_values),
             )
         if pending_ids:
-            total_sets = len(source_ids) + len(destination_ids)
-            pending = len(pending_ids)
+            total_sets = len(destination_ids)
             return _level_up_response(
                 status="warming",
                 reason="catalog_warming",
@@ -3335,53 +3302,20 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
                 total_sets=total_sets,
-                resolved_sets=max(0, total_sets - pending),
-                pending_sets=pending,
+                resolved_sets=max(0, total_sets - len(pending_ids)),
+                pending_sets=len(pending_ids),
             )
-        for app_id in source_ids:
-            quote_issue = _catalog_quote_issue(
-                groups[app_id],
-                side="buy",
-                now=current,
-                quote_window=quote_limit,
-                contract=contract,
-            )
-            if quote_issue is not None:
-                return _level_up_response(
-                    status="unavailable",
-                    reason=quote_issue,
-                    now=current,
-                    inventory_time=inventory_time,
-                    contract=contract,
-                    total_sets=len(groups),
-                    resolved_sets=len(qualified_resolutions),
-                )
-        for _, app_id in destination_costs:
+
+        all_resolutions: dict[int, BoosterResolution] = dict(
+            qualified_source_resolutions
+        )
+        for app_id in destination_app_ids:
             resolution = qualified_resolution(app_id, destination_values)
-            if resolution is None:
-                continue
-            quote_issue = _catalog_quote_issue(
-                groups[app_id],
-                side="sell",
-                now=current,
-                quote_window=quote_limit,
-                contract=contract,
-            )
-            if quote_issue is not None:
-                return _level_up_response(
-                    status="unavailable",
-                    reason=quote_issue,
-                    now=current,
-                    inventory_time=inventory_time,
-                    contract=contract,
-                    total_sets=len(groups),
-                    resolved_sets=len(qualified_resolutions),
-                )
-            qualified_resolutions[app_id] = resolution
+            if resolution is not None:
+                all_resolutions[app_id] = resolution
 
         resolved_sets: list[CatalogSet] = []
-        for app_id, resolution in qualified_resolutions.items():
-            cards = groups[app_id]
+        for app_id, resolution in sorted(all_resolutions.items()):
             game_name = resolution.game_name
             if not isinstance(game_name, str) or not game_name.strip():
                 continue
@@ -3390,7 +3324,7 @@ class SteamGateway:
                     CatalogSet(
                         app_id=app_id,
                         game_name=game_name.strip(),
-                        cards=cards,
+                        cards=groups[app_id],
                         set_size=resolution.card_set_size,
                         resolved=True,
                     )
