@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.10.0
+
+
+### Documentation
+- Update changelog for v0.9.0
+
+
+### Features
+- Optimize level-up plans per card
+
+
+### Maintenance
+- Prepare release v0.10.0
+
 ## v0.9.0
 
 
