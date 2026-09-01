@@ -1,37 +1,19 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.10.1
 
-## Unreleased
 
 ### Bug Fixes
-- Fix the live Steam market-search fallback for listings whose `asset_description.type` is present
-  while `tags` is absent, so the game name is still derived correctly. Level-up planning also uses
-  loaded inventory game metadata rather than depending on that provider response.
-- Preserve exact per-item fee inversion and seller-receipt thresholds: a required receipt of 14
-  rejects gross 15 (receipt 13), accepts gross 16 (receipt 14), accepts receipt 20 at gross 23,
-  and rejects invalid gross 22.
+- Compute plans from cached snapshots
 
-### Features
-- Reuse the validated in-memory session badge snapshot (`player_xp`, `player_level`, server-stamped
-  `checked_at`, submitted as `badge_refreshed_at`, and normal badge levels) and already-loaded
-  inventory game metadata in level-up requests. Include every normal-card game, not only sellable
-  source games, and make no badge or booster-metadata provider request during planning.
-- Keep level-up recommendations advisory and manual: Steam listing, buying, selling, trading, and
-  crafting actions are never automated.
-
-### Performance
-- Read the normalized catalog only for submitted AppIDs through the
-  `(generation, normal_card_app_id)` index, excluding unrelated catalog groups.
-- Keep optimizer requests off the bulk catalog download path: missing or stale generations queue
-  one shared background refresh and return an immediate non-actionable freshness response.
-- Construct each eligible destination once, sort once by the deterministic plan key, and scan
-  source cards with the cumulative receipt threshold and at most five funded outputs plus the
-  scope sentinel.
 
 ### Documentation
-- Document scoped catalog reads, session snapshot and inventory metadata reuse, exact integer fee
-  handling, and the one-sort threshold algorithm.
+- Update changelog for v0.10.0
+
+
+### Maintenance
+- Prepare release v0.10.1
 
 ## v0.10.0
 
