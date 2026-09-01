@@ -1,13 +1,26 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.10.2
+
+
+### Bug Fixes
+- Retry during catalog refresh
+
+
+### Documentation
+- Update changelog for v0.10.1
+
+
+### Maintenance
+- Prepare release v0.10.2
+
 ## v0.10.1
 
 
 ### Bug Fixes
-- Treat a scheduled market-catalog refresh as a transient loading state and retry the recommendation
-  automatically instead of presenting a cold or stale cache as a terminal price failure.
 - Compute plans from cached snapshots
+
 
 ### Documentation
 - Update changelog for v0.10.0
@@ -147,6 +160,12 @@ All notable changes to Steam Optimizer are documented here.
 - Update changelog for v0.6.0
 
 
+### Features
+- Generalize Steam inventory item metadata
+- Cache Steam inventory and market prices
+- Compact inventory results layout
+
+
 ### Maintenance
 - Resolve main merge conflicts
 - Merge main into cache branch
@@ -165,9 +184,6 @@ All notable changes to Steam Optimizer are documented here.
 
 
 ### Features
-- Generalize Steam inventory item metadata
-- Cache Steam inventory and market prices
-- Compact inventory results layout
 - Streamline inventory workspace design
 - Derive booster gem costs
 
