@@ -7,13 +7,11 @@ import sqlite3
 from collections.abc import (
     AsyncIterator,
     Callable,
-    Collection,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -25,10 +23,17 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 import httpx2
 import ijson
 from ijson.common import IncompleteJSONError, JSONError
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from app.booster_pricing import (
-    BoosterMetadataState,
     BoosterPricingService,
     BoosterResolution,
     BoosterScanResult,
@@ -48,6 +53,7 @@ from app.gem_pricing import (
 from app.json_parsing import reject_duplicate_object_keys
 from app.level_up_optimizer import (
     MAX_APP_ID,
+    MAX_GAME_NAME_LENGTH,
     MAX_NORMAL_SET_SIZE,
     MAX_QUOTE_QUANTITY,
     MIN_NORMAL_SET_SIZE,
@@ -98,6 +104,7 @@ _INVALID_BOOSTER_COST_ERROR = "Booster gem cost does not match card set size."
 _PUBLIC_BADGE_FIELDS_ERROR = "Public badge checks require XP and level."
 _PUBLIC_BADGE_CONSISTENCY_ERROR = "Public badge XP and level must agree."
 _UNAVAILABLE_BADGE_FIELDS_ERROR = "Unavailable badge checks cannot include XP or level."
+_NORMAL_BADGE_LEVELS_ERROR = "Normal badge levels must be sorted and unique."
 
 CheckStatus = Literal["public", "private", "unavailable"]
 BadgeStatus = Literal["public", "unavailable"]
@@ -118,9 +125,11 @@ STEAMAPIS_BADGES_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/users/{{steam_id}}/b
 LEVEL_UP_PRICE_MAX_AGE_SECONDS = 15 * 60
 MAX_BADGE_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_BADGE_DECODED_SIZE = 16 * 1024 * 1024
-MAX_BADGE_PREFLIGHT_CHARGE = 32 * 1024 * 1024
 MAX_BADGE_RECORDS = 25_000
+MAX_NORMAL_BADGE_LEVEL_ROWS = 10_000
 MAX_BADGE_JSON_TOKENS = 1_000_000
+MAX_BADGE_PREFLIGHT_CHARGE = 32 * 1024 * 1024
+MAX_LEVEL_UP_CATALOG_ROWS = 250_000
 _BADGE_JSON_CONTAINER_START_EVENTS = frozenset({"start_map", "start_array"})
 _BADGE_JSON_CONTAINER_END_EVENTS = frozenset({"end_map", "end_array"})
 _BADGE_JSON_SCALAR_EVENTS = frozenset(
@@ -129,8 +138,9 @@ _BADGE_JSON_SCALAR_EVENTS = frozenset(
 _BADGE_JSON_VALUE_EVENTS = (
     _BADGE_JSON_CONTAINER_START_EVENTS | _BADGE_JSON_SCALAR_EVENTS | {"string"}
 )
-MAX_LEVEL_UP_CATALOG_ROWS = 250_000
-MAX_LEVEL_UP_METADATA_APPS = 128
+_LEVEL_UP_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 # Inventory pages are normally 2,000 assets.  These bounds leave room for
 # unusually large inventories while stopping provider-controlled amplification.
@@ -196,20 +206,50 @@ class ProfileCheck(CheckResult):
     avatar_url: str | None = None
 
 
+class NormalBadgeLevel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: StrictInt = Field(ge=1, le=MAX_APP_ID)
+    level: StrictInt = Field(ge=0, le=5)
+
+
 class BadgeCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     status: BadgeStatus
     message: str
     player_xp: StrictInt | None = Field(default=None, ge=0, le=10**12)
     player_level: StrictInt | None = Field(default=None, ge=0, le=100_000)
+    checked_at: StrictStr | None = Field(default=None, min_length=1, max_length=64)
+    normal_badge_levels: list[NormalBadgeLevel] = Field(
+        default_factory=list,
+        max_length=MAX_NORMAL_BADGE_LEVEL_ROWS,
+    )
 
     @model_validator(mode="after")
     def validate_status_fields(self) -> BadgeCheck:
         if self.status == "public":
-            if self.player_xp is None or self.player_level is None:
+            if (
+                self.player_xp is None
+                or self.player_level is None
+                or self.checked_at is None
+                or _LEVEL_UP_TIMESTAMP_RE.fullmatch(self.checked_at) is None
+                or _level_up_timestamp(self.checked_at) is None
+            ):
                 raise ValueError(_PUBLIC_BADGE_FIELDS_ERROR)
             if level_for_xp(self.player_xp) != self.player_level:
                 raise ValueError(_PUBLIC_BADGE_CONSISTENCY_ERROR)
-        elif self.player_xp is not None or self.player_level is not None:
+            previous_app_id = 0
+            for level in self.normal_badge_levels:
+                if level.app_id <= previous_app_id:
+                    raise ValueError(_NORMAL_BADGE_LEVELS_ERROR)
+                previous_app_id = level.app_id
+        elif (
+            self.player_xp is not None
+            or self.player_level is not None
+            or self.checked_at is not None
+            or self.normal_badge_levels
+        ):
             raise ValueError(_UNAVAILABLE_BADGE_FIELDS_ERROR)
         return self
 
@@ -377,13 +417,15 @@ class SteamGatewayProtocol(Protocol):
 
     async def check_level_up(
         self,
-        steam_id: str,
         holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
         inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
         *,
         now: datetime | str | int | None = None,
     ) -> LevelUpOptimizationResponse:
-        """Calculate a read-only level-up recommendation without inventory I/O."""
+        """Calculate a read-only recommendation without external metadata I/O."""
         ...
 
     async def refresh_gems(
@@ -878,11 +920,8 @@ def _preflight_badge_json_body(body: bytes) -> None:
         raise InvalidSteamApisPayloadError
 
 
-def _parse_badges_payload(
-    payload: object,
-    relevant_app_ids: Collection[int],
-) -> BadgeState:
-    """Parse relevant normal-card badge levels from one bounded SteamApis response."""
+def _parse_badges_payload(payload: object) -> BadgeState:
+    """Parse all recognizable normal-card badge levels from one response."""
 
     if not isinstance(payload, Mapping) or not _is_success_flag(payload.get("success")):
         raise InvalidSteamApisPayloadError
@@ -909,31 +948,32 @@ def _parse_badges_payload(
     levels: dict[int, int] = {}
     for record in records:
         if not isinstance(record, Mapping):
-            raise InvalidSteamApisPayloadError
-        raw_app_id = _steamapis_badge_value(record, "appID", "appid")
-        if raw_app_id is None:
             continue
+        raw_app_id = _steamapis_badge_value(record, "appID", "appid")
         if isinstance(raw_app_id, bool) or not isinstance(raw_app_id, int):
-            raise InvalidSteamApisPayloadError
-        if raw_app_id == 0:
             continue
         app_id = _badge_integer(raw_app_id, minimum=1, maximum=MAX_APP_ID)
         if app_id is None:
-            raise InvalidSteamApisPayloadError
-        if app_id not in relevant_app_ids:
             continue
-        border_color = _badge_integer(
-            _steamapis_badge_value(record, "borderColor", "border_color"),
-            minimum=0,
-            maximum=1,
+        raw_border_color = _steamapis_badge_value(
+            record,
+            "borderColor",
+            "border_color",
         )
-        if border_color is None:
-            raise InvalidSteamApisPayloadError
-        # Foil records do not affect normal-card badge progress.
+        border_color = _badge_integer(raw_border_color, minimum=0, maximum=1)
         if border_color != 0:
             continue
-        level = _badge_integer(record.get("level"), minimum=0, maximum=5)
-        if level is None or app_id in levels:
+        raw_level = record.get("level")
+        if isinstance(raw_level, bool) or not isinstance(raw_level, int):
+            raise InvalidSteamApisPayloadError
+        # Steam event badges also use borderColor=0 but expose unbounded integer
+        # progress in level, with no separate record-kind discriminator.
+        if not 0 <= raw_level <= 5:
+            continue
+        level = raw_level
+        if app_id in levels:
+            raise InvalidSteamApisPayloadError
+        if len(levels) >= MAX_NORMAL_BADGE_LEVEL_ROWS:
             raise InvalidSteamApisPayloadError
         levels[app_id] = level
     try:
@@ -944,6 +984,42 @@ def _parse_badges_payload(
         )
     except (OptimizerInputError, TypeError, ValueError, ArithmeticError) as error:
         raise InvalidSteamApisPayloadError from error
+
+
+def _normalize_level_up_game_metadata(
+    value: object,
+) -> dict[int, tuple[str, int | None]] | None:
+    if not isinstance(value, Mapping):
+        return None
+    normalized: dict[int, tuple[str, int | None]] = {}
+    for raw_app_id, raw_metadata in value.items():
+        if (
+            isinstance(raw_app_id, bool)
+            or not isinstance(raw_app_id, int)
+            or not 0 < raw_app_id <= MAX_APP_ID
+            or not isinstance(raw_metadata, tuple)
+            or len(raw_metadata) != 2
+        ):
+            return None
+        raw_game_name, raw_set_size = raw_metadata
+        if not isinstance(raw_game_name, str):
+            return None
+        game_name = raw_game_name.strip()
+        if (
+            not game_name
+            or len(game_name) > MAX_GAME_NAME_LENGTH
+            or (
+                raw_set_size is not None
+                and (
+                    isinstance(raw_set_size, bool)
+                    or not isinstance(raw_set_size, int)
+                    or not MIN_NORMAL_SET_SIZE <= raw_set_size <= MAX_NORMAL_SET_SIZE
+                )
+            )
+        ):
+            return None
+        normalized[raw_app_id] = (game_name, raw_set_size)
+    return normalized
 
 
 def _catalog_groups(
@@ -1071,14 +1147,11 @@ def _level_up_snapshot_issue(
 
 def _level_up_response(
     *,
-    status: Literal["unavailable", "warming", "no_opportunity"],
+    status: Literal["unavailable", "no_opportunity"],
     reason: str,
     now: datetime,
     inventory_time: datetime,
     contract: MarketFeeContract | None,
-    total_sets: int = 0,
-    resolved_sets: int = 0,
-    pending_sets: int = 0,
 ) -> LevelUpOptimizationResponse:
     currency_code = contract.currency_code if contract is not None else None
     minor_digits = contract.minor_digits if contract is not None else None
@@ -1087,21 +1160,11 @@ def _level_up_response(
     publisher_fee_bps = contract.publisher_fee_bps if contract is not None else None
     min_fee_minor = contract.min_fee_minor if contract is not None else None
     taxes_included = False if contract is not None else None
-    bounded_total = max(0, total_sets)
-    bounded_pending = max(0, min(pending_sets, bounded_total))
-    bounded_resolved = max(0, min(resolved_sets, bounded_total))
-    if bounded_pending == 0 and bounded_resolved < bounded_total:
-        bounded_pending = bounded_total - bounded_resolved
-    else:
-        bounded_resolved = bounded_total - bounded_pending
     return LevelUpOptimizationResponse(
         status=status,
         reason=reason,
         generated_at=now,
         inventory_refreshed_at=inventory_time,
-        catalog_total_sets=bounded_total,
-        catalog_resolved_sets=bounded_resolved,
-        catalog_pending_sets=bounded_pending,
         scope_limited=False,
         valid_until=None,
         player=None,
@@ -2459,10 +2522,46 @@ class SteamApisClient:
         self,
         *,
         max_rows: int | None = None,
+        app_ids: Iterable[int] | None = None,
     ) -> NormalCardCatalogRead:
-        if max_rows is None:
-            return self.price_cache.read_catalog()
-        return self.price_cache.read_catalog(max_rows=max_rows)
+        return self.price_cache.read_catalog(
+            max_rows=MAX_LEVEL_UP_CATALOG_ROWS if max_rows is None else max_rows,
+            app_ids=app_ids,
+        )
+
+    def schedule_price_catalog_refresh(
+        self,
+        *,
+        max_age_seconds: int = LEVEL_UP_PRICE_MAX_AGE_SECONDS,
+    ) -> bool:
+        """Start a stale global-catalog refresh without delaying the caller."""
+
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, int)
+            or max_age_seconds <= 0
+        ):
+            return False
+        try:
+            cache_read = self.price_cache.read()
+        except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return False
+        if (
+            cache_read.has_generation
+            and cache_read.generation_age_seconds is not None
+            and cache_read.generation_age_seconds <= max_age_seconds
+        ):
+            return True
+        if self._api_headers() is None or cache_read.retry_suppressed:
+            return False
+        task = self._price_refresh_task
+        if task is None:
+            task = asyncio.create_task(
+                self._refresh_prices(max_age_seconds=max_age_seconds)
+            )
+            self._price_refresh_task = task
+            task.add_done_callback(self._discard_price_refresh_task)
+        return False
 
     async def ensure_price_catalog_fresh(
         self,
@@ -2471,34 +2570,20 @@ class SteamApisClient:
     ) -> bool:
         """Ensure the global generation is fresh under a caller's contract."""
 
-        if (
-            isinstance(max_age_seconds, bool)
-            or not isinstance(max_age_seconds, int)
-            or max_age_seconds <= 0
-        ):
-            return False
         for _ in range(2):
-            cache_read = self.price_cache.read()
-            if (
-                cache_read.has_generation
-                and cache_read.generation_age_seconds is not None
-                and cache_read.generation_age_seconds <= max_age_seconds
-            ):
+            if self.schedule_price_catalog_refresh(max_age_seconds=max_age_seconds):
                 return True
-            if self._api_headers() is None or cache_read.retry_suppressed:
-                return False
             task = self._price_refresh_task
             if task is None:
-                task = asyncio.create_task(
-                    self._refresh_prices(max_age_seconds=max_age_seconds)
-                )
-                self._price_refresh_task = task
-                task.add_done_callback(self._discard_price_refresh_task)
+                return False
             try:
                 await asyncio.shield(task)
             finally:
                 self._discard_price_refresh_task(task)
-        refreshed = self.price_cache.read()
+        try:
+            refreshed = self.price_cache.read()
+        except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+            return False
         return (
             refreshed.has_generation
             and refreshed.generation_age_seconds is not None
@@ -2712,14 +2797,20 @@ class SteamGateway:
 
     async def check_badges(self, steam_id: str) -> BadgeCheck:
         try:
-            badge_state = await self._fetch_badge_state(steam_id, ())
+            badge_state = await self._fetch_badge_state(steam_id)
             if not isinstance(badge_state, BadgeState):
                 return _unavailable_badges()
+            checked_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             return BadgeCheck(
                 status="public",
                 message="Steam badge data is available.",
                 player_xp=badge_state.player_xp,
                 player_level=badge_state.player_level,
+                checked_at=checked_at,
+                normal_badge_levels=[
+                    NormalBadgeLevel(app_id=app_id, level=level)
+                    for app_id, level in sorted(badge_state.normal_badge_levels.items())
+                ],
             )
         except Exception:  # noqa: BLE001 - map badge failures to unavailable
             return _unavailable_badges()
@@ -2727,7 +2818,6 @@ class SteamGateway:
     async def _fetch_badge_state(
         self,
         steam_id: str,
-        relevant_app_ids: Collection[int],
     ) -> BadgeState:
         headers = self.steamapis._api_headers()
         if headers is None:
@@ -2774,22 +2864,25 @@ class SteamGateway:
             )
         except (TypeError, UnicodeDecodeError, ValueError, RecursionError):
             raise InvalidSteamApisPayloadError from None
-        return _parse_badges_payload(payload, relevant_app_ids)
+        return _parse_badges_payload(payload)
 
     async def check_level_up(
         self,
-        steam_id: str,
         holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
         inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
         *,
         now: datetime | str | int | None = None,
     ) -> LevelUpOptimizationResponse:
-        """Return one read-only recommendation without touching inventory APIs."""
+        """Return one read-only recommendation from caller-owned snapshots."""
 
         current = _level_up_timestamp(now) if now is not None else datetime.now(UTC)
         if current is None:
             current = datetime.now(UTC)
         inventory_time = _level_up_timestamp(inventory_refreshed_at)
+        badge_time = _level_up_timestamp(badge_refreshed_at)
         safe_inventory_time = inventory_time or current
         try:
             contract = self.settings.level_up_money_contract
@@ -2834,6 +2927,58 @@ class SteamGateway:
                 inventory_time=safe_inventory_time,
                 contract=contract,
             )
+        if badge_time is None:
+            return _level_up_response(
+                status="unavailable",
+                reason="badge_data_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        try:
+            badge_age = current - badge_time
+            badge_valid = badge_age >= timedelta(0) and badge_age <= timedelta(
+                seconds=contract.max_inventory_age_seconds
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            badge_valid = False
+        if not badge_valid:
+            return _level_up_response(
+                status="unavailable",
+                reason="badge_data_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        if not isinstance(badge_state, BadgeState):
+            return _level_up_response(
+                status="unavailable",
+                reason="badge_data_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        try:
+            normalized_metadata = _normalize_level_up_game_metadata(game_metadata)
+        except (AttributeError, TypeError, ValueError):
+            normalized_metadata = None
+        if normalized_metadata is None:
+            return _level_up_response(
+                status="unavailable",
+                reason="quote_depth_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
+        requested_app_ids = tuple(sorted(normalized_metadata))
+        if not requested_app_ids:
+            return _level_up_response(
+                status="no_opportunity",
+                reason="no_sellable_card",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
         quote_limit = getattr(contract, "max_quote_age_seconds", None)
         if (
             isinstance(quote_limit, bool)
@@ -2847,13 +2992,10 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
             )
-
         try:
-            price_ready = await self.steamapis.ensure_price_catalog_fresh(
-                max_age_seconds=quote_limit
-            )
             catalog_read = self.steamapis.read_price_catalog(
-                max_rows=MAX_LEVEL_UP_CATALOG_ROWS
+                max_rows=MAX_LEVEL_UP_CATALOG_ROWS,
+                app_ids=requested_app_ids,
             )
         except (
             OSError,
@@ -2864,19 +3006,16 @@ class SteamGateway:
             RuntimeError,
             sqlite3.Error,
         ):
-            price_ready = False
             catalog_read = NormalCardCatalogRead(0, None, {})
         if now is None:
             current = datetime.now(UTC)
-        if not price_ready:
-            reason = (
-                "price_generation_stale"
-                if catalog_read.has_generation
-                else "price_generation_unavailable"
-            )
+        badge_age = current - badge_time
+        if badge_age < timedelta(0) or badge_age > timedelta(
+            seconds=contract.max_inventory_age_seconds
+        ):
             return _level_up_response(
                 status="unavailable",
-                reason=reason,
+                reason="badge_data_unavailable",
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
@@ -2887,6 +3026,7 @@ class SteamGateway:
             or catalog_read.truncated
             or not catalog_read.optimizer_complete
         ):
+            self.steamapis.schedule_price_catalog_refresh(max_age_seconds=quote_limit)
             return _level_up_response(
                 status="unavailable",
                 reason="price_generation_unavailable",
@@ -2912,6 +3052,13 @@ class SteamGateway:
             quote_limit=quote_limit,
         )
         if freshness_issue is not None:
+            if freshness_issue in {
+                "price_generation_stale",
+                "price_generation_unavailable",
+            }:
+                self.steamapis.schedule_price_catalog_refresh(
+                    max_age_seconds=quote_limit
+                )
             return _level_up_response(
                 status="unavailable",
                 reason=freshness_issue,
@@ -2927,9 +3074,31 @@ class SteamGateway:
                 inventory_time=safe_inventory_time,
                 contract=contract,
             )
-
         groups = _catalog_groups(catalog_read)
-        if not groups:
+        catalog_sets: list[CatalogSet] = []
+        for app_id in requested_app_ids:
+            cards = groups.get(app_id)
+            metadata = normalized_metadata[app_id]
+            if (
+                cards is None
+                or not MIN_NORMAL_SET_SIZE <= len(cards) <= MAX_NORMAL_SET_SIZE
+            ):
+                continue
+            game_name, requested_set_size = metadata
+            if requested_set_size is not None and requested_set_size != len(cards):
+                continue
+            try:
+                catalog_sets.append(
+                    CatalogSet(
+                        app_id=app_id,
+                        game_name=game_name,
+                        cards=cards,
+                        set_size=requested_set_size,
+                    )
+                )
+            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+                continue
+        if not catalog_sets:
             return _level_up_response(
                 status="no_opportunity",
                 reason="no_sellable_card",
@@ -2937,10 +3106,20 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
             )
-
-        # Validate the caller-owned snapshot before constructing any maps.  In
-        # particular, silently overwriting a duplicate hash could change which
-        # quantity is sold and would make the recommendation non-deterministic.
+        try:
+            complete_catalog = ResolvedCatalog(
+                generation=catalog_read.generation,
+                generated_at=generated_at,
+                sets=tuple(catalog_sets),
+            )
+        except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+            return _level_up_response(
+                status="unavailable",
+                reason="quote_depth_unavailable",
+                now=current,
+                inventory_time=inventory_time,
+                contract=contract,
+            )
         normalized_holdings: list[Holding] = []
         seen_holding_hashes: set[str] = set()
         for holding in holdings:
@@ -2951,8 +3130,6 @@ class SteamGateway:
                     now=current,
                     inventory_time=inventory_time,
                     contract=contract,
-                    total_sets=len(groups),
-                    resolved_sets=len(groups),
                 )
             if holding.market_hash_name in seen_holding_hashes:
                 return _level_up_response(
@@ -2961,382 +3138,9 @@ class SteamGateway:
                     now=current,
                     inventory_time=inventory_time,
                     contract=contract,
-                    total_sets=len(groups),
-                    resolved_sets=len(groups),
                 )
             seen_holding_hashes.add(holding.market_hash_name)
             normalized_holdings.append(holding)
-        holdings_by_hash = {
-            holding.market_hash_name: holding for holding in normalized_holdings
-        }
-
-        # Source discovery is intentionally card-granular and does not consult
-        # badge level.  A maxed source game can still provide a sellable card
-        # that funds a badge in another (or the same) game.
-        source_app_ids = tuple(
-            app_id
-            for app_id, cards in groups.items()
-            if any(
-                (
-                    (holding := holdings_by_hash.get(card.market_hash_name)) is not None
-                    and holding.owned_quantity >= 1
-                    and holding.sellable_quantity >= 1
-                )
-                for card in cards
-            )
-        )
-        if not source_app_ids:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_sellable_card",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(groups),
-            )
-
-        # The badge request remains bounded to one response, but its relevance
-        # covers every catalog group so an omitted normal badge correctly
-        # defaults to level zero and cannot make an eligible destination look
-        # maxed (or vice versa).
-        try:
-            badge_state = await self._fetch_badge_state(steam_id, groups)
-        except (
-            InvalidSteamApisPayloadError,
-            httpx2.HTTPError,
-            OSError,
-            TimeoutError,
-            TypeError,
-            ValueError,
-            ArithmeticError,
-            RuntimeError,
-        ):
-            return _level_up_response(
-                status="unavailable",
-                reason="badge_data_unavailable",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-            )
-        if now is None:
-            current = datetime.now(UTC)
-        freshness_issue = _level_up_snapshot_issue(
-            current=current,
-            inventory_time=inventory_time,
-            generated_at=generated_at,
-            inventory_limit=contract.max_inventory_age_seconds,
-            quote_limit=quote_limit,
-        )
-        if freshness_issue is not None:
-            return _level_up_response(
-                status="unavailable",
-                reason=freshness_issue,
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-            )
-
-        provider = self.steamapis.booster_pricing
-
-        async def resolve_metadata(
-            candidate_ids: tuple[str, ...],
-        ) -> tuple[dict[str, BoosterResolution], tuple[str, ...]]:
-            """Read metadata and warm at most one bounded pending shortlist."""
-
-            candidate_ids = tuple(dict.fromkeys(candidate_ids))
-            if not candidate_ids:
-                return {}, ()
-
-            def read_metadata_state() -> tuple[
-                dict[str, BoosterResolution], tuple[str, ...]
-            ]:
-                state = provider.read_metadata_state(candidate_ids)
-                if not isinstance(state, BoosterMetadataState):
-                    return {}, candidate_ids
-                candidate_set = set(candidate_ids)
-                values: dict[str, BoosterResolution] = {}
-                for key, value in state.values.items():
-                    key_text = str(key)
-                    if (
-                        key_text in candidate_set
-                        and isinstance(value, BoosterResolution)
-                        and value.game_name is not None
-                    ):
-                        values[key_text] = value
-                pending: list[str] = []
-                for value in state.pending_app_ids:
-                    if value in candidate_set and value not in pending:
-                        pending.append(value)
-                rejected = {
-                    value for value in state.rejected_app_ids if value in candidate_set
-                }
-                # A malformed/incomplete state must warm rather than being
-                # treated as a deliberately rejected game.
-                for value in candidate_ids:
-                    if (
-                        value not in values
-                        and value not in rejected
-                        and value not in pending
-                    ):
-                        pending.append(value)
-                return values, tuple(pending)
-
-            try:
-                fresh_values, pending_ids = read_metadata_state()
-            except (
-                AttributeError,
-                OSError,
-                TypeError,
-                ValueError,
-                ArithmeticError,
-                RuntimeError,
-                sqlite3.Error,
-            ):
-                fresh_values, pending_ids = {}, candidate_ids
-            if pending_ids:
-                shortlist = pending_ids[:MAX_LEVEL_UP_METADATA_APPS]
-                with suppress(
-                    AttributeError,
-                    OSError,
-                    TimeoutError,
-                    TypeError,
-                    ValueError,
-                    ArithmeticError,
-                    RuntimeError,
-                    sqlite3.Error,
-                ):
-                    await provider.resolve(
-                        shortlist,
-                        require_game_name=True,
-                    )
-                try:
-                    fresh_values, pending_ids = read_metadata_state()
-                except (
-                    AttributeError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                    ArithmeticError,
-                    RuntimeError,
-                    sqlite3.Error,
-                ):
-                    fresh_values, pending_ids = {}, candidate_ids
-            return fresh_values, pending_ids
-
-        def qualified_resolution(
-            app_id: int,
-            values: Mapping[str, BoosterResolution],
-        ) -> BoosterResolution | None:
-            resolution = values.get(str(app_id))
-            if not isinstance(resolution, BoosterResolution):
-                return None
-            cards = groups.get(app_id)
-            game_name = resolution.game_name
-            if (
-                cards is None
-                or resolution.card_set_size != len(cards)
-                or not isinstance(game_name, str)
-                or not game_name.strip()
-            ):
-                return None
-            return resolution
-
-        source_candidate_ids = tuple(str(app_id) for app_id in source_app_ids)
-        source_values, pending_ids = await resolve_metadata(source_candidate_ids)
-        if now is None:
-            current = datetime.now(UTC)
-        freshness_issue = _level_up_snapshot_issue(
-            current=current,
-            inventory_time=inventory_time,
-            generated_at=generated_at,
-            inventory_limit=contract.max_inventory_age_seconds,
-            quote_limit=quote_limit,
-        )
-        if freshness_issue is not None:
-            return _level_up_response(
-                status="unavailable",
-                reason=freshness_issue,
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(source_candidate_ids),
-                resolved_sets=len(source_values),
-            )
-        if pending_ids:
-            total_sets = len(source_candidate_ids)
-            return _level_up_response(
-                status="warming",
-                reason="catalog_warming",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=total_sets,
-                resolved_sets=max(0, total_sets - len(pending_ids)),
-                pending_sets=len(pending_ids),
-            )
-        qualified_source_resolutions = {
-            app_id: resolution
-            for app_id in source_app_ids
-            if (resolution := qualified_resolution(app_id, source_values)) is not None
-        }
-        if not qualified_source_resolutions:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_sellable_card",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(source_candidate_ids),
-                resolved_sets=len(source_candidate_ids),
-            )
-
-        # Build a safe destination metadata shortlist.  The pure optimizer
-        # performs the authoritative side quote/depth/fee checks; this pass
-        # only avoids warming destinations whose original missing-card subtotal
-        # cannot fit under any individually sellable source receipt.  Source
-        # apps are retained even when selling the only copy creates a new
-        # missing card, so same-app routes remain visible to the optimizer.
-        max_receipt: int | None = None
-        for app_id in qualified_source_resolutions:
-            for card in groups[app_id]:
-                holding = holdings_by_hash.get(card.market_hash_name)
-                if (
-                    holding is None
-                    or holding.owned_quantity < 1
-                    or holding.sellable_quantity < 1
-                ):
-                    continue
-                buyer_total = _level_up_quote_amount(
-                    card,
-                    side="buy",
-                    now=current,
-                    quote_window=quote_limit,
-                    contract=contract,
-                    require_depth=True,
-                )
-                if buyer_total is None:
-                    continue
-                receipt = seller_receipt_from_buyer_total(buyer_total, contract)
-                if receipt is not None and (
-                    max_receipt is None or receipt > max_receipt
-                ):
-                    max_receipt = receipt
-        if max_receipt is None:
-            return _level_up_response(
-                status="no_opportunity",
-                reason="no_sellable_card",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(source_candidate_ids),
-                resolved_sets=len(qualified_source_resolutions),
-            )
-
-        destination_app_ids: list[int] = []
-        qualified_source_ids = frozenset(qualified_source_resolutions)
-        for app_id, cards in groups.items():
-            if badge_state.level_for_game(app_id) >= 5:
-                continue
-            if app_id in qualified_source_ids:
-                destination_app_ids.append(app_id)
-                continue
-            missing_cards = tuple(
-                card
-                for card in cards
-                if (
-                    holdings_by_hash.get(card.market_hash_name) is None
-                    or holdings_by_hash[card.market_hash_name].owned_quantity < 1
-                )
-            )
-            if not missing_cards:
-                continue
-            subtotal = 0
-            valid = True
-            for card in missing_cards:
-                amount = _level_up_quote_amount(
-                    card,
-                    side="sell",
-                    now=current,
-                    quote_window=quote_limit,
-                    contract=contract,
-                    require_depth=True,
-                )
-                if amount is None:
-                    valid = False
-                    break
-                subtotal += amount
-                if subtotal > 2**63 - 1:
-                    valid = False
-                    break
-            if valid and subtotal <= max_receipt:
-                destination_app_ids.append(app_id)
-        destination_app_ids = sorted(set(destination_app_ids))
-        destination_ids = tuple(str(app_id) for app_id in destination_app_ids)
-        destination_values, pending_ids = await resolve_metadata(destination_ids)
-        if now is None:
-            current = datetime.now(UTC)
-        freshness_issue = _level_up_snapshot_issue(
-            current=current,
-            inventory_time=inventory_time,
-            generated_at=generated_at,
-            inventory_limit=contract.max_inventory_age_seconds,
-            quote_limit=quote_limit,
-        )
-        if freshness_issue is not None:
-            return _level_up_response(
-                status="unavailable",
-                reason=freshness_issue,
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=len(destination_ids),
-                resolved_sets=len(destination_values),
-            )
-        if pending_ids:
-            total_sets = len(destination_ids)
-            return _level_up_response(
-                status="warming",
-                reason="catalog_warming",
-                now=current,
-                inventory_time=inventory_time,
-                contract=contract,
-                total_sets=total_sets,
-                resolved_sets=max(0, total_sets - len(pending_ids)),
-                pending_sets=len(pending_ids),
-            )
-
-        all_resolutions: dict[int, BoosterResolution] = dict(
-            qualified_source_resolutions
-        )
-        for app_id in destination_app_ids:
-            resolution = qualified_resolution(app_id, destination_values)
-            if resolution is not None:
-                all_resolutions[app_id] = resolution
-
-        resolved_sets: list[CatalogSet] = []
-        for app_id, resolution in sorted(all_resolutions.items()):
-            game_name = resolution.game_name
-            if not isinstance(game_name, str) or not game_name.strip():
-                continue
-            try:
-                resolved_sets.append(
-                    CatalogSet(
-                        app_id=app_id,
-                        game_name=game_name.strip(),
-                        cards=groups[app_id],
-                        set_size=resolution.card_set_size,
-                        resolved=True,
-                    )
-                )
-            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
-                continue
-        complete_catalog = ResolvedCatalog(
-            generation=catalog_read.generation,
-            generated_at=generated_at,
-            sets=tuple(resolved_sets),
-            complete=True,
-        )
         catalog_hashes = {
             card.market_hash_name
             for current_set in complete_catalog.sets
@@ -3373,8 +3177,6 @@ class SteamGateway:
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
-                total_sets=len(groups),
-                resolved_sets=len(resolved_sets),
             )
 
     async def refresh_gems(

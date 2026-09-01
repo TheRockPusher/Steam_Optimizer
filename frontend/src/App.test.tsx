@@ -35,6 +35,9 @@ const privateInventory = {
 
 };
 
+const badgeCheckedAt = new Date().toISOString();
+const changedBadgeCheckedAt = new Date(Date.parse(badgeCheckedAt) - 1_000).toISOString();
+
 const signedInSession = {
   authenticated: true,
   user: {
@@ -51,7 +54,9 @@ const signedInSession = {
       status: "public",
       message: "Steam badge data is available.",
       player_xp: 1_250,
-      player_level: 11
+      player_level: 11,
+      checked_at: badgeCheckedAt,
+      normal_badge_levels: []
     }
   }
 };
@@ -166,9 +171,6 @@ function levelUpNoOpportunityResponse(
     reason,
     generated_at: "2026-08-29T12:00:00Z",
     inventory_refreshed_at: inventoryRefreshedAt,
-    catalog_total_sets: 0,
-    catalog_resolved_sets: 0,
-    catalog_pending_sets: 0,
     currency_code: "USD",
     minor_digits: 2,
     price_basis: "instant_top_of_book",
@@ -182,6 +184,22 @@ function levelUpNoOpportunityResponse(
     source: null,
     destinations: [],
     totals: null
+  };
+}
+
+function levelUpNoOpportunityForRequest(
+  reason: "no_sellable_card" | "no_positive_xp_swap" = "no_sellable_card"
+) {
+  return async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as {
+      inventory_refreshed_at: string;
+    };
+    const response = levelUpNoOpportunityResponse(
+      reason,
+      request.inventory_refreshed_at
+    );
+    response.generated_at = new Date().toISOString();
+    return jsonResponse(response);
   };
 }
 
@@ -715,7 +733,9 @@ describe("App", () => {
           status: "unavailable",
           message: "Steam badge check is unavailable.",
           player_xp: null,
-          player_level: null
+          player_level: null,
+          checked_at: null,
+          normal_badge_levels: []
         }
       }
     };
@@ -758,7 +778,9 @@ describe("App", () => {
           status: "unavailable",
           message: "Steam badge check is unavailable.",
           player_xp: null,
-          player_level: null
+          player_level: null,
+          checked_at: null,
+          normal_badge_levels: []
         }
       }
     };
@@ -770,7 +792,9 @@ describe("App", () => {
           status: "public",
           message: "Steam badge data is available.",
           player_xp: 1_450,
-          player_level: 12
+          player_level: 12,
+          checked_at: changedBadgeCheckedAt,
+          normal_badge_levels: []
         }
       }
     };
@@ -823,32 +847,21 @@ describe("App", () => {
           status: "public",
           message: "Steam badge data is available.",
           player_xp: 1_450,
-          player_level: 12
+          player_level: 12,
+          checked_at: changedBadgeCheckedAt,
+          normal_badge_levels: []
         }
       }
-    };
-    const responseForRequest = (
-      reason: "no_sellable_card" | "no_positive_xp_swap"
-    ) => async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const request = JSON.parse(String(init?.body)) as {
-        inventory_refreshed_at: string;
-      };
-      const response = levelUpNoOpportunityResponse(
-        reason,
-        request.inventory_refreshed_at
-      );
-      response.generated_at = new Date().toISOString();
-      return jsonResponse(response);
     };
     const inventory = publicInventory([inventoryItem(1)]);
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory))
       .mockImplementationOnce(
-        responseForRequest("no_sellable_card")
+        levelUpNoOpportunityForRequest("no_sellable_card")
       )
       .mockResolvedValueOnce(jsonResponse(levelTwelveSession))
-      .mockImplementationOnce(responseForRequest("no_positive_xp_swap"));
+      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_positive_xp_swap"));
 
     render(<App />);
 
@@ -1464,9 +1477,7 @@ describe("App", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse())
-      );
+      .mockImplementationOnce(levelUpNoOpportunityForRequest());
     render(<App />);
 
     const tablist = await screen.findByRole("tablist", {
@@ -1540,9 +1551,7 @@ describe("App", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse())
-      );
+      .mockImplementationOnce(levelUpNoOpportunityForRequest());
 
     render(<App />);
 
@@ -1660,18 +1669,24 @@ describe("App", () => {
   });
 
   it("invalidates a cached recommendation when ownership is refreshed", async () => {
-    const initialInventory = publicInventory([inventoryItem(1)]);
-    const refreshedInventory = publicInventory([inventoryItem(2)]);
+    const sourceCard = tradingCardItem(1, {
+      market_hash_name: "440-Card 0001 (Trading Card)",
+      gem_key: null,
+      gem_yield: null
+    });
+    const initialInventory = publicInventory([sourceCard]);
+    const refreshedInventory = publicInventory(
+      [{ ...sourceCard, quantity: 2 }],
+      { total_asset_count: 2 }
+    );
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(initialInventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_sellable_card"))
-      )
+      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_sellable_card"))
       .mockResolvedValueOnce(jsonResponse(refreshedInventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_positive_xp_swap"))
+      .mockImplementationOnce(
+        levelUpNoOpportunityForRequest("no_positive_xp_swap")
       );
 
     render(<App />);
@@ -1691,6 +1706,7 @@ describe("App", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Refresh inventory" })
     );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
 
     expect(
       await screen.findByText(/No one-card sale funds a badge path with more XP/)
@@ -1717,13 +1733,11 @@ describe("App", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(initialInventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_sellable_card"))
-      )
+      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_sellable_card"))
       .mockResolvedValueOnce(jsonResponse(changedSession))
       .mockResolvedValueOnce(jsonResponse(changedInventory))
-      .mockResolvedValueOnce(
-        jsonResponse(levelUpNoOpportunityResponse("no_positive_xp_swap"))
+      .mockImplementationOnce(
+        levelUpNoOpportunityForRequest("no_positive_xp_swap")
       );
 
     render(<App />);

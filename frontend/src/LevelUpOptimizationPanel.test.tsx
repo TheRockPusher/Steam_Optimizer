@@ -7,17 +7,43 @@ import {
 } from "./LevelUpOptimizationPanel";
 import {
   aggregateNormalCardOwnership,
+  buildLevelUpOptimizationRequest,
   buildSteamMarketListingUrl,
   buildSteamProfileGamecardsUrl,
   formatMinorUnits,
   isLevelUpOptimizationResponse,
+  levelUpSnapshotKey,
+  requestLevelUpOptimization,
   type LevelUpOptimizationResponse,
   type LevelUpReadyResponse
 } from "./levelUpOptimization";
 
 const generatedAt = "2026-08-29T12:00:00Z";
 const inventoryRefreshedAt = "2026-08-29T11:30:00Z";
+const badgeRefreshedAt = "2026-08-29T11:45:00Z";
 const steamId = "76561198000000001";
+
+const badges = {
+  status: "public" as const,
+  message: "Steam badge data is available.",
+  player_xp: 1_250,
+  player_level: 11,
+  checked_at: badgeRefreshedAt,
+  normal_badge_levels: []
+};
+
+const boosters = [
+  {
+    game_app_id: "440",
+    game_name: "Team Fortress 2",
+    card_set_size: 5
+  },
+  {
+    game_app_id: "570",
+    game_name: "Dota 2",
+    card_set_size: 5
+  }
+];
 
 function sellRow(appId: string, index: number) {
   return {
@@ -54,9 +80,6 @@ function readyResponse(): LevelUpReadyResponse {
     reason: "ready",
     generated_at: generatedAt,
     inventory_refreshed_at: inventoryRefreshedAt,
-    catalog_total_sets: 2,
-    catalog_resolved_sets: 2,
-    catalog_pending_sets: 0,
     currency_code: "USD",
     minor_digits: 2,
     price_basis: "instant_top_of_book",
@@ -111,12 +134,12 @@ function readyResponse(): LevelUpReadyResponse {
 }
 
 function responseWithStatus(
-  status: "no_opportunity" | "warming" | "unavailable",
+  status: "no_opportunity" | "unavailable",
   reason:
     | "no_sellable_card"
     | "no_positive_xp_swap"
-    | "catalog_warming"
     | "price_generation_stale"
+    | "badge_data_unavailable"
     | "steamapi_key_missing"
 ): LevelUpOptimizationResponse {
   return {
@@ -124,9 +147,6 @@ function responseWithStatus(
     reason,
     generated_at: generatedAt,
     inventory_refreshed_at: inventoryRefreshedAt,
-    catalog_total_sets: 3,
-    catalog_resolved_sets: status === "warming" ? 2 : 3,
-    catalog_pending_sets: status === "warming" ? 1 : 0,
     currency_code: "USD",
     minor_digits: 2,
     price_basis: "instant_top_of_book",
@@ -150,6 +170,8 @@ const inventoryItems = [
     marketable: true,
     tradable: true,
     item_type: "trading_card",
+    game_app_id: "440",
+    game_name: "Team Fortress 2",
     icon_url: "https://community.cloudflare.steamstatic.com/economy/image/source-0"
   },
   {
@@ -165,6 +187,33 @@ const inventoryItems = [
     marketable: false,
     tradable: true,
     item_type: "trading_card"
+  },
+  {
+    market_hash_name: "570-Owned 0 (Trading Card)",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    game_app_id: "570",
+    game_name: "Dota 2"
+  },
+  {
+    market_hash_name: "570-Owned 1 (Trading Card)",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    game_app_id: "570",
+    game_name: "Dota 2"
+  },
+  {
+    market_hash_name: "570-Owned 2 (Trading Card)",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    game_app_id: "570",
+    game_name: "Dota 2"
   },
   {
     market_hash_name: "440-Foil (Foil Trading Card)",
@@ -197,6 +246,8 @@ function renderPanel(
       steamId={steamId}
       inventoryStatus="public"
       items={inventoryItems}
+      boosters={boosters}
+      badges={badges}
       inventoryRefreshedAt={inventoryRefreshedAt}
       isInventoryLoading={false}
       isActive
@@ -225,19 +276,130 @@ async function flushPanelEffects() {
 }
 
 describe("normal-card ownership snapshots", () => {
-  it("deduplicates exact normal hashes and sums only marketable/tradable copies", () => {
+  it("deduplicates exact normal hashes and counts every marketable copy", () => {
     expect(aggregateNormalCardOwnership(inventoryItems)).toEqual([
       {
         market_hash_name: "440-Source 0 (Trading Card)",
         owned_quantity: 3,
-        sellable_quantity: 2
+        sellable_quantity: 3
       },
       {
         market_hash_name: "440-Source 1 (Trading Card)",
         owned_quantity: 1,
         sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 0 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 1 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 2 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
       }
     ]);
+  });
+  it("includes every normal-card game and joins loaded badge and booster metadata", () => {
+    const request = buildLevelUpOptimizationRequest(
+      [
+        ...inventoryItems,
+        {
+          market_hash_name: "730-Other Card (Trading Card)",
+          quantity: 1,
+          marketable: false,
+          tradable: false,
+          item_type: "trading_card",
+          game_app_id: "730",
+          game_name: "Counter-Strike 2"
+        }
+      ],
+      [
+        ...boosters,
+        {
+          game_app_id: "730",
+          game_name: "Counter-Strike 2",
+          card_set_size: null
+        }
+      ],
+      {
+        ...badges,
+        normal_badge_levels: [{ app_id: 440, level: 3 }]
+      },
+      inventoryRefreshedAt
+    );
+
+    expect(request.games).toEqual([
+      {
+        app_id: "440",
+        game_name: "Team Fortress 2",
+        card_set_size: 5,
+        badge_level: 3
+      },
+      {
+        app_id: "570",
+        game_name: "Dota 2",
+        card_set_size: 5,
+        badge_level: 0
+      },
+      {
+        app_id: "730",
+        game_name: "Counter-Strike 2",
+        card_set_size: null,
+        badge_level: 0
+      }
+    ]);
+    expect(request.cards).toEqual([
+      {
+        market_hash_name: "440-Source 0 (Trading Card)",
+        owned_quantity: 3,
+        sellable_quantity: 3
+      },
+      {
+        market_hash_name: "440-Source 1 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 0 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 1 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "570-Owned 2 (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      },
+      {
+        market_hash_name: "730-Other Card (Trading Card)",
+        owned_quantity: 1,
+        sellable_quantity: 0
+      }
+    ]);
+  });
+  it("rejects game names that exceed the inventory wire limit", () => {
+    const item = {
+      ...inventoryItems[0],
+      game_name: "x".repeat(8193)
+    };
+    expect(() =>
+      buildLevelUpOptimizationRequest(
+        [item],
+        [],
+        badges,
+        inventoryRefreshedAt
+      )
+    ).toThrow("Inventory game metadata is unavailable.");
   });
 });
 
@@ -339,8 +501,6 @@ describe("strict response validation", () => {
       ...buyRow("580", 0),
       buyer_total: 1
     };
-    response.catalog_total_sets = 3;
-    response.catalog_resolved_sets = 3;
     response.destinations.push({
       app_id: "580",
       game_name: "Left 4 Dead 2",
@@ -364,15 +524,22 @@ describe("strict response validation", () => {
     expect(isLevelUpOptimizationResponse(response)).toBe(true);
   });
 
-  it("accepts current no-opportunity, warming, and unavailable states", () => {
-    expect(isLevelUpOptimizationResponse(responseWithStatus("no_opportunity", "no_sellable_card"))).toBe(true);
+  it("accepts current no-opportunity and unavailable states", () => {
+    expect(
+      isLevelUpOptimizationResponse(
+        responseWithStatus("no_opportunity", "no_sellable_card")
+      )
+    ).toBe(true);
     expect(
       isLevelUpOptimizationResponse(
         responseWithStatus("no_opportunity", "no_positive_xp_swap")
       )
     ).toBe(true);
-    expect(isLevelUpOptimizationResponse(responseWithStatus("warming", "catalog_warming"))).toBe(true);
-    expect(isLevelUpOptimizationResponse(responseWithStatus("unavailable", "price_generation_stale"))).toBe(true);
+    expect(
+      isLevelUpOptimizationResponse(
+        responseWithStatus("unavailable", "price_generation_stale")
+      )
+    ).toBe(true);
     expect(
       isLevelUpOptimizationResponse(
         responseWithStatus("unavailable", "steamapi_key_missing")
@@ -392,18 +559,15 @@ describe("strict response validation", () => {
     response.totals.scope_limited = true;
     expect(isLevelUpOptimizationResponse(response)).toBe(false);
   });
-  it("rejects conclusive responses with unresolved catalog sets", () => {
-    const readyWithPending = readyResponse();
-    readyWithPending.catalog_total_sets = 3;
-    readyWithPending.catalog_pending_sets = 1;
-    expect(isLevelUpOptimizationResponse(readyWithPending)).toBe(false);
-    const noOpportunityWithPending = responseWithStatus(
-      "no_opportunity",
-      "no_sellable_card"
-    );
-    noOpportunityWithPending.catalog_total_sets = 4;
-    noOpportunityWithPending.catalog_pending_sets = 1;
-    expect(isLevelUpOptimizationResponse(noOpportunityWithPending)).toBe(false);
+
+  it("rejects obsolete catalog progress fields", () => {
+    const response = {
+      ...readyResponse(),
+      catalog_total_sets: 1,
+      catalog_resolved_sets: 1,
+      catalog_pending_sets: 0
+    };
+    expect(isLevelUpOptimizationResponse(response)).toBe(false);
   });
 });
 
@@ -419,19 +583,73 @@ describe("request and safe navigation helpers", () => {
     expect(new Headers(options?.headers).get("x-expected-steam-id")).toBe(steamId);
     expect(JSON.parse(String(options?.body))).toEqual({
       inventory_refreshed_at: inventoryRefreshedAt,
+      badge_refreshed_at: badgeRefreshedAt,
+      player_xp: 1_250,
+      player_level: 11,
+      games: [
+        {
+          app_id: "440",
+          game_name: "Team Fortress 2",
+          card_set_size: 5,
+          badge_level: 0
+        },
+        {
+          app_id: "570",
+          game_name: "Dota 2",
+          card_set_size: 5,
+          badge_level: 0
+        }
+      ],
       cards: [
         {
           market_hash_name: "440-Source 0 (Trading Card)",
           owned_quantity: 3,
-          sellable_quantity: 2
+          sellable_quantity: 3
         },
         {
           market_hash_name: "440-Source 1 (Trading Card)",
           owned_quantity: 1,
           sellable_quantity: 0
+        },
+        {
+          market_hash_name: "570-Owned 0 (Trading Card)",
+          owned_quantity: 1,
+          sellable_quantity: 0
+        },
+        {
+          market_hash_name: "570-Owned 1 (Trading Card)",
+          owned_quantity: 1,
+          sellable_quantity: 0
+        },
+        {
+          market_hash_name: "570-Owned 2 (Trading Card)",
+          owned_quantity: 1,
+          sellable_quantity: 0
         }
       ]
     });
+  });
+  it("rejects a response for a different submitted snapshot", async () => {
+    const request = buildLevelUpOptimizationRequest(
+      inventoryItems,
+      boosters,
+      badges,
+      inventoryRefreshedAt
+    );
+    const response = readyResponse();
+    response.inventory_refreshed_at = "2026-08-29T11:29:00Z";
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+
+    await expect(
+      requestLevelUpOptimization(steamId, request)
+    ).rejects.toThrow(
+      "The level-up optimization service returned an invalid response."
+    );
   });
 
   it("uses fixed Steam origins and encodes path segments", () => {
@@ -476,6 +694,73 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
   });
+  it("rechecks a future snapshot when it becomes current", async () => {
+    const futureInventoryRefreshedAt = "2026-08-29T12:01:00Z";
+    const response = readyResponse();
+    response.generated_at = "2026-08-29T12:01:01Z";
+    response.inventory_refreshed_at = futureInventoryRefreshedAt;
+    response.valid_until = "2026-08-29T13:00:00Z";
+    renderPanel(response, {
+      inventoryRefreshedAt: futureInventoryRefreshedAt
+    });
+
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Refresh inventory" })
+    ).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
+  });
+  it("refreshes badge data when the submitted badge snapshot is unavailable", async () => {
+    const onRefreshBadges = vi.fn();
+    renderPanel(
+      responseWithStatus("unavailable", "badge_data_unavailable"),
+      { onRefreshBadges }
+    );
+    await flushPanelEffects();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh badge data" })
+    );
+    expect(onRefreshBadges).toHaveBeenCalledTimes(1);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+  it("does not POST when a normal-card game has no identity metadata", async () => {
+    const missingGameNameItems = inventoryItems.map((item) =>
+      item.item_type === "trading_card"
+        ? { ...item, game_name: null }
+        : item
+    );
+    renderPanel(undefined, {
+      items: missingGameNameItems,
+      boosters: []
+    });
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Game metadata unavailable" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh inventory" })).toBeInTheDocument();
+  });
+
+  it("keys the recommendation cache by the badge snapshot timestamp", () => {
+    const originalKey = levelUpSnapshotKey(
+      steamId,
+      inventoryRefreshedAt,
+      badgeRefreshedAt
+    );
+    const changedKey = levelUpSnapshotKey(
+      steamId,
+      inventoryRefreshedAt,
+      "2026-08-29T11:46:00Z"
+    );
+    expect(originalKey).not.toBeNull();
+    expect(changedKey).not.toBe(originalKey);
+  });
 
   it("retains the same-key in-flight request while switching tabs", async () => {
     let resolveResponse!: (response: Response) => void;
@@ -487,6 +772,8 @@ describe("lazy panel lifecycle and state surfaces", () => {
       steamId,
       inventoryStatus: "public",
       items: inventoryItems,
+      boosters,
+      badges,
       inventoryRefreshedAt,
       isInventoryLoading: false,
       isActive: true,
@@ -527,6 +814,8 @@ describe("lazy panel lifecycle and state surfaces", () => {
           steamId={steamId}
           inventoryStatus="public"
           items={inventoryItems}
+          boosters={boosters}
+          badges={badges}
           inventoryRefreshedAt={inventoryRefreshedAt}
           isInventoryLoading={false}
           isActive
@@ -644,6 +933,8 @@ describe("lazy panel lifecycle and state surfaces", () => {
         steamId={steamId}
         inventoryStatus="public"
         items={inventoryItems}
+        boosters={boosters}
+        badges={badges}
         inventoryRefreshedAt={inventoryRefreshedAt}
         isInventoryLoading={false}
         isActive
@@ -663,7 +954,7 @@ describe("lazy panel lifecycle and state surfaces", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders no-opportunity, warming, and unavailable recovery copy", async () => {
+  it("renders no-opportunity and unavailable recovery copy", async () => {
     renderPanel(responseWithStatus("no_opportunity", "no_sellable_card"));
     await flushPanelEffects();
     expect(
@@ -696,10 +987,12 @@ describe("lazy panel lifecycle and state surfaces", () => {
         steamId={steamId}
         inventoryStatus="private"
         items={inventoryItems}
+        boosters={boosters}
+        badges={badges}
         inventoryRefreshedAt={inventoryRefreshedAt}
         isInventoryLoading={false}
-        isActive
         onRefreshInventory={vi.fn()}
+        isActive
       />
     );
     expect(screen.getByText(/Make your Steam inventory public/)).toBeInTheDocument();

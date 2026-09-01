@@ -1147,10 +1147,6 @@ h3 {
   background: var(--color-accent-soft);
 }
 
-.level-up-optimization-status-warming {
-  border-left-color: var(--color-private);
-  background: var(--color-private-soft);
-}
 
 .level-up-optimization-status-no-opportunity {
   border-left-color: var(--color-line);

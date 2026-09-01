@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode
@@ -18,11 +19,12 @@ import {
   levelUpSnapshotKey,
   LEVEL_UP_INVENTORY_MAX_AGE_MS,
   requestLevelUpOptimization,
+  type LevelUpBadgeSnapshot,
+  type LevelUpBooster,
   type LevelUpBuyRow,
   type LevelUpDestinationPlan,
   type LevelUpInventoryItem,
   type LevelUpMoneyMetadata,
-  type LevelUpOptimizationRequest,
   type LevelUpOptimizationResponse,
   type LevelUpReason,
   type LevelUpReadyResponse,
@@ -30,15 +32,17 @@ import {
 } from "./levelUpOptimization";
 
 export type LevelUpInventoryStatus = "public" | "private" | "unavailable";
-
 export type LevelUpOptimizationPanelProps = {
   steamId: string | null;
   inventoryStatus: LevelUpInventoryStatus;
   items: readonly LevelUpInventoryItem[];
+  boosters: readonly LevelUpBooster[];
+  badges: LevelUpBadgeSnapshot;
   inventoryRefreshedAt: string | null;
   isInventoryLoading: boolean;
   isActive: boolean;
   onRefreshInventory: () => void;
+  onRefreshBadges?: () => void;
 };
 
 export const LEVEL_UP_OPTIMIZATION_PANEL_ID = "level-up-optimization-panel";
@@ -58,9 +62,7 @@ const REASON_COPY: Record<LevelUpReason, string> = {
   price_generation_stale:
     "Current market prices are stale. Try refreshing the recommendation later.",
   quote_depth_unavailable:
-    "The market did not provide enough top-of-book quote depth for this calculation.",
-  catalog_warming:
-    "Steam card-set metadata is still being validated.",
+    "Current market order-book depth is unavailable. Try refreshing the recommendation later.",
   no_sellable_card:
     "No sellable normal card with a usable current bid is available in this inventory snapshot.",
   no_positive_xp_swap:
@@ -484,12 +486,14 @@ function ResponseSurface({
   steamId,
   onRefresh,
   onRefreshInventory,
+  onRefreshBadges,
   sourceIcons
 }: {
   response: LevelUpOptimizationResponse;
   steamId: string | null;
   onRefresh: () => void;
   onRefreshInventory: () => void;
+  onRefreshBadges: () => void;
   sourceIcons: ReadonlyMap<string, string>;
 }) {
   switch (response.status) {
@@ -515,19 +519,6 @@ function ResponseSurface({
           <p>No manual action plan is shown because there is no strictly positive XP advantage to recommend.</p>
         </StatusSurface>
       );
-    case "warming":
-      return (
-        <StatusSurface
-          status="warming"
-          title="Validating Steam card-set metadata"
-          action={<RefreshButton onClick={onRefresh}>Try again</RefreshButton>}
-        >
-          <p>{REASON_COPY[response.reason]}</p>
-          <p>
-            Resolved {response.catalog_resolved_sets} of {response.catalog_total_sets} sets; {response.catalog_pending_sets} pending.
-          </p>
-        </StatusSurface>
-      );
     case "unavailable":
       return (
         <StatusSurface
@@ -536,10 +527,11 @@ function ResponseSurface({
           action={
             response.reason === "inventory_snapshot_too_old" ? (
               <RefreshButton onClick={onRefreshInventory}>Refresh inventory</RefreshButton>
+            ) : response.reason === "badge_data_unavailable" ? (
+              <RefreshButton onClick={onRefreshBadges}>Refresh badge data</RefreshButton>
             ) : response.reason === "price_generation_stale" ||
               response.reason === "price_generation_unavailable" ||
-              response.reason === "quote_depth_unavailable" ||
-              response.reason === "badge_data_unavailable" ? (
+              response.reason === "quote_depth_unavailable" ? (
               <RefreshButton onClick={onRefresh}>Refresh recommendation</RefreshButton>
             ) : undefined
           }
@@ -584,15 +576,17 @@ function isAbortError(error: unknown): boolean {
     error.name === "AbortError"
   );
 }
-
 export function LevelUpOptimizationPanel({
   steamId,
   inventoryStatus,
   items,
+  boosters,
+  badges,
   inventoryRefreshedAt,
   isInventoryLoading,
   isActive,
-  onRefreshInventory
+  onRefreshInventory,
+  onRefreshBadges = onRefreshInventory
 }: LevelUpOptimizationPanelProps) {
   const [state, setState] = useState<LevelUpState>({ kind: "idle", key: null });
   const cacheRef = useRef(new Map<string, LevelUpOptimizationResponse>());
@@ -604,27 +598,80 @@ export function LevelUpOptimizationPanel({
   const tokenRef = useRef(0);
   const mountedRef = useRef(true);
   const [inventoryClock, setInventoryClock] = useState(Date.now);
-  const inputRef = useRef({ steamId, items, inventoryRefreshedAt });
+  const requestInput = useMemo(() => {
+    try {
+      return {
+        request: buildLevelUpOptimizationRequest(
+          items,
+          boosters,
+          badges,
+          inventoryRefreshedAt ?? ""
+        ),
+        message: null
+      };
+    } catch {
+      return {
+        request: null,
+        message:
+          "Steam badge or game identity data is unavailable. Refresh inventory and try again."
+      };
+    }
+  }, [badges, boosters, inventoryRefreshedAt, items]);
+  const inputRef = useRef({
+    steamId,
+    items,
+    boosters,
+    badges,
+    inventoryRefreshedAt,
+    request: requestInput.request
+  });
   useEffect(() => {
-    inputRef.current = { steamId, items, inventoryRefreshedAt };
-  }, [inventoryRefreshedAt, items, steamId]);
+    inputRef.current = {
+      steamId,
+      items,
+      boosters,
+      badges,
+      inventoryRefreshedAt,
+      request: requestInput.request
+    };
+  }, [
+    badges,
+    boosters,
+    inventoryRefreshedAt,
+    items,
+    requestInput.request,
+    steamId
+  ]);
 
-  const snapshotKey = levelUpSnapshotKey(steamId, inventoryRefreshedAt);
+  const snapshotKey = levelUpSnapshotKey(
+    steamId,
+    inventoryRefreshedAt,
+    badges.checked_at,
+    requestInput.request
+  );
   useEffect(() => {
-    if (
-      inventoryRefreshedAt === null ||
-      !isLevelUpIsoTimestamp(inventoryRefreshedAt)
-    ) {
+    const timestamps = [inventoryRefreshedAt, badges.checked_at].filter(
+      (timestamp): timestamp is string => isLevelUpIsoTimestamp(timestamp)
+    );
+    if (timestamps.length === 0) {
       return;
     }
-    const expiresAt =
-      Date.parse(inventoryRefreshedAt) + LEVEL_UP_INVENTORY_MAX_AGE_MS;
     const now = Date.now();
-    const expirationTimer = window.setTimeout(() => {
+    const transitionTimes = timestamps.flatMap((timestamp) => {
+      const startsAt = Date.parse(timestamp);
+      return [startsAt, startsAt + LEVEL_UP_INVENTORY_MAX_AGE_MS];
+    });
+    const nextTransition = Math.min(
+      ...transitionTimes.filter((timestamp) => timestamp > now)
+    );
+    if (!Number.isFinite(nextTransition)) {
+      return;
+    }
+    const freshnessTimer = window.setTimeout(() => {
       setInventoryClock(Date.now());
-    }, Math.max(0, expiresAt - now) + 1);
-    return () => window.clearTimeout(expirationTimer);
-  }, [inventoryRefreshedAt]);
+    }, nextTransition - now + 1);
+    return () => window.clearTimeout(freshnessTimer);
+  }, [badges.checked_at, inventoryClock, inventoryRefreshedAt]);
   useEffect(() => {
     let current = true;
     queueMicrotask(() => {
@@ -635,9 +682,13 @@ export function LevelUpOptimizationPanel({
     return () => {
       current = false;
     };
-  }, [isActive]);
+  }, [badges.checked_at, inventoryRefreshedAt, isActive]);
   const inventoryIsFresh = isInventorySnapshotFresh(
     inventoryRefreshedAt,
+    inventoryClock
+  );
+  const badgeIsFresh = isInventorySnapshotFresh(
+    badges.checked_at,
     inventoryClock
   );
 
@@ -652,8 +703,14 @@ export function LevelUpOptimizationPanel({
       current.steamId === null ||
       current.inventoryRefreshedAt === null ||
       !isLevelUpIsoTimestamp(current.inventoryRefreshedAt) ||
-      !isInventorySnapshotFresh(current.inventoryRefreshedAt, Date.now())
+      !isInventorySnapshotFresh(current.inventoryRefreshedAt, Date.now()) ||
+      !isInventorySnapshotFresh(current.badges.checked_at, Date.now()) ||
+      current.request === null
     ) {
+      return;
+    }
+    const request = current.request;
+    if (request === null) {
       return;
     }
     const existingRequest = requestRef.current;
@@ -681,20 +738,6 @@ export function LevelUpOptimizationPanel({
     const token = ++tokenRef.current;
     requestRef.current = { key, controller, token };
     setState({ kind: "loading", key });
-    let request: LevelUpOptimizationRequest;
-    try {
-      request = buildLevelUpOptimizationRequest(current.items, current.inventoryRefreshedAt);
-    } catch {
-      if (requestRef.current?.token === token) {
-        requestRef.current = null;
-        setState({
-          kind: "error",
-          key,
-          message: "Inventory ownership could not be normalized for a recommendation."
-        });
-      }
-      return;
-    }
     void requestLevelUpOptimization(current.steamId, request, controller.signal)
       .then((response) => {
         if (
@@ -749,7 +792,9 @@ export function LevelUpOptimizationPanel({
       inventoryStatus === "public" &&
       !isInventoryLoading &&
       snapshotKey !== null &&
-      inventoryIsFresh;
+      inventoryIsFresh &&
+      badgeIsFresh &&
+      requestInput.request !== null;
     if (
       requestRef.current !== null &&
       (!lifecycleValid || requestRef.current.key !== snapshotKey)
@@ -762,11 +807,13 @@ export function LevelUpOptimizationPanel({
     requestForKey(snapshotKey);
   }, [
     abortCurrent,
+    badgeIsFresh,
     inventoryIsFresh,
     inventoryStatus,
     isActive,
     isInventoryLoading,
     requestForKey,
+    requestInput.request,
     snapshotKey
   ]);
 
@@ -796,17 +843,23 @@ export function LevelUpOptimizationPanel({
       inventoryStatus === "public" &&
       !isInventoryLoading
     ) {
-      if (isInventorySnapshotFresh(inventoryRefreshedAt, Date.now())) {
+      if (
+        isInventorySnapshotFresh(inventoryRefreshedAt, Date.now()) &&
+        isInventorySnapshotFresh(badges.checked_at, Date.now()) &&
+        requestInput.request !== null
+      ) {
         requestForKey(snapshotKey, true);
       } else {
         setInventoryClock(Date.now());
       }
     }
   }, [
+    badges.checked_at,
     inventoryRefreshedAt,
     inventoryStatus,
     isInventoryLoading,
     requestForKey,
+    requestInput.request,
     snapshotKey
   ]);
 
@@ -837,9 +890,10 @@ export function LevelUpOptimizationPanel({
       ? activeState.response
       : activeState.kind === "response" &&
         activeState.response.status === "ready" &&
-        !inventoryIsFresh
+        (!inventoryIsFresh || !badgeIsFresh)
         ? activeState.response
         : null;
+  const badgeUnavailable = badges.status !== "public" || !badgeIsFresh;
   let content: ReactNode;
   if (!isActive) {
     content = null;
@@ -856,6 +910,34 @@ export function LevelUpOptimizationPanel({
         onRefreshInventory={refreshInventory}
       />
     );
+  } else if (badgeUnavailable) {
+    content = (
+      <StatusSurface
+        status="unavailable"
+        title="Refresh badge data to calculate a plan"
+        action={<RefreshButton onClick={onRefreshBadges}>Refresh badge data</RefreshButton>}
+      >
+        <p>
+          {badges.status === "public"
+            ? "Steam badge data is missing or too old for a safe recommendation."
+            : badges.message}
+        </p>
+      </StatusSurface>
+    );
+  } else if (
+    requestInput.request === null &&
+    snapshotKey !== null &&
+    inventoryIsFresh
+  ) {
+    content = (
+      <StatusSurface
+        status="unavailable"
+        title="Game metadata unavailable"
+        action={<RefreshButton onClick={refreshInventory}>Refresh inventory</RefreshButton>}
+      >
+        <p>{requestInput.message ?? "Refresh inventory to load game identity data."}</p>
+      </StatusSurface>
+    );
   } else if (expiredResponse !== null) {
     content = steamId === null ? (
       <StatusSurface status="unavailable" title="Level-up optimization unavailable">
@@ -866,9 +948,11 @@ export function LevelUpOptimizationPanel({
         response={expiredResponse}
         steamId={steamId}
         expired
-        onRefresh={inventoryIsFresh ? refreshRecommendation : refreshInventory}
+        onRefresh={inventoryIsFresh && badgeIsFresh ? refreshRecommendation : refreshInventory}
         refreshLabel={
-          inventoryIsFresh ? "Refresh recommendation" : "Refresh inventory"
+          inventoryIsFresh && badgeIsFresh
+            ? "Refresh recommendation"
+            : "Refresh inventory"
         }
         sourceIcons={sourceIcons}
       />
@@ -906,6 +990,7 @@ export function LevelUpOptimizationPanel({
         steamId={steamId}
         onRefresh={refreshRecommendation}
         onRefreshInventory={refreshInventory}
+        onRefreshBadges={onRefreshBadges}
         sourceIcons={sourceIcons}
       />
     );
@@ -923,10 +1008,18 @@ export function LevelUpOptimizationPanel({
       announcement = "Calculating a one-card level-up plan…";
     } else if (inventoryStatus !== "public") {
       announcement = "Level-up optimization unavailable.";
+    } else if (badgeUnavailable) {
+      announcement = "Refresh badge data to calculate a plan.";
+    } else if (
+      requestInput.request === null &&
+      snapshotKey !== null &&
+      inventoryIsFresh
+    ) {
+      announcement = "Game metadata is unavailable.";
     } else if (expiredResponse !== null) {
-      announcement = inventoryIsFresh
+      announcement = inventoryIsFresh && badgeIsFresh
         ? "Quote expired."
-        : "Quote and inventory snapshot expired.";
+        : "Quote and snapshot expired.";
     } else if (snapshotKey === null || !inventoryIsFresh) {
       announcement = "Refresh inventory to calculate a plan.";
     } else if (activeState.kind === "loading") {
@@ -939,9 +1032,7 @@ export function LevelUpOptimizationPanel({
           ? "One-card level-up recommendation ready."
           : activeState.response.status === "no_opportunity"
             ? "No one-card level-up opportunity."
-            : activeState.response.status === "warming"
-              ? "Steam card-set metadata is still being validated."
-              : "Level-up optimization unavailable.";
+            : "Level-up optimization unavailable.";
     }
   }
 

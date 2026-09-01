@@ -21,7 +21,9 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictInt,
+    StrictStr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -34,9 +36,15 @@ from app.cookies import InvalidCookieError, SignedCookieCodec, utc_datetime
 from app.gem_pricing import GemBorderColor, GemKey
 from app.json_parsing import DuplicateJSONKeyError, reject_duplicate_object_keys
 from app.level_up_optimizer import (
+    MAX_APP_ID,
+    MAX_GAME_NAME_LENGTH,
+    MAX_PLAYER_LEVEL,
+    MAX_PLAYER_XP,
+    BadgeState,
     Holding,
     LevelUpOptimizationResponse,
     OptimizerInputError,
+    level_for_xp,
     parse_normal_card_hash,
 )
 from app.steam_gateway import BadgeCheck, InventoryCheck, ProfileCheck
@@ -62,6 +70,7 @@ MAX_LEVEL_UP_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_LEVEL_UP_CARD_ROWS = 10_000
 MAX_LEVEL_UP_HASH_LENGTH = 512
 MAX_LEVEL_UP_CARD_QUANTITY = 1_000_000
+MAX_LEVEL_UP_GAME_ROWS = 10_000
 _LEVEL_UP_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -73,6 +82,11 @@ _LEVEL_UP_SELLABLE_QUANTITY_ERROR = "sellable quantity exceeds owned quantity"
 _LEVEL_UP_NORMAL_CARD_ERROR = "market hash is not a normal trading card"
 _LEVEL_UP_TIMESTAMP_ERROR = "inventory timestamp is invalid"
 _LEVEL_UP_DUPLICATE_HASH_ERROR = "card hashes must be unique"
+_LEVEL_UP_GAME_NAME_ERROR = "game name is required"
+_LEVEL_UP_GAME_APP_ID_ERROR = "game AppID is invalid"
+_LEVEL_UP_PLAYER_LEVEL_ERROR = "player XP and level disagree"
+_LEVEL_UP_DUPLICATE_GAME_ERROR = "game IDs must be unique"
+_LEVEL_UP_GAME_CARD_MATCH_ERROR = "game IDs must match normal-card AppIDs"
 
 Clock = Callable[[], datetime]
 
@@ -181,7 +195,7 @@ def _valid_level_up_timestamp(value: object) -> bool:
 class LevelUpCardOwnership(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    market_hash_name: str = Field(
+    market_hash_name: StrictStr = Field(
         min_length=1,
         max_length=MAX_LEVEL_UP_HASH_LENGTH,
     )
@@ -203,19 +217,69 @@ class LevelUpCardOwnership(BaseModel):
         return self
 
 
+class LevelUpGame(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: StrictStr = Field(pattern=r"^[1-9][0-9]*$", max_length=20)
+    game_name: StrictStr = Field(
+        min_length=1,
+        max_length=MAX_GAME_NAME_LENGTH,
+    )
+    card_set_size: StrictInt | None = Field(ge=5, le=15)
+    badge_level: StrictInt = Field(ge=0, le=5)
+
+    @field_validator("game_name", mode="before")
+    @classmethod
+    def normalize_game_name(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError(_LEVEL_UP_GAME_NAME_ERROR)
+        return value
+
+    @model_validator(mode="after")
+    def validate_app_id(self) -> LevelUpGame:
+        try:
+            app_id = int(self.app_id)
+        except (TypeError, ValueError):
+            raise ValueError(_LEVEL_UP_GAME_APP_ID_ERROR) from None
+        if not 0 < app_id <= MAX_APP_ID:
+            raise ValueError(_LEVEL_UP_GAME_APP_ID_ERROR)
+        return self
+
+
 class LevelUpRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    inventory_refreshed_at: str = Field(min_length=1, max_length=64)
+    inventory_refreshed_at: StrictStr = Field(min_length=1, max_length=64)
+    badge_refreshed_at: StrictStr = Field(min_length=1, max_length=64)
+    player_xp: StrictInt = Field(ge=0, le=MAX_PLAYER_XP)
+    player_level: StrictInt = Field(ge=0, le=MAX_PLAYER_LEVEL)
+    games: list[LevelUpGame] = Field(max_length=MAX_LEVEL_UP_GAME_ROWS)
     cards: list[LevelUpCardOwnership] = Field(max_length=MAX_LEVEL_UP_CARD_ROWS)
 
     @model_validator(mode="after")
     def validate_request(self) -> LevelUpRequest:
         if not _valid_level_up_timestamp(self.inventory_refreshed_at):
             raise ValueError(_LEVEL_UP_TIMESTAMP_ERROR)
-        hashes = {parse_normal_card_hash(card.market_hash_name) for card in self.cards}
-        if None in hashes or len(hashes) != len(self.cards):
+        if not _valid_level_up_timestamp(self.badge_refreshed_at):
+            raise ValueError(_LEVEL_UP_TIMESTAMP_ERROR)
+        if level_for_xp(self.player_xp) != self.player_level:
+            raise ValueError(_LEVEL_UP_PLAYER_LEVEL_ERROR)
+        hashes = {card.market_hash_name for card in self.cards}
+        if len(hashes) != len(self.cards):
             raise ValueError(_LEVEL_UP_DUPLICATE_HASH_ERROR)
+        card_app_ids: set[int] = set()
+        for card in self.cards:
+            parsed = parse_normal_card_hash(card.market_hash_name)
+            if parsed is None:
+                raise ValueError(_LEVEL_UP_NORMAL_CARD_ERROR)
+            card_app_ids.add(parsed[0])
+        game_app_ids = {int(game.app_id) for game in self.games}
+        if len(game_app_ids) != len(self.games):
+            raise ValueError(_LEVEL_UP_DUPLICATE_GAME_ERROR)
+        if game_app_ids != card_app_ids:
+            raise ValueError(_LEVEL_UP_GAME_CARD_MATCH_ERROR)
         return self
 
 
@@ -427,9 +491,6 @@ def _level_up_unavailable_response(
         reason=reason,
         generated_at=now,
         inventory_refreshed_at=inventory_time,
-        catalog_total_sets=0,
-        catalog_resolved_sets=0,
-        catalog_pending_sets=0,
         currency_code=getattr(contract, "currency_code", None),
         minor_digits=getattr(contract, "minor_digits", None),
         price_basis="instant_top_of_book" if contract is not None else None,
@@ -712,10 +773,30 @@ def create_auth_router(
                 headers={"Cache-Control": "no-store"},
             ) from error
         try:
+            game_metadata = {
+                int(game.app_id): (game.game_name, game.card_set_size)
+                for game in payload.games
+            }
+            badge_state = BadgeState(
+                player_xp=payload.player_xp,
+                player_level=payload.player_level,
+                normal_badge_levels={
+                    int(game.app_id): game.badge_level for game in payload.games
+                },
+            )
+        except (TypeError, ValueError, OptimizerInputError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_LEVEL_UP_INVALID_REQUEST_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
             result = await steam_gateway.check_level_up(
-                steam_id,
                 holdings,
+                game_metadata,
+                badge_state,
                 inventory_refreshed_at=payload.inventory_refreshed_at,
+                badge_refreshed_at=payload.badge_refreshed_at,
             )
         except Exception:  # noqa: BLE001 - recommendation failures are isolated
             fallback_now = current_time()

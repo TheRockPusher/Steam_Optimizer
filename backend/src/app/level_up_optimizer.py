@@ -36,7 +36,7 @@ NORMAL_BADGE_XP = 100
 MAX_APP_ID = 2_147_483_647
 MAX_HASH_LENGTH = 512
 MAX_CARD_NAME_LENGTH = 256
-MAX_GAME_NAME_LENGTH = 256
+MAX_GAME_NAME_LENGTH = 8192
 MAX_QUOTE_LENGTH = 64
 MAX_QUOTE_QUANTITY = 1_000_000_000
 MAX_HOLDING_QUANTITY = 1_000_000
@@ -77,7 +77,6 @@ class CatalogCard:
     observed_at: datetime | None = None
     highest_buy_observed_at: datetime | None = None
     lowest_sell_observed_at: datetime | None = None
-    resolved: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.market_hash_name, str):
@@ -107,10 +106,7 @@ class CatalogCard:
             raise OptimizerInputError(
                 "catalog_card_invalid", "card name does not match hash"
             )
-        if not isinstance(self.resolved, bool):
-            raise OptimizerInputError(
-                "catalog_card_invalid", "resolved must be boolean"
-            )
+
         for value, label in (
             (self.highest_buy, "highest_buy"),
             (self.lowest_sell, "lowest_sell"),
@@ -136,30 +132,16 @@ class CatalogSet:
     """A validated complete normal-card set for one game."""
 
     app_id: int
-    game_name: str | None
+    game_name: str
     cards: tuple[CatalogCard, ...]
     set_size: int | None = None
-    resolved: bool = True
 
     def __post_init__(self) -> None:
         _require_app_id(self.app_id, "app_id")
-        if not isinstance(self.resolved, bool):
-            raise OptimizerInputError("catalog_set_invalid", "resolved must be boolean")
-        if self.game_name is None:
-            if self.resolved:
-                raise OptimizerInputError(
-                    "catalog_set_invalid", "resolved sets need a game name"
-                )
-        else:
-            _require_bounded_text(self.game_name, "game_name", MAX_GAME_NAME_LENGTH)
+        _require_bounded_text(self.game_name, "game_name", MAX_GAME_NAME_LENGTH)
         if not isinstance(self.cards, tuple):
             raise OptimizerInputError("catalog_set_invalid", "cards must be a tuple")
         cards = self.cards
-        if not self.resolved and not cards:
-            object.__setattr__(self, "cards", cards)
-            if self.set_size is not None:
-                _require_set_size(self.set_size, "set_size")
-            return
         if not cards:
             raise OptimizerInputError("catalog_set_invalid", "set must contain cards")
         normalized_cards: list[CatalogCard] = []
@@ -168,10 +150,6 @@ class CatalogSet:
             if not isinstance(card, CatalogCard):
                 raise OptimizerInputError(
                     "catalog_set_invalid", "cards must be CatalogCard values"
-                )
-            if not card.resolved and self.resolved:
-                raise OptimizerInputError(
-                    "catalog_set_invalid", "resolved set contains unresolved card"
                 )
             if card.app_id != self.app_id:
                 raise OptimizerInputError(
@@ -198,17 +176,11 @@ class CatalogSet:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedCatalog:
-    """The current generation of resolved sets.
-
-    ``complete=False`` is an explicit warming state.  It is never silently
-    interpreted as an empty catalog or as a no-opportunity result.
-    """
+    """The current generation of complete normal-card sets."""
 
     generation: int
     generated_at: datetime
     sets: tuple[CatalogSet, ...]
-    complete: bool = True
-    pending_app_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.generation, bool) or not isinstance(self.generation, int):
@@ -220,8 +192,6 @@ class ResolvedCatalog:
                 "price_generation_unavailable", "generation must be positive"
             )
         generated_at = _coerce_utc(self.generated_at, "generated_at")
-        if not isinstance(self.complete, bool):
-            raise OptimizerInputError("catalog_invalid", "complete must be boolean")
         if not isinstance(self.sets, tuple):
             raise OptimizerInputError("catalog_invalid", "sets must be a tuple")
         raw_sets = self.sets
@@ -239,48 +209,13 @@ class ResolvedCatalog:
             if value.app_id in seen:
                 raise OptimizerInputError("catalog_invalid", "duplicate set AppID")
             seen.add(value.app_id)
-            if self.complete and not value.resolved:
-                raise OptimizerInputError(
-                    "catalog_invalid", "complete catalog contains unresolved set"
-                )
             normalized_sets.append(value)
         if sum(len(value.cards) for value in normalized_sets) > MAX_CATALOG_CARDS:
             raise OptimizerInputError(
                 "catalog_invalid", "catalog contains too many cards"
             )
-        if not isinstance(self.pending_app_ids, tuple):
-            raise OptimizerInputError(
-                "catalog_invalid", "pending_app_ids must be a tuple"
-            )
-        pending: list[int] = []
-        for app_id in self.pending_app_ids:
-            _require_app_id(app_id, "pending_app_id")
-            if app_id not in pending:
-                pending.append(app_id)
-        if self.complete and pending:
-            raise OptimizerInputError(
-                "catalog_invalid", "complete catalog has pending sets"
-            )
-        if not self.complete:
-            pending.extend(
-                value.app_id for value in normalized_sets if not value.resolved
-            )
-            pending = list(dict.fromkeys(pending))
         object.__setattr__(self, "generated_at", generated_at)
         object.__setattr__(self, "sets", tuple(normalized_sets))
-        object.__setattr__(self, "pending_app_ids", tuple(pending))
-
-    @property
-    def resolved_sets(self) -> tuple[CatalogSet, ...]:
-        return tuple(value for value in self.sets if value.resolved)
-
-    @property
-    def total_sets(self) -> int:
-        return len(self.sets)
-
-    @property
-    def resolved_set_count(self) -> int:
-        return len(self.resolved_sets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,13 +377,10 @@ class PlanTotals:
 
 @dataclass(frozen=True, slots=True)
 class LevelUpOptimizationResponse:
-    status: Literal["ready", "no_opportunity", "warming", "unavailable"]
+    status: Literal["ready", "no_opportunity", "unavailable"]
     reason: str | None
     generated_at: datetime
     inventory_refreshed_at: datetime
-    catalog_total_sets: int
-    catalog_resolved_sets: int
-    catalog_pending_sets: int
     currency_code: str | None = None
     minor_digits: int | None = None
     price_basis: str | None = None
@@ -473,9 +405,6 @@ class LevelUpOptimizationResponse:
             "reason": self.reason,
             "generated_at": _json_value(self.generated_at),
             "inventory_refreshed_at": _json_value(self.inventory_refreshed_at),
-            "catalog_total_sets": self.catalog_total_sets,
-            "catalog_resolved_sets": self.catalog_resolved_sets,
-            "catalog_pending_sets": self.catalog_pending_sets,
             "currency_code": self.currency_code,
             "minor_digits": self.minor_digits,
             "price_basis": self.price_basis,
@@ -707,9 +636,10 @@ def optimize_level_up(
 ) -> LevelUpOptimizationResponse:
     """Calculate one deterministic, fully funded level-up recommendation.
 
-    Missing or stale generation/inventory data raises :class:`OptimizerInputError`.
-    Missing quote/depth on one side excludes that side. An explicitly incomplete
-    catalog returns ``warming`` rather than a misleading no-opportunity result.
+    The catalog's generation and every quote are validated against the explicit
+    clock before any plan is returned.  Destination plans are built and sorted
+    once; each source only merges a possible same-app post-sale variant into
+    the first six sorted options.
     """
 
     if not isinstance(catalog, ResolvedCatalog):
@@ -717,7 +647,6 @@ def optimize_level_up(
     if not isinstance(badges, BadgeState):
         raise OptimizerInputError("badge_data_unavailable", "badges must be validated")
     _validate_fee_contract(fee_contract)
-    catalog_value = catalog
     holdings_by_hash = _normalize_holdings(holdings)
     current = _coerce_utc(now, "now")
     inventory_time = _coerce_utc(inventory_refreshed_at, "inventory_refreshed_at")
@@ -730,131 +659,159 @@ def optimize_level_up(
         raise OptimizerInputError(
             "inventory_snapshot_too_old", "inventory snapshot is stale or in the future"
         )
-    if (
-        current < catalog_value.generated_at
-        or current - catalog_value.generated_at > timedelta(seconds=quote_window)
+    if current < catalog.generated_at or current - catalog.generated_at > timedelta(
+        seconds=quote_window
     ):
         reason = (
             "price_generation_stale"
-            if current >= catalog_value.generated_at
+            if current >= catalog.generated_at
             else "price_generation_unavailable"
         )
         raise OptimizerInputError(reason, "price generation is stale or in the future")
 
-    if not catalog_value.complete:
-        return LevelUpOptimizationResponse(
-            status="warming",
-            reason="catalog_warming",
-            generated_at=current,
-            inventory_refreshed_at=inventory_time,
-            catalog_total_sets=catalog_value.total_sets,
-            catalog_resolved_sets=catalog_value.resolved_set_count,
-            catalog_pending_sets=len(catalog_value.pending_app_ids),
-            currency_code=contract_value.currency_code,
-            minor_digits=contract_value.minor_digits,
-            price_basis="instant_top_of_book",
-            steam_fee_bps=contract_value.steam_fee_bps,
-            publisher_fee_bps=contract_value.publisher_fee_bps,
-            min_fee_minor=contract_value.min_fee_minor,
-            taxes_included=False,
-        )
-
-    sets = tuple(sorted(catalog_value.resolved_sets, key=lambda value: value.app_id))
-    catalog_hashes = {
-        card.market_hash_name for current_set in sets for card in current_set.cards
-    }
+    sets = tuple(sorted(catalog.sets, key=lambda value: value.app_id))
+    cards_by_hash: dict[str, tuple[CatalogSet, CatalogCard]] = {}
+    for current_set in sets:
+        for current_card in current_set.cards:
+            if current_card.market_hash_name in cards_by_hash:
+                raise OptimizerInputError(
+                    "catalog_invalid", "duplicate card hash in catalog"
+                )
+            cards_by_hash[current_card.market_hash_name] = (current_set, current_card)
     if any(
-        market_hash_name not in catalog_hashes for market_hash_name in holdings_by_hash
+        market_hash_name not in cards_by_hash for market_hash_name in holdings_by_hash
     ):
         raise OptimizerInputError(
             "catalog_invalid",
             "inventory contains a normal card outside the resolved catalog",
         )
 
+    destination_quotes = _destination_sell_quotes(
+        sets, current, quote_window, contract_value
+    )
+    destination_options = _destination_options(
+        sets,
+        holdings_by_hash,
+        badges,
+        current,
+        quote_window,
+        contract_value,
+        destination_quotes,
+    )
+    destination_keys = tuple(
+        _destination_sort_key(value, current) for value in destination_options
+    )
+    destination_indices = {
+        value.app_id: index for index, value in enumerate(destination_options)
+    }
+
     candidates: list[_SourceCandidate] = []
     saw_source = False
-    for source_set in sets:
+    for source_hash in sorted(holdings_by_hash):
+        holding = holdings_by_hash[source_hash]
+        if holding.sellable_quantity < 1:
+            continue
+        source_set, source_card = cards_by_hash[source_hash]
         source_level = badges.level_for_game(source_set.app_id)
-        for source_card in source_set.cards:
-            source_rows = _source_rows(
-                source_card,
-                holdings_by_hash,
-                current,
-                quote_window,
-                contract_value,
-            )
-            if source_rows is None:
-                continue
-            saw_source = True
-            source = _build_source_plan(source_set, source_level, source_rows)
-            destination_options = _destination_options(
-                source_card.market_hash_name,
-                sets,
+        source_rows = _source_rows(
+            source_card,
+            holdings_by_hash,
+            current,
+            quote_window,
+            contract_value,
+        )
+        if source_rows is None:
+            continue
+        saw_source = True
+        source = _build_source_plan(source_set, source_level, source_rows)
+
+        before_crafts = _craftable_count(source_set, holdings_by_hash, source_level)
+        after_crafts = _craftable_count(
+            source_set,
+            holdings_by_hash,
+            source_level,
+            sold_hash=source_hash,
+        )
+        foregone_craft_xp = (before_crafts - after_crafts) * NORMAL_BADGE_XP
+        minimum_required_crafts = foregone_craft_xp // NORMAL_BADGE_XP + 1
+
+        adjusted_destination: DestinationPlan | None = None
+        replaced_index: int | None = None
+        if holding.owned_quantity == 1:
+            adjusted_destination = _destination_plan(
+                source_set,
                 holdings_by_hash,
                 badges,
                 current,
                 quote_window,
                 contract_value,
+                destination_quotes,
+                sold_hash=source_hash,
             )
-            selected = _select_destinations(destination_options, source.seller_receipt)
-            if not selected:
-                continue
-            purchase_total = sum(value.missing_cards_total for value in selected)
-            if purchase_total > source.seller_receipt:
-                raise OptimizerInputError(
-                    "optimizer_internal_error", "selected destinations exceed proceeds"
-                )
+            replaced_index = destination_indices.get(source_set.app_id)
+        destination_candidates = _destination_prefix(
+            destination_options,
+            destination_keys,
+            current,
+            replaced_index,
+            adjusted_destination,
+        )
+        if len(destination_candidates) < minimum_required_crafts:
+            continue
+        required_receipt = sum(
+            option.missing_cards_total
+            for option in destination_candidates[:minimum_required_crafts]
+        )
+        if source.seller_receipt < required_receipt:
+            continue
 
-            before_crafts = _craftable_count(source_set, holdings_by_hash, source_level)
-            after_crafts = _craftable_count(
-                source_set,
-                holdings_by_hash,
-                source_level,
-                sold_hash=source_card.market_hash_name,
+        selected = _select_destinations(destination_candidates, source.seller_receipt)
+        if len(selected) < minimum_required_crafts:
+            continue
+        purchase_total = sum(value.missing_cards_total for value in selected)
+        if purchase_total > source.seller_receipt:
+            raise OptimizerInputError(
+                "optimizer_internal_error", "selected destinations exceed proceeds"
             )
-            foregone_craft_xp = (before_crafts - after_crafts) * NORMAL_BADGE_XP
-            funded_craft_xp = sum(value.craft_xp for value in selected)
-            xp_advantage = funded_craft_xp - foregone_craft_xp
-            if xp_advantage <= 0:
-                continue
-            scope_limited = (
-                len(selected) == MAX_DESTINATION_SETS
-                and len(destination_options) > MAX_DESTINATION_SETS
+        funded_craft_xp = sum(value.craft_xp for value in selected)
+        xp_advantage = funded_craft_xp - foregone_craft_xp
+        if xp_advantage <= 0:
+            continue
+        scope_limited = (
+            len(selected) == MAX_DESTINATION_SETS
+            and len(destination_candidates) > MAX_DESTINATION_SETS
+            and sum(option.missing_cards_total for option in destination_candidates[:6])
+            <= source.seller_receipt
+        )
+        destinations = tuple(selected)
+        totals = PlanTotals(
+            source_buyer_total=source.buyer_total,
+            steam_fee_total=source.steam_fee,
+            publisher_fee_total=source.publisher_fee,
+            seller_receipt_total=source.seller_receipt,
+            purchase_total=purchase_total,
+            unspent_swap_proceeds=source.seller_receipt - purchase_total,
+            foregone_craft_xp=foregone_craft_xp,
+            funded_craft_xp=funded_craft_xp,
+            xp_advantage=xp_advantage,
+            destination_count=len(destinations),
+            scope_limited=scope_limited,
+        )
+        all_quote_times = [row.quote_timestamp for row in source.rows] + [
+            row.quote_timestamp
+            for destination in destinations
+            for row in destination.rows
+        ]
+        oldest_quote_age = max(current - value for value in all_quote_times)
+        candidates.append(
+            _SourceCandidate(
+                source=source,
+                destinations=destinations,
+                totals=totals,
+                oldest_quote=oldest_quote_age,
+                card_actions=1 + sum(len(value.rows) for value in destinations),
             )
-            if scope_limited:
-                sixth = destination_options[MAX_DESTINATION_SETS]
-                scope_limited = (
-                    purchase_total + sixth.missing_cards_total <= source.seller_receipt
-                )
-            destinations = tuple(selected)
-            totals = PlanTotals(
-                source_buyer_total=source.buyer_total,
-                steam_fee_total=source.steam_fee,
-                publisher_fee_total=source.publisher_fee,
-                seller_receipt_total=source.seller_receipt,
-                purchase_total=purchase_total,
-                unspent_swap_proceeds=source.seller_receipt - purchase_total,
-                foregone_craft_xp=foregone_craft_xp,
-                funded_craft_xp=funded_craft_xp,
-                xp_advantage=xp_advantage,
-                destination_count=len(destinations),
-                scope_limited=scope_limited,
-            )
-            all_quote_times = [row.quote_timestamp for row in source.rows] + [
-                row.quote_timestamp
-                for destination in destinations
-                for row in destination.rows
-            ]
-            oldest_quote_age = max(current - value for value in all_quote_times)
-            candidates.append(
-                _SourceCandidate(
-                    source=source,
-                    destinations=destinations,
-                    totals=totals,
-                    oldest_quote=oldest_quote_age,
-                    card_actions=1 + sum(len(value.rows) for value in destinations),
-                )
-            )
+        )
 
     if not candidates:
         reason = "no_positive_xp_swap" if saw_source else "no_sellable_card"
@@ -863,9 +820,6 @@ def optimize_level_up(
             reason=reason,
             generated_at=current,
             inventory_refreshed_at=inventory_time,
-            catalog_total_sets=catalog_value.total_sets,
-            catalog_resolved_sets=catalog_value.resolved_set_count,
-            catalog_pending_sets=len(catalog_value.pending_app_ids),
             currency_code=contract_value.currency_code,
             minor_digits=contract_value.minor_digits,
             price_basis="instant_top_of_book",
@@ -884,14 +838,19 @@ def optimize_level_up(
             value.oldest_quote,
             value.card_actions,
             value.source.app_id,
-            value.source.rows[0].market_hash_name,
+            tuple(row.market_hash_name for row in value.source.rows),
             tuple(destination.app_id for destination in value.destinations),
+            tuple(
+                row.market_hash_name
+                for destination in value.destinations
+                for row in destination.rows
+            ),
         ),
     )
     player = _player_projection(badges, best.totals.funded_craft_xp)
     valid_until = min(
         inventory_time + timedelta(seconds=inventory_window),
-        catalog_value.generated_at + timedelta(seconds=quote_window),
+        catalog.generated_at + timedelta(seconds=quote_window),
         *(
             row.quote_timestamp + timedelta(seconds=quote_window)
             for row in best.source.rows
@@ -907,9 +866,6 @@ def optimize_level_up(
         reason="ready",
         generated_at=current,
         inventory_refreshed_at=inventory_time,
-        catalog_total_sets=catalog_value.total_sets,
-        catalog_resolved_sets=catalog_value.resolved_set_count,
-        catalog_pending_sets=len(catalog_value.pending_app_ids),
         scope_limited=best.totals.scope_limited,
         valid_until=valid_until,
         player=player,
@@ -982,11 +938,17 @@ def _build_source_plan(
     badge_level: int,
     rows: tuple[SellRow, ...],
 ) -> SourcePlan:
+    set_size = source_set.set_size
+    if set_size is None:
+        raise OptimizerInputError(
+            "optimizer_internal_error",
+            "source catalog set is incomplete",
+        )
     return SourcePlan(
         app_id=source_set.app_id,
-        game_name=source_set.game_name or "",
+        game_name=source_set.game_name,
         badge_level=badge_level,
-        set_size=source_set.set_size or len(source_set.cards),
+        set_size=set_size,
         rows=rows,
         buyer_total=sum(row.buyer_total for row in rows),
         steam_fee=sum(row.steam_fee for row in rows),
@@ -995,76 +957,161 @@ def _build_source_plan(
     )
 
 
+def _destination_sell_quotes(
+    sets: Sequence[CatalogSet],
+    now: datetime,
+    quote_window: int,
+    contract: MarketFeeContract,
+) -> dict[str, _SideQuote | None]:
+    return {
+        card.market_hash_name: _side_quote(card, "sell", now, quote_window, contract)
+        for current_set in sets
+        for card in current_set.cards
+    }
+
+
+def _destination_plan(
+    destination_set: CatalogSet,
+    holdings: Mapping[str, Holding],
+    badges: BadgeState,
+    now: datetime,
+    quote_window: int,
+    contract: MarketFeeContract,
+    sell_quotes: Mapping[str, _SideQuote | None] | None = None,
+    *,
+    sold_hash: str | None = None,
+) -> DestinationPlan | None:
+    badge_level = badges.level_for_game(destination_set.app_id)
+    if badge_level >= 5:
+        return None
+    rows: list[BuyRow] = []
+    owned_card_count = 0
+    for card in destination_set.cards:
+        holding = holdings.get(card.market_hash_name)
+        owned_quantity = holding.owned_quantity if holding is not None else 0
+        if card.market_hash_name == sold_hash:
+            owned_quantity = max(0, owned_quantity - 1)
+        if owned_quantity >= 1:
+            owned_card_count += 1
+            continue
+        quote = (
+            sell_quotes.get(card.market_hash_name)
+            if sell_quotes is not None
+            else _side_quote(card, "sell", now, quote_window, contract)
+        )
+        if quote is None or quote.quantity < 1:
+            return None
+        rows.append(
+            BuyRow(
+                market_hash_name=card.market_hash_name,
+                card_name=card.card_name,
+                quantity=1,
+                buyer_total=quote.price_minor,
+                top_ask_quantity=quote.quantity,
+                quote_timestamp=quote.timestamp,
+            )
+        )
+    if not rows:
+        # A fully owned destination is not a sale-funded craft.
+        return None
+    set_size = destination_set.set_size
+    if set_size is None:
+        raise OptimizerInputError(
+            "optimizer_internal_error",
+            "destination catalog set is incomplete",
+        )
+    if owned_card_count + len(rows) != set_size:
+        raise OptimizerInputError(
+            "optimizer_internal_error",
+            "destination ownership does not cover full catalog",
+        )
+    return DestinationPlan(
+        app_id=destination_set.app_id,
+        game_name=destination_set.game_name,
+        badge_level_before=badge_level,
+        badge_level_after=badge_level + 1,
+        set_size=set_size,
+        owned_card_count=owned_card_count,
+        rows=tuple(rows),
+        missing_cards_total=sum(row.buyer_total * row.quantity for row in rows),
+    )
+
+
+def _destination_sort_key(
+    value: DestinationPlan, now: datetime
+) -> tuple[int, timedelta, int, int, tuple[str, ...]]:
+    return (
+        value.missing_cards_total,
+        max(now - row.quote_timestamp for row in value.rows),
+        len(value.rows),
+        value.app_id,
+        tuple(row.market_hash_name for row in value.rows),
+    )
+
+
 def _destination_options(
-    sold_hash: str,
     sets: Sequence[CatalogSet],
     holdings: Mapping[str, Holding],
     badges: BadgeState,
     now: datetime,
     quote_window: int,
     contract: MarketFeeContract,
+    sell_quotes: Mapping[str, _SideQuote | None] | None = None,
 ) -> tuple[DestinationPlan, ...]:
-    options: list[DestinationPlan] = []
-    for destination_set in sets:
-        badge_level = badges.level_for_game(destination_set.app_id)
-        if badge_level >= 5:
-            continue
-        rows: list[BuyRow] = []
-        owned_card_count = 0
-        for card in destination_set.cards:
-            holding = holdings.get(card.market_hash_name)
-            owned_quantity = holding.owned_quantity if holding is not None else 0
-            if card.market_hash_name == sold_hash:
-                owned_quantity -= 1
-            if owned_quantity >= 1:
-                owned_card_count += 1
-                continue
-            quote = _side_quote(card, "sell", now, quote_window, contract)
-            if quote is None or quote.quantity < 1:
-                rows = []
-                break
-            rows.append(
-                BuyRow(
-                    market_hash_name=card.market_hash_name,
-                    card_name=card.card_name,
-                    quantity=1,
-                    buyer_total=quote.price_minor,
-                    top_ask_quantity=quote.quantity,
-                    quote_timestamp=quote.timestamp,
-                )
-            )
-        if not rows:
-            # A fully owned destination is not a sale-funded craft.  A set
-            # whose first missing quote is invalid also has no usable option.
-            continue
-        set_size = destination_set.set_size or len(destination_set.cards)
-        if owned_card_count + len(rows) != set_size:
-            raise OptimizerInputError(
-                "optimizer_internal_error",
-                "destination ownership does not cover full catalog",
-            )
-        options.append(
-            DestinationPlan(
-                app_id=destination_set.app_id,
-                game_name=destination_set.game_name or "",
-                badge_level_before=badge_level,
-                badge_level_after=badge_level + 1,
-                set_size=set_size,
-                owned_card_count=owned_card_count,
-                rows=tuple(rows),
-                missing_cards_total=sum(row.buyer_total * row.quantity for row in rows),
+    options = [
+        destination
+        for destination_set in sets
+        if (
+            destination := _destination_plan(
+                destination_set,
+                holdings,
+                badges,
+                now,
+                quote_window,
+                contract,
+                sell_quotes,
             )
         )
-    options.sort(
-        key=lambda value: (
-            value.missing_cards_total,
-            max(now - row.quote_timestamp for row in value.rows),
-            len(value.rows),
-            value.app_id,
-            tuple(row.market_hash_name for row in value.rows),
-        )
-    )
+        is not None
+    ]
+    options.sort(key=lambda value: _destination_sort_key(value, now))
     return tuple(options)
+
+
+def _destination_prefix(
+    options: Sequence[DestinationPlan],
+    option_keys: Sequence[tuple[int, timedelta, int, int, tuple[str, ...]]],
+    now: datetime,
+    replaced_index: int | None,
+    adjusted: DestinationPlan | None,
+) -> tuple[DestinationPlan, ...]:
+    """Merge one same-app variant into sorted options and return six rows."""
+
+    if replaced_index is None and adjusted is None:
+        return tuple(options[: MAX_DESTINATION_SETS + 1])
+    adjusted_key = (
+        _destination_sort_key(adjusted, now) if adjusted is not None else None
+    )
+    selected: list[DestinationPlan] = []
+    index = 0
+    inserted = adjusted is None
+    while len(selected) < MAX_DESTINATION_SETS + 1:
+        while index < len(options) and index == replaced_index:
+            index += 1
+        if (
+            adjusted is not None
+            and adjusted_key is not None
+            and not inserted
+            and (index >= len(options) or adjusted_key <= option_keys[index])
+        ):
+            selected.append(adjusted)
+            inserted = True
+            continue
+        if index >= len(options):
+            break
+        selected.append(options[index])
+        index += 1
+    return tuple(selected)
 
 
 def _select_destinations(

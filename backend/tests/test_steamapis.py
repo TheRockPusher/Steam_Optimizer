@@ -27,14 +27,7 @@ if TYPE_CHECKING:
 
 import app.steam_gateway as steam_gateway
 import app.steamapis_price_cache as steamapis_price_cache
-from app.booster_pricing import (
-    BoosterLookup,
-    BoosterMetadataState,
-    BoosterPriceCache,
-    BoosterPricingService,
-    BoosterResolution,
-    BoosterScanResult,
-)
+from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import (
     GemKey,
     GemPriceCache,
@@ -42,6 +35,7 @@ from app.gem_pricing import (
     GemResolution,
     GemScanResult,
 )
+from app.level_up_optimizer import BadgeState
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -201,48 +195,18 @@ class NoopBoosterPricing:
         return BoosterScanResult(values={})
 
 
-class NeverBoosterProvider:
-    async def lookup(self, game_app_id: str) -> BoosterLookup:
-        del game_app_id
-        raise AssertionError
+_LEVEL_UP_PROVIDER_CALL_ERROR = "level-up must not use booster metadata providers"
 
 
-class LevelUpMetadataProvider:
-    def __init__(
-        self,
-        values: Mapping[str, BoosterResolution],
-        pending_app_ids: Iterable[str] = (),
-    ) -> None:
-        self.values = dict(values)
-        self.pending_app_ids = tuple(pending_app_ids)
-        self.read_calls: list[tuple[str, ...]] = []
-        self.resolve_calls: list[tuple[tuple[str, ...], bool]] = []
-
-    def read_metadata_state(
-        self,
-        game_app_ids: Iterable[str],
-    ) -> BoosterMetadataState:
-        ids = tuple(dict.fromkeys(game_app_ids))
-        self.read_calls.append(ids)
-        id_set = set(ids)
-        values = {
-            app_id: value for app_id, value in self.values.items() if app_id in id_set
-        }
-        pending = [
-            app_id
-            for app_id in ids
-            if app_id in self.pending_app_ids or app_id not in values
-        ]
-        return BoosterMetadataState(values=values, pending_app_ids=tuple(pending))
-
+class ExplodingLevelUpProviders:
     async def resolve(
         self,
         game_app_ids: Iterable[str],
         *,
         require_game_name: bool = False,
     ) -> BoosterScanResult:
-        self.resolve_calls.append((tuple(game_app_ids), require_game_name))
-        return BoosterScanResult(values={})
+        del game_app_ids, require_game_name
+        raise AssertionError(_LEVEL_UP_PROVIDER_CALL_ERROR)
 
 
 class MinimalClient:
@@ -1002,6 +966,7 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
             market_hash_name="Encoded | Name",
             icon_url="https://community.cloudflare.steamstatic.com/economy/image/full",
             marketable=1,
+            tradable=0,
         ),
         item_description("3", "Unmarketable", marketable=0),
     ]
@@ -1044,6 +1009,8 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
         result.items[0].icon_url
         == "https://community.cloudflare.steamstatic.com/economy/image/full"
     )
+    assert result.items[0].marketable is True
+    assert result.items[0].tradable is False
     assert result.items[2].icon_url == f"{STEAM_ICON_BASE_URL}relative-icon"
     assert result.items[2].quantity == 2
     assert result.priceable_item_count == 2
@@ -1519,45 +1486,35 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
             ],
         ),
     )
-    booster_cache = BoosterPriceCache(configured.gem_price_cache_path)
-    booster_cache.put_positive("440", 5, game_name="Source Game")
-    booster_cache.put_positive("10", 5, game_name="Destination Ten")
-    booster_cache.put_positive("20", 5, game_name="Destination Twenty")
-    booster_pricing = BoosterPricingService(
-        configured,
-        cache=booster_cache,
-        provider=NeverBoosterProvider(),
+    gateway_http_client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset(str(index)) for index in range(1, 6)],
+                    descriptions=[
+                        item_description(
+                            str(index),
+                            f"Source Card {index}",
+                            market_hash_name=market_hash_name,
+                            marketable=1,
+                            tags=trading_card_tags(),
+                        )
+                        for index, market_hash_name in enumerate(
+                            source_hashes,
+                            start=1,
+                        )
+                    ],
+                ),
+            ),
+            price_redirect(),
+        ]
     )
     gateway = SteamGateway(
         configured,
-        http_client=FakeHTTPClient(
-            [
-                FakeResponse(
-                    200,
-                    page(
-                        assets=[item_asset(str(index)) for index in range(1, 6)],
-                        descriptions=[
-                            item_description(
-                                str(index),
-                                f"Source Card {index}",
-                                market_hash_name=market_hash_name,
-                                marketable=1,
-                                tags=trading_card_tags(),
-                            )
-                            for index, market_hash_name in enumerate(
-                                source_hashes,
-                                start=1,
-                            )
-                        ],
-                    ),
-                ),
-                price_redirect(),
-            ],
-            stream_response=_badge_stream_response(_badge_payload()),
-        ),
+        http_client=gateway_http_client,
         bulk_http_client=bulk_client,
         gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
-        booster_pricing=booster_pricing,
     )
 
     inventory = run(gateway.check_inventory("76561198000000000"))
@@ -1565,7 +1522,6 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
     plan_time = datetime.now(UTC)
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             tuple(
                 steam_gateway.Holding(
                     market_hash_name=item.market_hash_name,
@@ -1575,7 +1531,14 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
                 for item in inventory.items
                 if item.market_hash_name is not None
             ),
+            {
+                10: ("Destination Ten", 5),
+                20: ("Destination Twenty", 5),
+                440: ("Source Game", 5),
+            },
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=plan_time,
+            badge_refreshed_at=plan_time,
             now=plan_time,
         )
     )
@@ -1594,43 +1557,7 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
     assert result.source is not None
     assert result.source.app_id == 440
     assert [destination.app_id for destination in result.destinations] == [10, 20]
-
-
-def test_inventory_hash_literal_percent_joins_once_decoded_bulk_name() -> None:
-    client = FakeHTTPClient(
-        [
-            FakeResponse(
-                200,
-                page(
-                    assets=[item_asset("1")],
-                    descriptions=[
-                        item_description(
-                            "1",
-                            "Literal percent",
-                            market_hash_name="Literal%20Name",
-                            marketable=1,
-                        )
-                    ],
-                ),
-            ),
-            price_redirect(),
-        ],
-        stream_response=FakeResponse(
-            200,
-            chunks=[
-                b'{"metadata":{"appId":753,"itemCount":1},"items":['
-                b'{"marketHashName":"Literal%2520Name",'
-                b'"orderBook":{"lowestSell":"0.25"}}]}'
-            ],
-        ),
-    )
-
-    result = run(SteamGateway(settings(), http_client=client).check_inventory("42"))
-
-    assert result.status == "public"
-    assert result.items[0].market_hash_name == "Literal%20Name"
-    assert result.items[0].price is not None
-    assert result.items[0].price.lowest_sell == "0.25"
+    assert gateway_http_client.stream_calls == []
 
 
 def test_price_cache_fresh_hit_avoids_second_provider_refresh() -> None:
@@ -2579,6 +2506,53 @@ def test_price_cache_catalog_retains_normal_card_without_quotes(
     assert card.lowest_sell is None
 
 
+def test_price_cache_catalog_filters_unrelated_app_ids(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    cache = SteamApisPriceCache(cache_path)
+    refresh = cache.begin_refresh()
+    quote_time = "2026-08-26T12:00:00Z"
+    for app_id in (10, 440, 999):
+        refresh.add(
+            f"{app_id}-Card (Trading Card)",
+            "0.10",
+            "0.20",
+            quote_time,
+            1,
+            1,
+        )
+    refresh.commit(
+        now=datetime(2026, 8, 26, 12, tzinfo=UTC).timestamp(),
+        optimizer_complete=True,
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=FakeHTTPClient([]),
+        price_cache=cache,
+    )
+
+    filtered = steamapis.read_price_catalog(max_rows=10, app_ids={440})
+    empty = steamapis.read_price_catalog(max_rows=10, app_ids=())
+    direct = cache.read_catalog(max_rows=10, app_ids={440})
+
+    assert filtered.generation == 1
+    assert filtered.optimizer_complete is True
+    assert filtered.row_count == 1
+    assert filtered.truncated is False
+    assert direct.groups == filtered.groups
+    assert set(filtered.groups) == {440}
+    assert [card.market_hash_name for card in filtered.groups[440]] == [
+        "440-Card (Trading Card)"
+    ]
+    assert empty.generation == filtered.generation
+    assert empty.refreshed_at == filtered.refreshed_at
+    assert empty.optimizer_complete is True
+    assert empty.groups == {}
+    assert empty.row_count == 0
+    assert empty.truncated is False
+
+
 def _badge_payload(
     *,
     player_xp: int = 0,
@@ -2615,6 +2589,7 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
             _badge_payload(
                 badges=[
                     {"appID": 440, "borderColor": 0, "level": 3},
+                    {"appID": 10, "borderColor": 0, "level": 2},
                     {"appID": 440, "borderColor": 1, "level": 50},
                     {
                         "appID": 2_243_720,
@@ -2635,11 +2610,11 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
         http_client=client,
     )
 
-    result = run(gateway._fetch_badge_state("76561198000000000", {440}))
+    result = run(gateway._fetch_badge_state("76561198000000000"))
 
     assert result.player_xp == 0
     assert result.player_level == 0
-    assert dict(result.normal_badge_levels) == {440: 3}
+    assert dict(result.normal_badge_levels) == {10: 2, 440: 3}
     assert client.get_calls == []
     assert client.stream_calls == [
         {
@@ -2669,6 +2644,8 @@ def test_badge_check_rejects_inconsistent_xp_and_level() -> None:
             message="Steam badge data is available.",
             player_xp=1_250,
             player_level=12,
+            checked_at="2026-08-26T12:00:00Z",
+            normal_badge_levels=[],
         )
 
 
@@ -2679,7 +2656,10 @@ def test_check_badges_returns_validated_public_xp_and_level() -> None:
             _badge_payload(
                 player_xp=100,
                 player_level=1,
-                badges=[{"appID": 440, "borderColor": 0, "level": 1}],
+                badges=[
+                    {"appID": 440, "borderColor": 0, "level": 1},
+                    {"appID": 10, "borderColor": 0, "level": 2},
+                ],
             )
         ),
     )
@@ -2691,6 +2671,11 @@ def test_check_badges_returns_validated_public_xp_and_level() -> None:
     assert result.message == "Steam badge data is available."
     assert result.player_xp == 100
     assert result.player_level == 1
+    assert result.checked_at is not None
+    assert result.model_dump()["normal_badge_levels"] == [
+        {"app_id": 10, "level": 2},
+        {"app_id": 440, "level": 1},
+    ]
     assert client.get_calls == []
     assert len(client.stream_calls) == 1
     assert client.stream_calls[0]["url"] == STEAMAPIS_BADGES_ENDPOINT.format(
@@ -2714,6 +2699,8 @@ def test_check_badges_maps_provider_failure_to_unavailable_not_private() -> None
     assert result.message == "Steam badge check is unavailable."
     assert result.player_xp is None
     assert result.player_level is None
+    assert result.checked_at is None
+    assert result.normal_badge_levels == []
 
 
 @pytest.mark.parametrize(
@@ -2737,6 +2724,8 @@ def test_check_badges_maps_invalid_payload_to_unavailable(
     assert result.status == "unavailable"
     assert result.player_xp is None
     assert result.player_level is None
+    assert result.checked_at is None
+    assert result.normal_badge_levels == []
 
 
 def test_get_badges_accepts_documented_snake_case_fields() -> None:
@@ -2751,7 +2740,6 @@ def test_get_badges_accepts_documented_snake_case_fields() -> None:
                 ],
             },
         },
-        {440},
     )
 
     assert result.player_xp == 100
@@ -2801,27 +2789,29 @@ def test_get_badges_rejects_ambiguous_provider_aliases(
     payload: dict[str, object],
 ) -> None:
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        steam_gateway._parse_badges_payload(payload, {440})
+        steam_gateway._parse_badges_payload(payload)
 
 
 @pytest.mark.parametrize(
     "raw_app_id",
     [False, 0.0, "440", -1, steam_gateway.MAX_APP_ID + 1],
 )
-def test_get_badges_rejects_malformed_app_ids(raw_app_id: object) -> None:
-    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        steam_gateway._parse_badges_payload(
-            _badge_payload(
-                badges=[
-                    {
-                        "appID": raw_app_id,
-                        "borderColor": 0,
-                        "level": 1,
-                    }
-                ]
-            ),
-            {440},
+def test_get_badges_ignores_unrecognized_app_ids(raw_app_id: object) -> None:
+    result = steam_gateway._parse_badges_payload(
+        _badge_payload(
+            player_xp=100,
+            player_level=1,
+            badges=[
+                {
+                    "appID": raw_app_id,
+                    "borderColor": 0,
+                    "level": 1,
+                }
+            ],
         )
+    )
+
+    assert dict(result.normal_badge_levels) == {}
 
 
 def test_get_badges_ignores_non_game_irrelevant_and_foil_records() -> None:
@@ -2837,38 +2827,58 @@ def test_get_badges_ignores_non_game_irrelevant_and_foil_records() -> None:
                 {"appID": 440, "borderColor": 1},
                 {"appID": 440, "borderColor": 1, "level": 999},
                 {"appID": 440, "borderColor": 0, "level": 1},
+                {"appID": 10, "borderColor": 0, "level": 2},
             ],
         ),
-        {440},
     )
 
-    assert dict(result.normal_badge_levels) == {440: 1}
+    assert dict(result.normal_badge_levels) == {10: 2, 440: 1}
 
 
 @pytest.mark.parametrize(
-    "badges",
+    "badge",
     [
-        [{"appID": 440, "level": 1}],
-        [{"appID": 440, "borderColor": 2, "level": 1}],
-        [{"appID": 440, "borderColor": False, "level": 1}],
-        [{"appID": 440, "borderColor": 0}],
-        [{"appID": 440, "borderColor": 0, "level": 6}],
-        [{"appID": 440, "borderColor": 0, "level": -1}],
-        [{"appID": 440, "borderColor": 0, "level": False}],
-        [{"appID": 440, "borderColor": 0, "level": "1"}],
-        [
-            {"appID": 440, "borderColor": 0, "level": 1},
-            {"appID": 440, "borderColor": 0, "level": 1},
-        ],
+        {"appID": 440, "level": 1},
+        {"appID": 440, "borderColor": 2, "level": 1},
+        {"appID": 440, "borderColor": False, "level": 1},
+        {"appID": 440, "borderColor": 0, "level": 6},
+        {"appID": 440, "borderColor": 0, "level": -1},
     ],
 )
-def test_get_badges_rejects_malformed_relevant_normal_badges(
-    badges: list[dict[str, object]],
+def test_get_badges_ignores_records_outside_normal_badge_shape(
+    badge: dict[str, object],
+) -> None:
+    result = steam_gateway._parse_badges_payload(_badge_payload(badges=[badge]))
+
+    assert dict(result.normal_badge_levels) == {}
+
+
+@pytest.mark.parametrize(
+    "badge",
+    [
+        {"appID": 440, "borderColor": 0},
+        {"appID": 440, "borderColor": 0, "level": False},
+        {"appID": 440, "borderColor": 0, "level": "1"},
+    ],
+)
+def test_get_badges_rejects_malformed_normal_badge(
+    badge: dict[str, object],
 ) -> None:
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
         steam_gateway._parse_badges_payload(
-            _badge_payload(badges=badges),
-            {440},
+            _badge_payload(badges=[badge]),
+        )
+
+
+def test_get_badges_rejects_duplicate_normal_badges() -> None:
+    with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
+        steam_gateway._parse_badges_payload(
+            _badge_payload(
+                badges=[
+                    {"appID": 440, "borderColor": 0, "level": 1},
+                    {"appID": 440, "borderColor": 0, "level": 2},
+                ]
+            ),
         )
 
 
@@ -2892,15 +2902,11 @@ def test_get_badges_rejects_malformed_relevant_normal_badges(
             "success": True,
             "result": {"xp": 0, "level": False, "badges": []},
         },
-        {
-            "success": True,
-            "result": {"xp": 0, "level": 0, "badges": [None]},
-        },
     ],
 )
 def test_get_badges_rejects_malformed_envelopes(payload: object) -> None:
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        steam_gateway._parse_badges_payload(payload, {440})
+        steam_gateway._parse_badges_payload(payload)
 
 
 def test_get_badges_rejects_decoded_payload_over_structural_bound() -> None:
@@ -2909,7 +2915,7 @@ def test_get_badges_rejects_decoded_payload_over_structural_bound() -> None:
     result["padding"] = [None] * (MAX_BADGE_DECODED_SIZE // 32)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        steam_gateway._parse_badges_payload(payload, {440})
+        steam_gateway._parse_badges_payload(payload)
 
 
 @pytest.mark.parametrize("status_code", [400, 403, 429, 500])
@@ -2924,7 +2930,7 @@ def test_get_badges_rejects_non_success_responses(status_code: int) -> None:
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state("76561198000000000", {440}))
+        run(gateway._fetch_badge_state("76561198000000000"))
 
 
 def test_get_badges_rejects_duplicate_object_members() -> None:
@@ -2939,7 +2945,7 @@ def test_get_badges_rejects_duplicate_object_members() -> None:
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state("76561198000000000", {440}))
+        run(gateway._fetch_badge_state("76561198000000000"))
 
 
 @pytest.mark.parametrize("steam_id", ["", "abc", " 123", "1" * 21])
@@ -2950,7 +2956,7 @@ def test_get_badges_rejects_invalid_steam_ids_before_network(
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state(steam_id, {440}))
+        run(gateway._fetch_badge_state(steam_id))
 
     assert client.stream_calls == []
 
@@ -2979,7 +2985,7 @@ def test_get_badges_fails_closed_for_transport_corruption(
     gateway = SteamGateway(settings(), http_client=client)
 
     with pytest.raises(steam_gateway.InvalidSteamApisPayloadError):
-        run(gateway._fetch_badge_state("76561198000000000", {440}))
+        run(gateway._fetch_badge_state("76561198000000000"))
 
 
 def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> None:
@@ -3019,7 +3025,6 @@ def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> N
         run(
             SteamGateway(settings(), http_client=timeout_client)._fetch_badge_state(
                 "76561198000000000",
-                {440},
             )
         )
     for client in (
@@ -3033,7 +3038,6 @@ def test_get_badges_fails_closed_for_timeout_malformed_and_bounded_inputs() -> N
             run(
                 SteamGateway(settings(), http_client=client)._fetch_badge_state(
                     "76561198000000000",
-                    {440},
                 )
             )
 
@@ -3054,7 +3058,6 @@ def test_get_badges_rejects_compact_decoded_object_amplification() -> None:
         run(
             SteamGateway(settings(), http_client=client)._fetch_badge_state(
                 "76561198000000000",
-                {440},
             )
         )
 
@@ -3089,7 +3092,6 @@ def test_get_badges_accepts_large_valid_public_profile() -> None:
     result = run(
         SteamGateway(settings(), http_client=client)._fetch_badge_state(
             "76561198000000000",
-            {440},
         )
     )
 
@@ -3116,9 +3118,11 @@ def test_level_up_empty_holdings_respect_missing_contract() -> None:
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             (),
+            {},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=datetime(2026, 8, 26, 12, tzinfo=UTC),
+            badge_refreshed_at=datetime(2026, 8, 26, 12, tzinfo=UTC),
             now=datetime(2026, 8, 26, 12, tzinfo=UTC),
         )
     )
@@ -3129,7 +3133,7 @@ def test_level_up_empty_holdings_respect_missing_contract() -> None:
     assert client.stream_calls == []
 
 
-def test_level_up_refreshes_clock_after_catalog_await(
+def test_level_up_refreshes_clock_after_catalog_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     start = datetime(2026, 8, 26, 12, tzinfo=UTC)
@@ -3153,32 +3157,25 @@ def test_level_up_refreshes_clock_after_catalog_await(
     )
     gateway = SteamGateway(configured, http_client=FakeHTTPClient([]))
 
-    async def fresh_catalog(*, max_age_seconds: int) -> bool:
-        assert max_age_seconds == 900
-        return True
-
     monkeypatch.setattr(steam_gateway, "datetime", AdvancingDateTime)
     monkeypatch.setattr(
         gateway.steamapis,
-        "ensure_price_catalog_fresh",
-        fresh_catalog,
-    )
-    monkeypatch.setattr(
-        gateway.steamapis,
         "read_price_catalog",
-        lambda *, max_rows: steam_gateway.NormalCardCatalogRead(
+        lambda *, max_rows, app_ids=None: steam_gateway.NormalCardCatalogRead(
             1,
             start.timestamp(),
             {},
-            optimizer_complete=max_rows > 0,
+            optimizer_complete=max_rows > 0 and app_ids is not None,
         ),
     )
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             (),
+            {440: ("Team Fortress 2", 5)},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=start - timedelta(seconds=3599),
+            badge_refreshed_at=start - timedelta(seconds=3599),
         )
     )
 
@@ -3186,7 +3183,7 @@ def test_level_up_refreshes_clock_after_catalog_await(
     assert result.reason == "inventory_snapshot_too_old"
 
 
-def test_level_up_incomplete_catalog_short_circuits_before_badges(
+def test_level_up_invalid_catalog_group_is_excluded(
     tmp_path: Path,
 ) -> None:
     quote_time = datetime.now(UTC)
@@ -3219,7 +3216,6 @@ def test_level_up_incomplete_catalog_short_circuits_before_badges(
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             (
                 steam_gateway.Holding(
                     market_hash_name=market_hash_names[0],
@@ -3227,7 +3223,10 @@ def test_level_up_incomplete_catalog_short_circuits_before_badges(
                     sellable_quantity=1,
                 ),
             ),
+            {440: ("Oversized Set", None)},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=now,
+            badge_refreshed_at=now,
             now=now,
         )
     )
@@ -3258,7 +3257,6 @@ def test_level_up_requires_steamapis_key_before_provider_calls() -> None:
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             (
                 steam_gateway.Holding(
                     market_hash_name="440-Card (Trading Card)",
@@ -3266,7 +3264,10 @@ def test_level_up_requires_steamapis_key_before_provider_calls() -> None:
                     sellable_quantity=1,
                 ),
             ),
+            {440: ("Source Game", 5)},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=now,
+            badge_refreshed_at=now,
             now=now,
         )
     )
@@ -3277,30 +3278,12 @@ def test_level_up_requires_steamapis_key_before_provider_calls() -> None:
     assert client.stream_calls == []
 
 
-@pytest.mark.parametrize(
-    ("badge_payload", "expected"),
-    [
-        pytest.param(
-            _badge_payload(),
-            ("no_opportunity", "no_positive_xp_swap"),
-            id="valid-badge-state",
-        ),
-        pytest.param(
-            _badge_payload(badges=[{"appID": 440, "borderColor": 0, "level": 6}]),
-            ("unavailable", "badge_data_unavailable"),
-            id="malformed-relevant-normal-badge",
-        ),
-    ],
-)
-def test_level_up_real_gateway_uses_catalog_badge_relevance(
+def test_level_up_uses_supplied_badges_without_redundant_provider_calls(
     tmp_path: Path,
-    badge_payload: dict[str, object],
-    expected: tuple[str, str],
 ) -> None:
     quote_time = datetime.now(UTC)
     configured = settings(
         steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
-        gem_price_cache_path=str(tmp_path / "boosters.sqlite3"),
         level_up_currency_code="USD",
         level_up_currency_minor_digits=2,
         level_up_price_basis="buyer_total",
@@ -3316,27 +3299,18 @@ def test_level_up_real_gateway_uses_catalog_badge_relevance(
     for market_hash_name in source_hashes:
         refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
     refresh.commit(now=time.time(), optimizer_complete=True)
-    now = datetime.now(UTC)
-    booster_cache = BoosterPriceCache(configured.gem_price_cache_path)
-    booster_cache.put_positive("440", 5, game_name="Source Game")
-    booster_pricing = BoosterPricingService(
-        configured,
-        cache=booster_cache,
-        provider=NeverBoosterProvider(),
-    )
+    client = FakeHTTPClient([])
+    providers = ExplodingLevelUpProviders()
     gateway = SteamGateway(
         configured,
-        http_client=FakeHTTPClient(
-            [],
-            stream_response=_badge_stream_response(badge_payload),
-        ),
+        http_client=client,
         price_cache=price_cache,
-        booster_pricing=booster_pricing,
+        booster_pricing=providers,  # type: ignore[arg-type]
     )
+    now = datetime.now(UTC)
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             tuple(
                 steam_gateway.Holding(
                     market_hash_name=market_hash_name,
@@ -3345,12 +3319,20 @@ def test_level_up_real_gateway_uses_catalog_badge_relevance(
                 )
                 for market_hash_name in source_hashes
             ),
+            {440: ("Source Game", 5)},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=now,
+            badge_refreshed_at=now,
             now=now,
         )
     )
 
-    assert (result.status, result.reason) == expected
+    assert (result.status, result.reason) == (
+        "no_opportunity",
+        "no_positive_xp_swap",
+    )
+    assert client.get_calls == []
+    assert client.stream_calls == []
 
 
 def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
@@ -3359,7 +3341,6 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
     quote_time = datetime.now(UTC)
     configured = settings(
         steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
-        gem_price_cache_path=str(tmp_path / "boosters.sqlite3"),
         level_up_currency_code="USD",
         level_up_currency_minor_digits=2,
         level_up_price_basis="buyer_total",
@@ -3423,37 +3404,22 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
     refresh.commit(now=time.time(), optimizer_complete=True)
     now = datetime.now(UTC)
 
-    booster_cache = BoosterPriceCache(configured.gem_price_cache_path)
-    booster_cache.put_positive("440", 5, game_name="Source Game")
-    booster_cache.put_positive("10", 5, game_name="Destination Ten")
-    booster_cache.put_positive("20", 5, game_name="Destination Twenty")
-    booster_cache.put_positive("50", 6, game_name="Unqualified Source")
-    booster_cache.put_positive("40", 6, game_name="Unqualified Destination")
-    booster_pricing = BoosterPricingService(
-        configured,
-        cache=booster_cache,
-        provider=NeverBoosterProvider(),
-    )
-    badge_client = FakeHTTPClient(
-        [],
-        stream_response=_badge_stream_response(
-            _badge_payload(
-                badges=[
-                    {
-                        "appID": 2_243_720,
-                        "borderColor": 0,
-                        "level": 372_366,
-                    }
-                ]
-            )
-        ),
-    )
+    client = FakeHTTPClient([])
+    providers = ExplodingLevelUpProviders()
     gateway = SteamGateway(
         configured,
-        http_client=badge_client,
+        http_client=client,
         price_cache=price_cache,
-        booster_pricing=booster_pricing,
+        booster_pricing=providers,  # type: ignore[arg-type]
     )
+    game_metadata = {
+        10: ("Destination Ten", 5),
+        20: ("Destination Twenty", 5),
+        30: ("Unaffordable", 5),
+        40: ("Unqualified Destination", 6),
+        440: ("Source Game", 5),
+        50: ("Unqualified Source", 6),
+    }
     holdings = tuple(
         steam_gateway.Holding(
             market_hash_name=market_hash_name,
@@ -3465,9 +3431,11 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             holdings,
+            game_metadata,
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=now,
+            badge_refreshed_at=now,
             now=now,
         )
     )
@@ -3493,8 +3461,8 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
         "set_size",
         "rows",
     }
-    assert badge_client.get_calls == []
-    assert len(badge_client.stream_calls) == 1
+    assert client.get_calls == []
+    assert client.stream_calls == []
 
 
 def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
@@ -3503,7 +3471,6 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
     quote_time = datetime.now(UTC)
     configured = settings(
         steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
-        gem_price_cache_path=str(tmp_path / "boosters.sqlite3"),
         level_up_currency_code="USD",
         level_up_currency_minor_digits=2,
         level_up_price_basis="buyer_total",
@@ -3538,25 +3505,12 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
             None if index <= 2 else 1,
         )
     refresh.commit(now=quote_time.timestamp(), optimizer_complete=True)
-    booster_cache = BoosterPriceCache(configured.gem_price_cache_path)
-    booster_cache.put_positive("440", 5, game_name="Source Game")
-    booster_cache.put_positive("20", 5, game_name="Destination Game")
-    booster_pricing = BoosterPricingService(
-        configured,
-        cache=booster_cache,
-        provider=NeverBoosterProvider(),
-    )
-    badge_client = FakeHTTPClient(
-        [],
-        stream_response=_badge_stream_response(
-            _badge_payload(badges=[{"appID": 440, "borderColor": 0, "level": 5}])
-        ),
-    )
+    client = FakeHTTPClient([])
     gateway = SteamGateway(
         configured,
-        http_client=badge_client,
+        http_client=client,
         price_cache=price_cache,
-        booster_pricing=booster_pricing,
+        booster_pricing=ExplodingLevelUpProviders(),  # type: ignore[arg-type]
     )
     holdings = (
         steam_gateway.Holding(
@@ -3576,9 +3530,11 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             holdings,
+            {440: ("Source Game", 5), 20: ("Destination Game", 5)},
+            BadgeState(0, 0, {440: 5}),
             inventory_refreshed_at=quote_time,
+            badge_refreshed_at=quote_time,
             now=quote_time,
         )
     )
@@ -3595,108 +3551,34 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
     assert destination.set_size == 5
     assert destination.owned_card_count == 2
     assert destination.missing_cards_total == 150
-    assert badge_client.get_calls == []
-    assert len(badge_client.stream_calls) == 1
-
-
-def test_level_up_metadata_warming_keeps_each_phase_provider_call_bounded(
-    tmp_path: Path,
-) -> None:
-    quote_time = datetime.now(UTC)
-    configured = settings(
-        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
-        gem_price_cache_path=str(tmp_path / "boosters.sqlite3"),
-        level_up_currency_code="USD",
-        level_up_currency_minor_digits=2,
-        level_up_price_basis="buyer_total",
-        level_up_steam_fee_bps=500,
-        level_up_publisher_fee_bps=1000,
-        level_up_min_fee_minor=1,
-        level_up_max_quote_age_seconds=900,
-        level_up_max_inventory_age_seconds=3600,
-    )
-    price_cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
-    refresh = price_cache.begin_refresh()
-    source_hash = "440-Source Card 1 (Trading Card)"
-    for card_index in range(1, 6):
-        refresh.add(
-            f"440-Source Card {card_index} (Trading Card)",
-            "100.00" if card_index == 1 else None,
-            "100.00",
-            quote_time.isoformat(),
-            1 if card_index == 1 else None,
-            1,
-        )
-    for app_id in range(1_000, 1_130):
-        for card_index in range(1, 6):
-            refresh.add(
-                f"{app_id}-Destination Card {card_index} (Trading Card)",
-                None,
-                "0.01",
-                quote_time.isoformat(),
-                None,
-                1,
-            )
-    refresh.commit(now=quote_time.timestamp(), optimizer_complete=True)
-    metadata = LevelUpMetadataProvider(
-        {"440": BoosterResolution(card_set_size=5, gem_cost=1, game_name="Source")},
-    )
-    badge_client = FakeHTTPClient(
-        [],
-        stream_response=_badge_stream_response(_badge_payload()),
-    )
-    gateway = SteamGateway(
-        configured,
-        http_client=badge_client,
-        price_cache=price_cache,
-        booster_pricing=metadata,  # type: ignore[arg-type]
-    )
-
-    result = run(
-        gateway.check_level_up(
-            "76561198000000000",
-            (
-                steam_gateway.Holding(
-                    market_hash_name=source_hash,
-                    owned_quantity=1,
-                    sellable_quantity=1,
-                ),
-            ),
-            inventory_refreshed_at=quote_time,
-            now=quote_time,
-        )
-    )
-
-    assert result.status == "warming"
-    assert result.reason == "catalog_warming"
-    assert len(metadata.resolve_calls) == 1
-    resolved_ids, require_game_name = metadata.resolve_calls[0]
-    assert require_game_name is True
-    assert len(resolved_ids) == steam_gateway.MAX_LEVEL_UP_METADATA_APPS
-    assert len(set(resolved_ids)) == len(resolved_ids)
-    assert len(metadata.read_calls) == 3
-    assert len(badge_client.stream_calls) == 1
+    assert client.get_calls == []
+    assert client.stream_calls == []
 
 
 @pytest.mark.parametrize("quote_age_seconds", [600, 1200])
-def test_level_up_passes_configured_quote_age_to_strict_cache_gate(
+def test_level_up_schedules_strict_catalog_refresh_without_awaiting_it(
     quote_age_seconds: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StrictPriceAgeSpy:
         def __init__(self) -> None:
-            self.requested_ages: list[int] = []
+            self.scheduled_ages: list[int] = []
 
         async def ensure_price_catalog_fresh(self, *, max_age_seconds: int) -> bool:
-            self.requested_ages.append(max_age_seconds)
+            del max_age_seconds
+            raise AssertionError
+
+        def schedule_price_catalog_refresh(self, *, max_age_seconds: int) -> bool:
+            self.scheduled_ages.append(max_age_seconds)
             return False
 
         def read_price_catalog(
             self,
             *,
             max_rows: int,
+            app_ids: Iterable[int] | None = None,
         ) -> steam_gateway.NormalCardCatalogRead:
-            del max_rows
+            del max_rows, app_ids
             return steam_gateway.NormalCardCatalogRead(0, None, {})
 
     configured = settings(
@@ -3716,7 +3598,6 @@ def test_level_up_passes_configured_quote_age_to_strict_cache_gate(
 
     result = run(
         gateway.check_level_up(
-            "76561198000000000",
             (
                 steam_gateway.Holding(
                     market_hash_name="440-Test Card (Trading Card)",
@@ -3724,14 +3605,17 @@ def test_level_up_passes_configured_quote_age_to_strict_cache_gate(
                     sellable_quantity=1,
                 ),
             ),
+            {440: ("Test Game", 5)},
+            BadgeState(0, 0, {}),
             inventory_refreshed_at=now,
+            badge_refreshed_at=now,
             now=now,
         )
     )
 
     assert result.status == "unavailable"
     assert result.reason == "price_generation_unavailable"
-    assert strict_cache.requested_ages == [quote_age_seconds]
+    assert strict_cache.scheduled_ages == [quote_age_seconds]
 
 
 def test_duplicate_feed_hash_aborts_generation_without_cross_row_merge(

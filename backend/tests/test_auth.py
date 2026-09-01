@@ -23,7 +23,7 @@ from app.cookies import (
     SignedCookieCodec,
 )
 from app.gem_pricing import GemKey, GemResolution, GemScanResult
-from app.level_up_optimizer import Holding, LevelUpOptimizationResponse
+from app.level_up_optimizer import BadgeState, Holding, LevelUpOptimizationResponse
 from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import (
@@ -82,8 +82,10 @@ class FakeGateway:
         self.inventory_calls = 0
         self.level_up_calls: list[
             tuple[
-                str,
                 Sequence[Holding],
+                Mapping[int, tuple[str, int | None]],
+                BadgeState,
+                datetime | str | int,
                 datetime | str | int,
                 datetime | str | int | None,
             ]
@@ -115,6 +117,8 @@ class FakeGateway:
             message="badge ok",
             player_xp=0,
             player_level=0,
+            checked_at=NOW.isoformat().replace("+00:00", "Z"),
+            normal_badge_levels=[],
         )
 
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
@@ -130,13 +134,24 @@ class FakeGateway:
 
     async def check_level_up(
         self,
-        steam_id: str,
         holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
         inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
         *,
         now: datetime | str | int | None = None,
     ) -> LevelUpOptimizationResponse:
-        self.level_up_calls.append((steam_id, holdings, inventory_refreshed_at, now))
+        self.level_up_calls.append(
+            (
+                holdings,
+                game_metadata,
+                badge_state,
+                inventory_refreshed_at,
+                badge_refreshed_at,
+                now,
+            )
+        )
         if self.level_up_error is not None:
             raise self.level_up_error
         if self.level_up_result is not None:
@@ -146,9 +161,6 @@ class FakeGateway:
             reason="badge_data_unavailable",
             generated_at=NOW,
             inventory_refreshed_at=NOW,
-            catalog_total_sets=0,
-            catalog_resolved_sets=0,
-            catalog_pending_sets=0,
         )
 
     async def refresh_gems(
@@ -364,7 +376,17 @@ def test_callback_maps_verifier_outage_to_service_unavailable() -> None:
 
 def test_session_and_logout_use_signed_session_cookie() -> None:
     settings = make_settings(cookie_samesite="strict")
-    gateway = FakeGateway(inventory_retry_after_seconds=17)
+    gateway = FakeGateway(
+        inventory_retry_after_seconds=17,
+        badge_result=BadgeCheck(
+            status="public",
+            message="badge ok",
+            player_xp=0,
+            player_level=0,
+            checked_at="2026-08-26T12:00:00Z",
+            normal_badge_levels=[{"app_id": 440, "level": 3}],
+        ),
+    )
     app = create_app(
         settings,
         steam_gateway=gateway,
@@ -392,6 +414,8 @@ def test_session_and_logout_use_signed_session_cookie() -> None:
                 "message": "badge ok",
                 "player_xp": 0,
                 "player_level": 0,
+                "checked_at": "2026-08-26T12:00:00Z",
+                "normal_badge_levels": [{"app_id": 440, "level": 3}],
             },
         },
     }
@@ -425,6 +449,8 @@ def test_session_badge_failure_is_isolated_from_profile_success() -> None:
             "message": "Steam badge check is unavailable.",
             "player_xp": None,
             "player_level": None,
+            "checked_at": None,
+            "normal_badge_levels": [],
         },
     }
     assert gateway.profile_calls == 1
@@ -456,6 +482,8 @@ def test_session_profile_failure_is_isolated_from_badge_success() -> None:
             "message": "badge ok",
             "player_xp": 0,
             "player_level": 0,
+            "checked_at": "2026-08-26T12:00:00Z",
+            "normal_badge_levels": [],
         },
     }
     assert gateway.profile_calls == 1
@@ -620,12 +648,34 @@ def test_inventory_gateway_exception_returns_unavailable_result() -> None:
 def _valid_level_up_payload() -> dict[str, object]:
     return {
         "inventory_refreshed_at": NOW.isoformat().replace("+00:00", "Z"),
+        "badge_refreshed_at": NOW.isoformat().replace("+00:00", "Z"),
+        "player_xp": 0,
+        "player_level": 0,
+        "games": [
+            {
+                "app_id": "440",
+                "game_name": " Test Game ",
+                "card_set_size": None,
+                "badge_level": 0,
+            },
+            {
+                "app_id": "20",
+                "game_name": "Destination Game",
+                "card_set_size": 5,
+                "badge_level": 1,
+            },
+        ],
         "cards": [
             {
                 "market_hash_name": "440-Test Card (Trading Card)",
                 "owned_quantity": 2,
                 "sellable_quantity": 1,
-            }
+            },
+            {
+                "market_hash_name": "20-Destination Card (Trading Card)",
+                "owned_quantity": 1,
+                "sellable_quantity": 0,
+            },
         ],
     }
 
@@ -684,23 +734,42 @@ def test_level_up_forwards_one_bounded_snapshot_without_inventory_fetch() -> Non
     assert response.json()["status"] == "unavailable"
     assert response.json()["reason"] == "badge_data_unavailable"
     assert len(gateway.level_up_calls) == 1
-    steam_id, holdings, refreshed_at, called_at = gateway.level_up_calls[0]
-    assert steam_id == AUTHENTICATED_STEAM_ID
+
+    holdings, game_metadata, badge_state, refreshed_at, badge_at, called_at = (
+        gateway.level_up_calls[0]
+    )
+    assert game_metadata == {
+        440: ("Test Game", None),
+        20: ("Destination Game", 5),
+    }
+    assert badge_state == BadgeState(0, 0, {440: 0, 20: 1})
     assert refreshed_at == "2026-08-26T12:00:00Z"
+    assert badge_at == "2026-08-26T12:00:00Z"
     assert called_at is None
-    assert len(holdings) == 1
+    assert len(holdings) == 2
     assert holdings[0].market_hash_name == "440-Test Card (Trading Card)"
     assert holdings[0].owned_quantity == 2
     assert holdings[0].sellable_quantity == 1
+    assert holdings[1].market_hash_name == "20-Destination Card (Trading Card)"
+    assert holdings[1].owned_quantity == 1
+    assert holdings[1].sellable_quantity == 0
     assert gateway.inventory_calls == 0
+
+    assert gateway.badge_calls == 0
+    assert gateway.booster_refresh_calls == []
+
+
+def _level_up_payload_with(**updates: object) -> dict[str, object]:
+    payload = _valid_level_up_payload()
+    payload.update(updates)
+    return payload
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {
-            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
-            "cards": [
+        _level_up_payload_with(
+            cards=[
                 {
                     "market_hash_name": "440-Test Card (Trading Card)",
                     "owned_quantity": 1,
@@ -711,48 +780,124 @@ def test_level_up_forwards_one_bounded_snapshot_without_inventory_fetch() -> Non
                     "owned_quantity": 1,
                     "sellable_quantity": 1,
                 },
-            ],
-        },
-        {
-            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
-            "cards": [
+            ]
+        ),
+        _level_up_payload_with(
+            cards=[
                 {
                     "market_hash_name": "440-Test Card (Trading Card)",
                     "owned_quantity": True,
                     "sellable_quantity": 1,
                 }
-            ],
-        },
-        {
-            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
-            "cards": [
+            ]
+        ),
+        _level_up_payload_with(
+            cards=[
                 {
                     "market_hash_name": "440-Test Card (Trading Card)",
                     "owned_quantity": 1,
                     "sellable_quantity": 2,
                 }
-            ],
-        },
-        {
-            "inventory_refreshed_at": "not-a-timestamp",
-            "cards": [],
-        },
-        {
-            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
-            "cards": [],
-            "unknown": True,
-        },
-        {
-            "inventory_refreshed_at": "2026-08-26T12:00:00Z",
-            "cards": [
+            ]
+        ),
+        _level_up_payload_with(inventory_refreshed_at="not-a-timestamp"),
+        _level_up_payload_with(unknown=True),
+        _level_up_payload_with(
+            cards=[
                 {
                     "market_hash_name": "440-Test Card (Trading Card)",
                     "owned_quantity": 1,
                     "sellable_quantity": 1,
                     "unknown": True,
                 }
-            ],
-        },
+            ]
+        ),
+        _level_up_payload_with(badge_refreshed_at=None),
+        _level_up_payload_with(player_xp=True),
+        _level_up_payload_with(player_level=1),
+        _level_up_payload_with(player_level=True),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": "Test Game",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                },
+                {
+                    "app_id": "440",
+                    "game_name": "Duplicate Game",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                },
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "10",
+                    "game_name": "Wrong Game",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                }
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": "Test Game",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                },
+                {
+                    "app_id": "10",
+                    "game_name": "Extra Game",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                },
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": " ",
+                    "card_set_size": None,
+                    "badge_level": 0,
+                }
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": "Test Game",
+                    "card_set_size": True,
+                    "badge_level": 0,
+                }
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": "Test Game",
+                    "card_set_size": None,
+                    "badge_level": 6,
+                }
+            ]
+        ),
+        _level_up_payload_with(
+            games=[
+                {
+                    "app_id": "440",
+                    "game_name": "Test Game",
+                    "card_set_size": None,
+                    "badge_level": True,
+                }
+            ]
+        ),
     ],
 )
 def test_level_up_rejects_invalid_snapshot_contract(
