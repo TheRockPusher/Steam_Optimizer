@@ -47,6 +47,7 @@ export type LevelUpOptimizationPanelProps = {
 
 export const LEVEL_UP_OPTIMIZATION_PANEL_ID = "level-up-optimization-panel";
 const PANEL_ID = LEVEL_UP_OPTIMIZATION_PANEL_ID;
+const PRICE_CATALOG_RETRY_MS = 5_000;
 const REASON_COPY: Record<LevelUpReason, string> = {
   ready: "The current recommendation is ready for review.",
   currency_contract_missing:
@@ -59,6 +60,8 @@ const REASON_COPY: Record<LevelUpReason, string> = {
     "This ownership snapshot is too old for a safe recommendation.",
   price_generation_unavailable:
     "Current market prices are unavailable. Try refreshing the recommendation later.",
+  price_generation_refreshing:
+    "Steam Optimizer is refreshing the shared market-price catalog. This recommendation will retry automatically.",
   price_generation_stale:
     "Current market prices are stale. Try refreshing the recommendation later.",
   quote_depth_unavailable:
@@ -520,6 +523,13 @@ function ResponseSurface({
         </StatusSurface>
       );
     case "unavailable":
+      if (response.reason === "price_generation_refreshing") {
+        return (
+          <StatusSurface status="loading" title="Loading current market prices…">
+            <p>{REASON_COPY[response.reason]}</p>
+          </StatusSurface>
+        );
+      }
       return (
         <StatusSurface
           status="unavailable"
@@ -816,6 +826,21 @@ export function LevelUpOptimizationPanel({
     requestInput.request,
     snapshotKey
   ]);
+
+  useEffect(() => {
+    if (
+      !isActive ||
+      state.kind !== "response" ||
+      state.response.status !== "unavailable" ||
+      state.response.reason !== "price_generation_refreshing"
+    ) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      requestForKey(state.key, true);
+    }, PRICE_CATALOG_RETRY_MS);
+    return () => window.clearTimeout(timer);
+  }, [isActive, requestForKey, state]);
 
   useEffect(() => {
     if (state.kind !== "response" || state.response.status !== "ready") {

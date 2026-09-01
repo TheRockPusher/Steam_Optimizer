@@ -86,6 +86,7 @@ export type LevelUpReason =
   | "badge_data_unavailable"
   | "inventory_snapshot_too_old"
   | "price_generation_unavailable"
+  | "price_generation_refreshing"
   | "price_generation_stale"
   | "quote_depth_unavailable"
   | "no_sellable_card"
@@ -229,6 +230,7 @@ export type LevelUpUnavailableResponse = LevelUpResponseCommon & {
   | "badge_data_unavailable"
   | "inventory_snapshot_too_old"
   | "price_generation_unavailable"
+  | "price_generation_refreshing"
   | "price_generation_stale"
   | "quote_depth_unavailable";
   valid_until: null;
@@ -810,6 +812,7 @@ export function isLevelUpOptimizationResponse(
           response.reason === "badge_data_unavailable" ||
           response.reason === "inventory_snapshot_too_old" ||
           response.reason === "price_generation_unavailable" ||
+          response.reason === "price_generation_refreshing" ||
           response.reason === "price_generation_stale" ||
           response.reason === "quote_depth_unavailable") &&
         (response.reason !== "currency_contract_missing" ||

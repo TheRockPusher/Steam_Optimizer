@@ -123,6 +123,7 @@ BOOSTER_CARD_COUNT = 3
 
 STEAMAPIS_BADGES_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/users/{{steam_id}}/badges"
 LEVEL_UP_PRICE_MAX_AGE_SECONDS = 15 * 60
+_PriceCatalogRefreshState = Literal["fresh", "refreshing", "unavailable"]
 MAX_BADGE_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_BADGE_DECODED_SIZE = 16 * 1024 * 1024
 MAX_BADGE_RECORDS = 25_000
@@ -2533,7 +2534,7 @@ class SteamApisClient:
         self,
         *,
         max_age_seconds: int = LEVEL_UP_PRICE_MAX_AGE_SECONDS,
-    ) -> bool:
+    ) -> _PriceCatalogRefreshState:
         """Start a stale global-catalog refresh without delaying the caller."""
 
         if (
@@ -2541,19 +2542,19 @@ class SteamApisClient:
             or not isinstance(max_age_seconds, int)
             or max_age_seconds <= 0
         ):
-            return False
+            return "unavailable"
         try:
             cache_read = self.price_cache.read()
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error):
-            return False
+            return "unavailable"
         if (
             cache_read.has_generation
             and cache_read.generation_age_seconds is not None
             and cache_read.generation_age_seconds <= max_age_seconds
         ):
-            return True
+            return "fresh"
         if self._api_headers() is None or cache_read.retry_suppressed:
-            return False
+            return "unavailable"
         task = self._price_refresh_task
         if task is None:
             task = asyncio.create_task(
@@ -2561,7 +2562,7 @@ class SteamApisClient:
             )
             self._price_refresh_task = task
             task.add_done_callback(self._discard_price_refresh_task)
-        return False
+        return "refreshing"
 
     async def ensure_price_catalog_fresh(
         self,
@@ -2571,11 +2572,16 @@ class SteamApisClient:
         """Ensure the global generation is fresh under a caller's contract."""
 
         for _ in range(2):
-            if self.schedule_price_catalog_refresh(max_age_seconds=max_age_seconds):
+            refresh_state = self.schedule_price_catalog_refresh(
+                max_age_seconds=max_age_seconds
+            )
+            if refresh_state == "fresh":
                 return True
+            if refresh_state == "unavailable":
+                return False
             task = self._price_refresh_task
             if task is None:
-                return False
+                continue
             try:
                 await asyncio.shield(task)
             finally:
@@ -3026,10 +3032,17 @@ class SteamGateway:
             or catalog_read.truncated
             or not catalog_read.optimizer_complete
         ):
-            self.steamapis.schedule_price_catalog_refresh(max_age_seconds=quote_limit)
+            refresh_state = self.steamapis.schedule_price_catalog_refresh(
+                max_age_seconds=quote_limit
+            )
+            reason = (
+                "price_generation_unavailable"
+                if refresh_state == "unavailable"
+                else "price_generation_refreshing"
+            )
             return _level_up_response(
                 status="unavailable",
-                reason="price_generation_unavailable",
+                reason=reason,
                 now=current,
                 inventory_time=inventory_time,
                 contract=contract,
@@ -3056,9 +3069,11 @@ class SteamGateway:
                 "price_generation_stale",
                 "price_generation_unavailable",
             }:
-                self.steamapis.schedule_price_catalog_refresh(
+                refresh_state = self.steamapis.schedule_price_catalog_refresh(
                     max_age_seconds=quote_limit
                 )
+                if refresh_state != "unavailable":
+                    freshness_issue = "price_generation_refreshing"
             return _level_up_response(
                 status="unavailable",
                 reason=freshness_issue,

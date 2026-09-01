@@ -114,9 +114,10 @@ The current connection, inventory, and read-only recommendation stage provides:
   Steam Market eligibility. The endpoint never calls the inventory or badge providers, never
   resolves booster/card-set metadata, never logs holdings, or stores the submitted snapshot.
 - Planning reads the current cached catalog generation synchronously and never waits for SteamApis'
-  bulk catalog download. A missing or stale generation queues one shared background refresh and
-  immediately returns a non-actionable `price_generation_unavailable` or
-  `price_generation_stale` response; the next request can use the completed generation.
+  bulk catalog download. A missing or stale generation queues one shared background refresh. While
+  that task runs, the panel shows **Loading current market prices** and retries every five seconds;
+  a true unavailable state is shown only when the refresh cannot be started or prices remain
+  unusable after it finishes.
 - The optimizer validates the submitted game IDs against normal-card hashes and reads the price
   catalog only for those AppIDs through the `(generation, normal_card_app_id)` index; unrelated
   catalog groups are not loaded. It evaluates every held sellable normal card as a one-copy
