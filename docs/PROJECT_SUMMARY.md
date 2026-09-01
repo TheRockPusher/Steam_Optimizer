@@ -133,11 +133,13 @@ state until the user refreshes.
 For that request, the backend validates that the `games` IDs exactly match AppIDs parsed from normal
 card hashes and reads the current price-catalog generation only for those submitted AppIDs through
 the `(generation, normal_card_app_id)` index. It never waits for the global SteamApis bulk download:
-a missing or stale generation queues one shared background refresh and immediately returns a
-non-actionable unavailable state. Unrelated catalog groups are not loaded. Complete named catalog
-sets are built from the request's game names and filtered groups; an optional `card_set_size` only
-cross-checks the group length. Missing, invalid, or set-size-mismatched groups are excluded from
-candidacy; if none remain, the result is `no_sellable_card`. Every held sellable normal card is
+a missing or stale generation queues one shared background refresh. While that task runs, the
+frontend shows a loading state and retries every five seconds; it shows an unavailable state only
+when the refresh cannot start or its completed generation remains unusable. Unrelated catalog groups
+are not loaded. Complete named catalog sets are built from the request's game names and filtered
+groups; an optional `card_set_size` only cross-checks the group length.
+Missing, invalid, or set-size-mismatched groups are excluded from candidacy; if none remain, the
+result is `no_sellable_card`. Every held sellable normal card is
 evaluated as a one-copy source candidate, including cards from maxed badges; destinations must
 remain below normal badge level five. Foil and non-game records are ignored, as are syntactically
 valid records outside the normal badge shape, including unrelated event and collection badges. A
@@ -154,12 +156,12 @@ The endpoint returns exactly one of these read-only states:
 - `unavailable`: a required contract, badge snapshot, price, depth, catalog, identity, or freshness
   gate is unresolved.
 
-Initial unavailable reasons are `currency_contract_missing`, `steamapi_key_missing`,
-`badge_data_unavailable`, `inventory_snapshot_too_old`, `price_generation_unavailable`,
-`price_generation_stale`, and `quote_depth_unavailable`. Missing submitted game metadata fails
-closed as `unavailable`; missing or invalid scoped catalog candidates are excluded, and an
-all-excluded catalog returns `no_sellable_card`. No-opportunity also uses
-`no_positive_xp_swap`. Every success response uses
+Transient catalog loading uses `price_generation_refreshing`. Unavailable reasons are
+`currency_contract_missing`, `steamapi_key_missing`, `badge_data_unavailable`,
+`inventory_snapshot_too_old`, `price_generation_unavailable`, `price_generation_stale`, and
+`quote_depth_unavailable`. Missing submitted game metadata fails closed as `unavailable`; missing or
+invalid scoped catalog candidates are excluded, and an all-excluded catalog returns
+`no_sellable_card`. No-opportunity also uses `no_positive_xp_swap`. Every success response uses
 `Cache-Control: no-store`.
 
 Money is fail-closed behind one explicit, verified contract. The checked-in service group defines

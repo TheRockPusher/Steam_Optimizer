@@ -139,6 +139,7 @@ function responseWithStatus(
     | "no_sellable_card"
     | "no_positive_xp_swap"
     | "price_generation_stale"
+    | "price_generation_refreshing"
     | "badge_data_unavailable"
     | "steamapi_key_missing"
 ): LevelUpOptimizationResponse {
@@ -693,6 +694,41 @@ describe("lazy panel lifecycle and state surfaces", () => {
     await flushPanelEffects();
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
+  });
+  it("automatically retries while the shared price catalog refreshes", async () => {
+    renderPanel(
+      responseWithStatus("unavailable", "price_generation_refreshing")
+    );
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("heading", { name: "Loading current market prices…" })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Refresh recommendation" })
+    ).not.toBeInTheDocument();
+
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      new Response(
+        JSON.stringify(
+          responseWithStatus("no_opportunity", "no_sellable_card")
+        ),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        }
+      )
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByText(/No sellable normal card with a usable current bid/)
+    ).toBeInTheDocument();
   });
   it("rechecks a future snapshot when it becomes current", async () => {
     const futureInventoryRefreshedAt = "2026-08-29T12:01:00Z";

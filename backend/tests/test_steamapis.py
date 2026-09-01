@@ -3555,9 +3555,18 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
     assert client.stream_calls == []
 
 
+@pytest.mark.parametrize(
+    ("refresh_state", "expected_reason"),
+    [
+        ("refreshing", "price_generation_refreshing"),
+        ("unavailable", "price_generation_unavailable"),
+    ],
+)
 @pytest.mark.parametrize("quote_age_seconds", [600, 1200])
-def test_level_up_schedules_strict_catalog_refresh_without_awaiting_it(
+def test_level_up_reports_catalog_refresh_state_without_awaiting_it(
     quote_age_seconds: int,
+    refresh_state: str,
+    expected_reason: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StrictPriceAgeSpy:
@@ -3568,9 +3577,9 @@ def test_level_up_schedules_strict_catalog_refresh_without_awaiting_it(
             del max_age_seconds
             raise AssertionError
 
-        def schedule_price_catalog_refresh(self, *, max_age_seconds: int) -> bool:
+        def schedule_price_catalog_refresh(self, *, max_age_seconds: int) -> str:
             self.scheduled_ages.append(max_age_seconds)
-            return False
+            return refresh_state
 
         def read_price_catalog(
             self,
@@ -3614,7 +3623,7 @@ def test_level_up_schedules_strict_catalog_refresh_without_awaiting_it(
     )
 
     assert result.status == "unavailable"
-    assert result.reason == "price_generation_unavailable"
+    assert result.reason == expected_reason
     assert strict_cache.scheduled_ages == [quote_age_seconds]
 
 

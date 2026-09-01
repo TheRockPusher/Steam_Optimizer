@@ -5,8 +5,9 @@ All notable changes to Steam Optimizer are documented here.
 
 
 ### Bug Fixes
+- Treat a scheduled market-catalog refresh as a transient loading state and retry the recommendation
+  automatically instead of presenting a cold or stale cache as a terminal price failure.
 - Compute plans from cached snapshots
-
 
 ### Documentation
 - Update changelog for v0.10.0
