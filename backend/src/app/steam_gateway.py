@@ -68,11 +68,6 @@ from app.level_up_optimizer import (
     optimize_level_up,
     parse_normal_card_hash,
 )
-from app.market_fees import (
-    MarketFeeContract,
-    decimal_to_minor,
-    seller_receipt_from_buyer_total,
-)
 from app.steamapis_price_cache import (
     CachedPrice,
     NormalCardCatalogRead,
@@ -83,6 +78,7 @@ from app.steamapis_price_cache import (
 
 if TYPE_CHECKING:
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
+    from app.market_fees import MarketFeeContract
     from app.settings import Settings
 
 PROFILE_ENDPOINT = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
@@ -170,6 +166,12 @@ MAX_PRICE_STREAM_NESTING = 64
 MAX_PRICE_STREAM_TOKENS = 100_000_000
 MAX_PRICE_STREAM_SCALAR_LENGTH = 16_384
 MAX_CONCURRENT_BULK_STREAMS = 1
+
+# Bulk feeds are parsed in bounded cooperative segments so a fully buffered
+# response cannot monopolize the event loop and cancellation lands within
+# one segment.
+_PRICE_STREAM_YIELD_TOKENS = 4096
+_PRICE_STREAM_YIELD_ROWS = 512
 
 STEAM_ICON_HOSTNAME = "community.cloudflare.steamstatic.com"
 STEAMAPIS_BULK_HOST_SUFFIX = ".r2.cloudflarestorage.com"
@@ -821,7 +823,7 @@ def _level_up_timestamp(value: object) -> datetime | None:
                     microsecond=milliseconds * 1000
                 )
             return datetime.fromtimestamp(value, UTC)
-        except (OverflowError, OSError, ValueError):
+        except OverflowError, OSError, ValueError:
             return None
     if (
         not isinstance(value, str)
@@ -1069,7 +1071,7 @@ def _catalog_groups(
                     lowest_sell_quantity=entry.lowest_sell_quantity,
                     observed_at=observed_at,
                 )
-            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+            except OptimizerInputError, TypeError, ValueError, ArithmeticError:
                 valid = False
                 break
             if card.market_hash_name in seen:
@@ -1081,47 +1083,6 @@ def _catalog_groups(
             cards.sort(key=lambda card: card.market_hash_name)
             groups[raw_app_id] = tuple(cards)
     return groups
-
-
-def _level_up_quote_amount(
-    card: CatalogCard,
-    *,
-    side: Literal["buy", "sell"],
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
-    require_depth: bool = False,
-) -> int | None:
-    """Return one fresh exact quote amount for local candidate prefiltering."""
-
-    if side == "buy":
-        price = card.highest_buy
-        quantity = card.highest_buy_quantity
-        timestamp_value = card.highest_buy_observed_at or card.observed_at
-    else:
-        price = card.lowest_sell
-        quantity = card.lowest_sell_quantity
-        timestamp_value = card.lowest_sell_observed_at or card.observed_at
-    if price is None:
-        return None
-    timestamp = _level_up_timestamp(timestamp_value)
-    if timestamp is None:
-        return None
-    try:
-        if timestamp > now or now - timestamp > timedelta(seconds=quote_window):
-            return None
-    except (OverflowError, TypeError, ValueError, ArithmeticError):
-        return None
-    if require_depth and (
-        isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1
-    ):
-        return None
-    amount = decimal_to_minor(price, contract.minor_digits)
-    if amount is None:
-        return None
-    if side == "buy" and seller_receipt_from_buyer_total(amount, contract) is None:
-        return None
-    return amount
 
 
 def _level_up_snapshot_issue(
@@ -1141,7 +1102,7 @@ def _level_up_snapshot_issue(
             return "price_generation_unavailable"
         if current - generated_at > timedelta(seconds=quote_limit):
             return "price_generation_stale"
-    except (OverflowError, TypeError, ValueError, ArithmeticError):
+    except OverflowError, TypeError, ValueError, ArithmeticError:
         return "price_generation_unavailable"
     return None
 
@@ -1407,7 +1368,7 @@ def _booster_infos(
             ) and resolution.gem_cost == derive_booster_gem_cost(
                 resolution.card_set_size
             )
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             is_valid_resolution = False
         if not is_valid_resolution:
             resolution = None
@@ -1618,7 +1579,7 @@ def _provider_amount(value: object) -> str | None:
         if fixed_length > MAX_PRICE_STREAM_SCALAR_LENGTH:
             return None
         fixed = format(decimal, "f")
-    except (ArithmeticError, ValueError, TypeError):
+    except ArithmeticError, ValueError, TypeError:
         return None
     return fixed if len(fixed) <= MAX_PRICE_STREAM_SCALAR_LENGTH else None
 
@@ -1663,7 +1624,7 @@ def _depth_price_key(value: object) -> str | None:
         return None
     try:
         return format(Decimal(normalized).normalize(), "f")
-    except (ArithmeticError, ValueError, TypeError):
+    except ArithmeticError, ValueError, TypeError:
         return None
 
 
@@ -1737,7 +1698,7 @@ def _depth_extreme_price(
         prices = (Decimal(value) for value in totals)
         extreme = max(prices) if kind == "buy" else min(prices)
         return format(extreme.normalize(), "f")
-    except (ArithmeticError, TypeError, ValueError):
+    except ArithmeticError, TypeError, ValueError:
         return None
 
 
@@ -1793,7 +1754,7 @@ def _observed_at(value: object) -> str | None:
         observed = datetime.fromtimestamp(seconds, UTC) + timedelta(
             milliseconds=remainder
         )
-    except (ArithmeticError, ValueError, TypeError, OSError):
+    except ArithmeticError, ValueError, TypeError, OSError:
         return None
     return observed.isoformat().replace("+00:00", "Z")
 
@@ -1871,16 +1832,24 @@ def _price_refresh_lock(cache: SteamApisPriceCache) -> asyncio.Lock:
     return lock
 
 
+_PriceRefreshSink = Callable[
+    [str, str | None, str | None, str | None, int | None, int | None],
+    None,
+]
+
+
 async def _stream_prices(
     response: HTTPResponse,
     requested_names: frozenset[str],
-    on_price: Callable[[str, InventoryPrice], None] | None = None,
+    on_price: _PriceRefreshSink | None = None,
 ) -> tuple[dict[str, InventoryPrice], set[str], _PriceStreamSummary]:
     prices: dict[str, InventoryPrice] = {}
     priced_names: set[str] = set()
     stack: list[_PriceFrame] = []
     nesting = 0
     token_count = 0
+    tokens_until_yield = _PRICE_STREAM_YIELD_TOKENS
+    rows_until_yield = _PRICE_STREAM_YIELD_ROWS
     saw_items_array = False
     metadata_app_id: int | None = None
     declared_item_count: int | None = None
@@ -1899,6 +1868,10 @@ async def _stream_prices(
             raise InvalidSteamApisPayloadError
         if isinstance(value, str) and len(value) > MAX_PRICE_STREAM_SCALAR_LENGTH:
             raise InvalidSteamApisPayloadError
+        tokens_until_yield -= 1
+        if tokens_until_yield <= 0:
+            tokens_until_yield = _PRICE_STREAM_YIELD_TOKENS
+            await asyncio.sleep(0)
         if event == "start_map":
             nesting += 1
             if nesting > MAX_PRICE_STREAM_NESTING:
@@ -1951,19 +1924,29 @@ async def _stream_prices(
                     raise InvalidSteamApisPayloadError
                 seen_item_hashes.add(decoded_name)
                 parsed_item_count += 1
+                rows_until_yield -= 1
+                if rows_until_yield <= 0:
+                    rows_until_yield = _PRICE_STREAM_YIELD_ROWS
+                    await asyncio.sleep(0)
+                if on_price is not None:
+                    # The cache refresh sink receives pre-normalized scalars
+                    # so the hundreds of thousands of persisted feed rows
+                    # never construct a pydantic model.
+                    on_price(
+                        decoded_name,
+                        _provider_amount(frame.highest_buy),
+                        _provider_amount(frame.lowest_sell),
+                        _observed_at(frame.observed_at),
+                        frame.highest_buy_quantity,
+                        frame.lowest_sell_quantity,
+                    )
+                # Unrequested rows never parse quote numbers or allocate an
+                # InventoryPrice; only requested browser lookup rows do.
                 matched_names = (
                     (decoded_name,) if decoded_name in requested_names else ()
                 )
-                price: InventoryPrice | None = None
-                if on_price is not None:
-                    price = _price_from_frame(frame)
-                    on_price(decoded_name, price)
-                # Do not parse numbers or allocate an InventoryPrice for the
-                # hundreds of thousands of unrequested feed entries unless a
-                # cache refresh is actively persisting this complete feed.
                 if matched_names:
-                    if price is None:
-                        price = _price_from_frame(frame)
+                    price = _price_from_frame(frame)
                     for candidate in matched_names:
                         _merge_price(prices, priced_names, candidate, price)
             continue
@@ -2236,7 +2219,7 @@ class SteamApisClient:
             if status_code == 403:
                 try:
                     payload = response.json()
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     payload = None
                 except _PRICE_STREAM_JSON_ERRORS:
                     payload = None
@@ -2257,7 +2240,7 @@ class SteamApisClient:
                 return _unavailable_inventory()
             try:
                 payload = response.json()
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return _unavailable_inventory()
             except _PRICE_STREAM_JSON_ERRORS:
                 return _unavailable_inventory()
@@ -2331,12 +2314,18 @@ class SteamApisClient:
         items.sort(
             key=lambda item: (item.name.casefold(), item.class_id, item.instance_id)
         )
-        priceable_names = {
-            item.market_hash_name
-            for item in items
-            if item.marketable and item.market_hash_name
-        }
-        if any(item.gem_key is not None for item in items):
+        priceable_names: set[str] = set()
+        inventory_has_gem_items = False
+        inventory_has_trading_card = False
+        for item in items:
+            market_hash_name = item.market_hash_name
+            if item.marketable and market_hash_name:
+                priceable_names.add(market_hash_name)
+            if item.gem_key is not None:
+                inventory_has_gem_items = True
+            if item.item_type == "trading_card":
+                inventory_has_trading_card = True
+        if inventory_has_gem_items:
             # The sack is a reference price, not an inventory row and therefore
             # does not affect ordinary SteamApis coverage counts.
             priceable_names.add(SACK_OF_GEMS_MARKET_HASH_NAME)
@@ -2387,20 +2376,6 @@ class SteamApisClient:
             price_lookup.prices,
             booster_scan.values,
         )
-        for index, item in enumerate(items):
-            if not item.marketable or item.market_hash_name is None:
-                continue
-            price = price_lookup.prices.get(item.market_hash_name)
-            if price is not None:
-                items[index] = item.model_copy(update={"price": price})
-
-        (
-            price_status,
-            price_message,
-            priceable_item_count,
-            priced_item_count,
-        ) = _price_status_for_items(items)
-
         gem_groups = _gem_group_representatives(items)
         gem_scan = GemScanResult(values={})
         if gem_groups:
@@ -2420,12 +2395,41 @@ class SteamApisClient:
                 gem_scan = GemScanResult(values={})
 
         sack_price = price_lookup.prices.get(SACK_OF_GEMS_MARKET_HASH_NAME)
+        # One enrichment pass: a single model_copy per updated item receives
+        # both the price join and the gem resolution, preserving item order.
+        for index, item in enumerate(items):
+            price = (
+                price_lookup.prices.get(item.market_hash_name)
+                if item.marketable and item.market_hash_name is not None
+                else None
+            )
+            gem_key = item.gem_key
+            resolution = gem_scan.values.get(gem_key) if gem_key is not None else None
+            if resolution is not None and getattr(resolution, "key", None) != gem_key:
+                resolution = None
+            if price is None and resolution is None:
+                continue
+            updates: dict[str, object] = {}
+            if price is not None:
+                updates["price"] = price
+            if resolution is not None:
+                updates["gem_yield"] = resolution.gem_yield
+                updates["gem_cash_value"] = gem_cash_value(
+                    resolution.gem_yield,
+                    sack_price.lowest_sell if sack_price is not None else None,
+                )
+            items[index] = item.model_copy(update=updates)
+
+        (
+            price_status,
+            price_message,
+            priceable_item_count,
+            priced_item_count,
+        ) = _price_status_for_items(items)
+
         auxiliary_price_exposed = any(
             booster.price is not None for booster in boosters
-        ) or (
-            sack_price is not None
-            and any(item.item_type == "trading_card" for item in items)
-        )
+        ) or (sack_price is not None and inventory_has_trading_card)
         if price_lookup.used_stale_cache and (
             priced_item_count or auxiliary_price_exposed
         ):
@@ -2445,22 +2449,6 @@ class SteamApisClient:
                 price_message = (
                     "Displayed booster or gem market context uses a cached fallback."
                 )
-        for index, item in enumerate(items):
-            key = item.gem_key
-            if key is None:
-                continue
-            resolution = gem_scan.values.get(key)
-            if resolution is None or getattr(resolution, "key", None) != key:
-                continue
-            items[index] = item.model_copy(
-                update={
-                    "gem_yield": resolution.gem_yield,
-                    "gem_cash_value": gem_cash_value(
-                        resolution.gem_yield,
-                        sack_price.lowest_sell if sack_price is not None else None,
-                    ),
-                }
-            )
 
         (
             gem_status,
@@ -2484,7 +2472,7 @@ class SteamApisClient:
             gem_rate_limited=gem_scan.rate_limited,
             gem_retry_after_seconds=gem_scan.retry_after_seconds,
             gem_cash_context=_gem_cash_context(sack_price)
-            if any(item.gem_key is not None for item in items)
+            if inventory_has_gem_items
             else None,
             items=items,
             boosters=boosters,
@@ -2545,7 +2533,7 @@ class SteamApisClient:
             return "unavailable"
         try:
             cache_read = self.price_cache.read()
-        except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error):
+        except OSError, TypeError, ValueError, RuntimeError, sqlite3.Error:
             return "unavailable"
         if (
             cache_read.has_generation
@@ -2563,38 +2551,6 @@ class SteamApisClient:
             self._price_refresh_task = task
             task.add_done_callback(self._discard_price_refresh_task)
         return "refreshing"
-
-    async def ensure_price_catalog_fresh(
-        self,
-        *,
-        max_age_seconds: int = LEVEL_UP_PRICE_MAX_AGE_SECONDS,
-    ) -> bool:
-        """Ensure the global generation is fresh under a caller's contract."""
-
-        for _ in range(2):
-            refresh_state = self.schedule_price_catalog_refresh(
-                max_age_seconds=max_age_seconds
-            )
-            if refresh_state == "fresh":
-                return True
-            if refresh_state == "unavailable":
-                return False
-            task = self._price_refresh_task
-            if task is None:
-                continue
-            try:
-                await asyncio.shield(task)
-            finally:
-                self._discard_price_refresh_task(task)
-        try:
-            refreshed = self.price_cache.read()
-        except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error):
-            return False
-        return (
-            refreshed.has_generation
-            and refreshed.generation_age_seconds is not None
-            and refreshed.generation_age_seconds <= max_age_seconds
-        )
 
     def _discard_price_refresh_task(
         self,
@@ -2650,14 +2606,7 @@ class SteamApisClient:
                 _, _, stream_summary = await _stream_prices(
                     cdn_response,
                     frozenset(),
-                    on_price=lambda name, price: refresh_session.add(
-                        name,
-                        price.highest_buy,
-                        price.lowest_sell,
-                        price.observed_at,
-                        price.highest_buy_quantity,
-                        price.lowest_sell_quantity,
-                    ),
+                    on_price=refresh_session.add,
                 )
             _validate_price_generation(refresh_session, stream_summary)
             refresh_session.commit(optimizer_complete=True)
@@ -2868,7 +2817,7 @@ class SteamGateway:
                 raw_body.decode("utf-8"),
                 object_pairs_hook=reject_duplicate_object_keys,
             )
-        except (TypeError, UnicodeDecodeError, ValueError, RecursionError):
+        except TypeError, UnicodeDecodeError, ValueError, RecursionError:
             raise InvalidSteamApisPayloadError from None
         return _parse_badges_payload(payload)
 
@@ -2892,7 +2841,7 @@ class SteamGateway:
         safe_inventory_time = inventory_time or current
         try:
             contract = self.settings.level_up_money_contract
-        except (AttributeError, TypeError, ValueError, ArithmeticError):
+        except AttributeError, TypeError, ValueError, ArithmeticError:
             contract = None
         if contract is None:
             return _level_up_response(
@@ -2923,7 +2872,7 @@ class SteamGateway:
             inventory_age = current - inventory_time
             inventory_limit = contract.max_inventory_age_seconds
             inventory_valid = inventory_age <= timedelta(seconds=inventory_limit)
-        except (AttributeError, TypeError, ValueError, OverflowError):
+        except AttributeError, TypeError, ValueError, OverflowError:
             inventory_valid = False
         if not inventory_valid:
             return _level_up_response(
@@ -2946,7 +2895,7 @@ class SteamGateway:
             badge_valid = badge_age >= timedelta(0) and badge_age <= timedelta(
                 seconds=contract.max_inventory_age_seconds
             )
-        except (AttributeError, TypeError, ValueError, OverflowError):
+        except AttributeError, TypeError, ValueError, OverflowError:
             badge_valid = False
         if not badge_valid:
             return _level_up_response(
@@ -2966,7 +2915,7 @@ class SteamGateway:
             )
         try:
             normalized_metadata = _normalize_level_up_game_metadata(game_metadata)
-        except (AttributeError, TypeError, ValueError):
+        except AttributeError, TypeError, ValueError:
             normalized_metadata = None
         if normalized_metadata is None:
             return _level_up_response(
@@ -3049,7 +2998,7 @@ class SteamGateway:
             )
         try:
             generated_at = datetime.fromtimestamp(catalog_read.refreshed_at, UTC)
-        except (OverflowError, OSError, ValueError, TypeError):
+        except OverflowError, OSError, ValueError, TypeError:
             return _level_up_response(
                 status="unavailable",
                 reason="price_generation_unavailable",
@@ -3111,7 +3060,7 @@ class SteamGateway:
                         set_size=requested_set_size,
                     )
                 )
-            except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+            except OptimizerInputError, TypeError, ValueError, ArithmeticError:
                 continue
         if not catalog_sets:
             return _level_up_response(
@@ -3127,7 +3076,7 @@ class SteamGateway:
                 generated_at=generated_at,
                 sets=tuple(catalog_sets),
             )
-        except (OptimizerInputError, TypeError, ValueError, ArithmeticError):
+        except OptimizerInputError, TypeError, ValueError, ArithmeticError:
             return _level_up_response(
                 status="unavailable",
                 reason="quote_depth_unavailable",

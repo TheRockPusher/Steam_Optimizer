@@ -80,6 +80,9 @@ _BOOSTER_CACHE_TABLE_INFO = (
     ("created_at", "REAL", 1, None, 0),
     ("expires_at", "REAL", 1, None, 0),
 )
+# get_many binds one variable per game AppID; 999 keys per statement keeps
+# every batch at SQLite's portable variable ceiling of 999.
+_BOOSTER_GET_MANY_BATCH_SIZE = 999
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 _STEAM_CARD_TYPE_SUFFIX = " Trading Card"
 _LOGGER = logging.getLogger(__name__)
@@ -535,7 +538,7 @@ class BoosterPriceCache:
             return None
         try:
             result = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return None
         return result if math.isfinite(result) else None
 
@@ -590,7 +593,7 @@ class BoosterPriceCache:
                 (game_app_id,),
             ).fetchone()
             return None if row is None else self._entry(row)
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return None
         finally:
             if connection is not None:
@@ -604,21 +607,23 @@ class BoosterPriceCache:
         results: dict[str, BoosterCacheEntry] = {}
         try:
             connection = self._connect()
-            for game_app_id in unique_ids:
-                row = connection.execute(
-                    """
+            for start in range(0, len(unique_ids), _BOOSTER_GET_MANY_BATCH_SIZE):
+                chunk = unique_ids[start : start + _BOOSTER_GET_MANY_BATCH_SIZE]
+                id_values = ",".join(["?"] * len(chunk))
+                rows = connection.execute(
+                    f"""
                     SELECT game_app_id, status, card_set_size, game_name,
                            created_at, expires_at
                       FROM booster_card_count_cache
-                     WHERE game_app_id = ?
-                    """,
-                    (game_app_id,),
-                ).fetchone()
-                if row is not None:
+                     WHERE game_app_id IN ({id_values})
+                    """,  # noqa: S608 - id_values contains only literal "?"
+                    chunk,
+                ).fetchall()
+                for row in rows:
                     entry = self._entry(row)
                     if entry is not None:
-                        results[game_app_id] = entry
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+                        results[entry.game_app_id] = entry
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return {}
         finally:
             if connection is not None:
@@ -668,7 +673,7 @@ class BoosterPriceCache:
                 ),
             )
             connection.commit()
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return
         finally:
             if connection is not None:
@@ -702,7 +707,7 @@ class BoosterPriceCache:
                 ),
             )
             connection.commit()
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return
         finally:
             if connection is not None:
@@ -782,7 +787,7 @@ class SteamCommunityBoosterProvider:
                     raw_text,
                     object_pairs_hook=reject_duplicate_object_keys,
                 )
-            except (TypeError, UnicodeError, ValueError, RecursionError):
+            except TypeError, UnicodeError, ValueError, RecursionError:
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
             if _bounded_json_size(payload, MAX_BOOSTER_SEARCH_BYTES) is None:
                 return BoosterLookup(failure="Steam Market card data is unavailable.")
@@ -1088,8 +1093,7 @@ class BoosterPricingService:
                     continue
                 else:
                     pending_count += 1
-                    if self._queue_lookup(game_app_id):
-                        continue
+                    self._queue_lookup(game_app_id)
                 continue
             stale_resolution = (
                 resolution
@@ -1103,8 +1107,7 @@ class BoosterPricingService:
                 used_stale_cache = True
             if stale_resolution is None:
                 pending_count += 1
-            if self._queue_lookup(game_app_id):
-                continue
+            self._queue_lookup(game_app_id)
 
         rate_limited, retry_after_seconds = self._rate_limit_status()
         return BoosterScanResult(

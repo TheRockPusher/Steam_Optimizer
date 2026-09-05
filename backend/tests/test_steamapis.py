@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from collections.abc import (
         AsyncIterator,
         Awaitable,
-        Callable,
         Iterable,
         Mapping,
         Sequence,
@@ -1028,6 +1027,28 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
     assert "server-only-key" not in stream_url
 
 
+def test_inventory_items_sort_class_ids_by_string_order() -> None:
+    client = FakeHTTPClient(
+        [
+            FakeResponse(
+                200,
+                page(
+                    assets=[item_asset("9"), item_asset("10")],
+                    descriptions=[
+                        item_description("9", "Same Card"),
+                        item_description("10", "Same Card"),
+                    ],
+                ),
+            ),
+        ],
+    )
+    result = run(SteamGateway(settings(), http_client=client).check_inventory("42"))
+
+    assert result.status == "public"
+    assert [item.class_id for item in result.items] == ["10", "9"]
+    assert [item.name for item in result.items] == ["Same Card", "Same Card"]
+
+
 def test_bulk_redirect_rejects_non_https_without_streaming() -> None:
     client = FakeHTTPClient(
         [FakeResponse(302, headers={"Location": "http://cdn.example/items.json"})]
@@ -1606,7 +1627,7 @@ def test_price_cache_concurrent_stale_readers_coalesce_refresh(
     async def blocked_stream_with_price(
         _response: object,
         _requested_names: frozenset[str],
-        on_price: Callable[[str, steam_gateway.InventoryPrice], None] | None = None,
+        on_price: steam_gateway._PriceRefreshSink | None = None,
     ) -> tuple[
         dict[str, object],
         set[str],
@@ -1619,11 +1640,11 @@ def test_price_cache_concurrent_stale_readers_coalesce_refresh(
         assert callable(on_price)
         on_price(
             "Name",
-            steam_gateway.InventoryPrice(
-                highest_buy="0.10",
-                lowest_sell="0.20",
-                observed_at="2026-08-27T00:00:00Z",
-            ),
+            "0.10",
+            "0.20",
+            "2026-08-27T00:00:00Z",
+            None,
+            None,
         )
         return {}, set(), steam_gateway._PriceStreamSummary(753, 1, 1)
 
@@ -1907,6 +1928,130 @@ def test_price_cache_empty_json_refresh_keeps_previous_generation(
     assert stale.prices["Name"].lowest_sell == "0.20"
 
 
+def test_price_cache_cancelled_refresh_keeps_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    client = FakeHTTPClient(
+        [price_redirect(), price_redirect()],
+        stream_response=price_stream(),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+    run(steamapis.fetch_prices(frozenset({"Name"})))
+    with sqlite3.connect(cache_path) as connection:
+        connection.execute("UPDATE steamapis_price_cache_meta SET refreshed_at = 0")
+        connection.commit()
+    partial_installed = asyncio.Event()
+
+    async def blocked_stream(
+        _response: object,
+        _requested_names: frozenset[str],
+        on_price: steam_gateway._PriceRefreshSink | None = None,
+    ) -> tuple[
+        dict[str, object],
+        set[str],
+        steam_gateway._PriceStreamSummary,
+    ]:
+        assert callable(on_price)
+        on_price(
+            "Partial",
+            None,
+            "9.99",
+            "2026-08-27T00:00:00Z",
+            None,
+            None,
+        )
+        partial_installed.set()
+        await asyncio.Event().wait()
+        pytest.fail("stream must be cancelled, not completed")
+
+    original_stream_prices = steam_gateway._stream_prices
+    monkeypatch.setattr(steam_gateway, "_stream_prices", blocked_stream)
+
+    async def exercise() -> None:
+        pending = asyncio.create_task(steamapis.fetch_prices(frozenset({"Name"})))
+        await partial_installed.wait()
+        refresh_task = steamapis._price_refresh_task
+        assert refresh_task is not None
+        refresh_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        surviving = SteamApisPriceCache(cache_path).read(("Name", "Partial"))
+        assert surviving.has_generation is True
+        assert surviving.generation == 1
+        assert set(surviving.prices) == {"Name"}
+        assert surviving.prices["Name"].lowest_sell == "0.20"
+        assert surviving.retry_suppressed is False
+        assert surviving.failure_count == 0
+        assert (
+            steam_gateway._price_refresh_lock(steamapis.price_cache).locked() is False
+        )
+
+        monkeypatch.setattr(steam_gateway, "_stream_prices", original_stream_prices)
+        client.responses.append(price_redirect())
+        client.stream_response = price_stream()
+        refreshed = await steamapis.fetch_prices(frozenset({"Name"}))
+
+        assert refreshed.status == "complete"
+        assert refreshed.prices["Name"].lowest_sell == "0.20"
+        assert len(client.get_calls) == 3
+        assert SteamApisPriceCache(cache_path).read().generation == 2
+
+    run(exercise())
+
+
+def test_bulk_refresh_yields_event_loop_and_cancels_mid_stream(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    row_count = 20_000
+    rows = ",".join(
+        f'{{"marketHashName":"440-Card {index} (Trading Card)","orderBook":{{}}}}'
+        for index in range(row_count)
+    )
+    payload = (
+        '{"metadata":{"appId":753,"itemCount":'
+        + str(row_count)
+        + '},"items":['
+        + rows
+        + "]}"
+    ).encode()
+    client = FakeHTTPClient(
+        [price_redirect()],
+        stream_response=FakeResponse(200, chunks=[payload]),
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
+    )
+
+    async def exercise() -> None:
+        pending = asyncio.create_task(steamapis._refresh_prices())
+        for _ in range(8):
+            await asyncio.sleep(0)
+        # Bounded cooperative segments keep the loop responsive: a fully
+        # buffered 20k-row feed is still mid-stream after eight rounds
+        # instead of monopolizing one step, so cancelling it lands inside a
+        # segment and aborts without installing a generation.
+        assert not pending.done()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    run(exercise())
+
+    surviving = SteamApisPriceCache(cache_path).read()
+    assert surviving.has_generation is False
+    assert surviving.retry_suppressed is False
+    assert surviving.failure_count == 0
+    assert steam_gateway._price_refresh_lock(steamapis.price_cache).locked() is False
+
+
 def test_price_cache_recovers_corrupt_database(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     cache_path.write_bytes(b"not a sqlite database")
@@ -1923,19 +2068,9 @@ def test_price_cache_recovers_corrupt_database(tmp_path: Path) -> None:
 
 
 def test_unrequested_price_numbers_are_bounded_during_full_feed_cache(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    converted: list[str | None] = []
-
-    original = steam_gateway._price_from_frame
-
-    def spy(
-        frame: steam_gateway._PriceFrame,
-    ) -> steam_gateway.InventoryPrice:
-        converted.append(frame.market_hash_name)
-        return original(frame)
-
-    monkeypatch.setattr(steam_gateway, "_price_from_frame", spy)
+    cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
         [
             FakeResponse(
@@ -1946,19 +2081,33 @@ def test_unrequested_price_numbers_are_bounded_during_full_feed_cache(
         stream_response=FakeResponse(
             200,
             chunks=[
-                b'{"metadata":{"appId":753,"itemCount":2},"items":[{"marketHashName":"Unrequested","orderBook":'
+                b'{"metadata":{"appId":753,"itemCount":2},"items":['
+                b'{"marketHashName":"440-Unrequested (Trading Card)","orderBook":'
                 b'{"highestBuy":1e999997},"updatedAt":1e999997},'
                 b'{"marketHashName":"Requested","orderBook":{"highestBuy":"0.10"}}]}',
             ],
         ),
     )
-    lookup = run(
-        SteamGateway(settings(), http_client=client).steamapis.fetch_prices(
-            frozenset({"Requested"})
-        )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=client,
     )
+
+    lookup = run(steamapis.fetch_prices(frozenset({"Requested"})))
+
     assert lookup.status == "complete"
-    assert converted == ["Unrequested", "Requested"]
+    assert set(lookup.prices) == {"Requested"}
+    assert lookup.prices["Requested"].highest_buy == "0.10"
+    cache = SteamApisPriceCache(cache_path)
+    cached = cache.read(("440-Unrequested (Trading Card)", "Requested"))
+    assert cached.has_generation is True
+    assert set(cached.prices) == {"Requested"}
+    unrequested = cache.read_catalog(app_ids=[440]).groups[440][0]
+    assert unrequested.market_hash_name == "440-Unrequested (Trading Card)"
+    assert unrequested.highest_buy is None
+    assert unrequested.lowest_sell is None
+    assert unrequested.observed_at is None
+    assert cached.prices["Requested"].highest_buy == "0.10"
 
 
 def test_inventory_rejects_oversized_cursor_before_next_request() -> None:
@@ -2191,7 +2340,6 @@ def test_inventory_single_flight_does_not_retain_completed_results() -> None:
     first_result, second_result, third_result = run(exercise())
     assert first_result == second_result == third_result
     assert calls == 2
-    assert client._inventory_inflight == {}
 
 
 def test_steamapis_stop_cancels_shielded_inventory_before_gem_warmer() -> None:
@@ -2241,8 +2389,6 @@ def test_steamapis_stop_cancels_shielded_inventory_before_gem_warmer() -> None:
 
         await client.stop()
         assert fetch_cancelled.is_set()
-        assert client._inventory_inflight == {}
-        assert gem_pricing._worker_task is None
 
         try:
             allow_resolution.set()
@@ -2266,7 +2412,7 @@ def test_bulk_stream_semaphore_limits_concurrent_streams(
     async def blocked_stream(
         _: object,
         __: frozenset[str],
-        on_price: Callable[[str, steam_gateway.InventoryPrice], None] | None = None,
+        on_price: steam_gateway._PriceRefreshSink | None = None,
     ) -> tuple[dict, set]:
         del on_price
         nonlocal calls
@@ -2468,14 +2614,58 @@ def test_price_cache_catalog_normalizes_card_metadata_and_is_bounded(
     assert card.market_hash_name == card_name
     assert card.normal_card_app_id == 440
     assert card.normal_card_name == "Test Card"
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_price_cache_reopens_legacy_index_shape_without_losing_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    read_only: bool,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    cache = SteamApisPriceCache(cache_path)
+    refresh = cache.begin_refresh()
+    refresh.add(
+        "440-Card (Trading Card)",
+        "0.10",
+        "0.20",
+        "2026-08-26T12:00:00Z",
+        1,
+        1,
+    )
+    refresh.commit(
+        now=datetime(2026, 8, 26, 12, tzinfo=UTC).timestamp(),
+        optimizer_complete=True,
+    )
     with sqlite3.connect(cache_path) as connection:
-        index_rows = connection.execute(
-            "PRAGMA index_info(steamapis_price_cache_generation_app_id_idx)"
-        ).fetchall()
-    assert [row[2] for row in index_rows] == [
-        "generation",
-        "normal_card_app_id",
-    ]
+        connection.execute("DROP INDEX steamapis_price_cache_generation_app_id_idx")
+        connection.execute(
+            """
+            CREATE INDEX steamapis_price_cache_generation_app_id_idx
+                ON steamapis_price_cache (generation, normal_card_app_id)
+            """
+        )
+        connection.commit()
+    connection.close()
+    if read_only:
+        connect = sqlite3.connect
+
+        def read_only_connect(database: Path, *, timeout: float) -> sqlite3.Connection:
+            return connect(f"{database.as_uri()}?mode=ro", timeout=timeout, uri=True)
+
+        monkeypatch.setattr(sqlite3, "connect", read_only_connect)
+
+    reopened = SteamApisPriceCache(cache_path)
+    reopened.initialize()
+    retained = reopened.read(("440-Card (Trading Card)",))
+    catalog = reopened.read_catalog()
+
+    assert retained.has_generation is True
+    assert retained.generation == 1
+    assert retained.prices["440-Card (Trading Card)"].lowest_sell == "0.20"
+    assert catalog.row_count == 1
+    assert catalog.groups[440][0].lowest_sell == "0.20"
 
 
 def test_price_cache_catalog_retains_normal_card_without_quotes(
@@ -2551,6 +2741,42 @@ def test_price_cache_catalog_filters_unrelated_app_ids(
     assert empty.groups == {}
     assert empty.row_count == 0
     assert empty.truncated is False
+
+
+def test_price_cache_catalog_truncation_reports_overflow_rows(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    cache = SteamApisPriceCache(cache_path)
+    refresh = cache.begin_refresh()
+    quote_time = "2026-08-26T12:00:00Z"
+    for name in (
+        "440-Alpha (Trading Card)",
+        "440-Beta (Trading Card)",
+        "999-Gamma (Trading Card)",
+    ):
+        refresh.add(name, "0.10", "0.20", quote_time, 1, 1)
+    refresh.commit(
+        now=datetime(2026, 8, 26, 12, tzinfo=UTC).timestamp(),
+        optimizer_complete=True,
+    )
+    steamapis = SteamApisClient(
+        settings(steamapis_price_cache_path=str(cache_path)),
+        http_client=FakeHTTPClient([]),
+        price_cache=cache,
+    )
+
+    catalog = steamapis.read_price_catalog(max_rows=2)
+
+    assert catalog.generation == 1
+    assert catalog.optimizer_complete is True
+    assert catalog.row_count == 2
+    assert catalog.truncated is True
+    assert set(catalog.groups) == {440}
+    assert [card.market_hash_name for card in catalog.groups[440]] == [
+        "440-Alpha (Trading Card)",
+        "440-Beta (Trading Card)",
+    ]
 
 
 def _badge_payload(
@@ -3573,10 +3799,6 @@ def test_level_up_reports_catalog_refresh_state_without_awaiting_it(
         def __init__(self) -> None:
             self.scheduled_ages: list[int] = []
 
-        async def ensure_price_catalog_fresh(self, *, max_age_seconds: int) -> bool:
-            del max_age_seconds
-            raise AssertionError
-
         def schedule_price_catalog_refresh(self, *, max_age_seconds: int) -> str:
             self.scheduled_ages.append(max_age_seconds)
             return refresh_state
@@ -3641,7 +3863,7 @@ def test_duplicate_feed_hash_aborts_generation_without_cross_row_merge(
         None,
     )
     original.commit(now=time.time())
-    before = cache.read()
+    before = cache.read(["440-Card (Trading Card)"])
 
     replacement = cache.begin_refresh()
     replacement.add(
@@ -3663,6 +3885,34 @@ def test_duplicate_feed_hash_aborts_generation_without_cross_row_merge(
         )
     replacement.abort()
 
-    after = cache.read()
+    after = cache.read(["440-Card (Trading Card)"])
     assert after.generation == before.generation
     assert after.prices == before.prices
+
+
+def test_price_cache_keeps_committed_catalog_readable_during_large_refresh(
+    tmp_path: Path,
+) -> None:
+    cache = SteamApisPriceCache(tmp_path / "prices.sqlite3")
+    name = "440-Card (Trading Card)"
+    original = cache.begin_refresh()
+    original.add(name, "0.10", "0.20", None)
+    original.commit(optimizer_complete=True)
+    before = cache.read_catalog(app_ids=[440])
+
+    replacement = cache.begin_refresh()
+    try:
+        replacement.add(name, "0.11", "0.21", None)
+        # Exceed SQLite's default page cache while the streamed transaction is open.
+        for index in range(50_000):
+            replacement.add(f"Unrelated item {index}", "0.10", "0.20", None)
+        during = cache.read_catalog(app_ids=[440])
+        assert during.groups == before.groups
+        assert during.generation == before.generation
+        replacement.commit(optimizer_complete=True)
+    finally:
+        replacement.abort()
+
+    after = cache.read_catalog(app_ids=[440])
+    assert after.generation == before.generation + 1
+    assert after.groups[440][0].lowest_sell == "0.21"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
@@ -204,32 +205,27 @@ def test_provider_requests_one_normal_card_count_with_public_market_parameters(
     result = run(provider.lookup("123"))
 
     assert result == BoosterLookup(card_set_size=7)
-    assert client.get_calls == [
-        {
-            "url": STEAM_MARKET_SEARCH_RENDER_ENDPOINT,
-            "params": {
-                "query": "",
-                "start": "0",
-                "count": "1",
-                "appid": "753",
-                "category_753_Game[]": "tag_app_123",
-                "category_753_item_class[]": "tag_item_class_2",
-                "category_753_cardborder[]": "tag_cardborder_0",
-                "norender": "1",
-            },
-            "headers": {
-                "Accept": "application/json",
-                "Cookie": "bMarketOptOut=1",
-                "Referer": "https://steamcommunity.com/market/",
-                "User-Agent": (
-                    "SteamOptimizer/0.1.1 (+https://github.com/"
-                    "TheRockPusher/Steam_Optimizer)"
-                ),
-            },
-            "follow_redirects": False,
-            "timeout": None,
-        }
-    ]
+    assert len(client.get_calls) == 1
+    call = client.get_calls[0]
+    assert call["url"] == STEAM_MARKET_SEARCH_RENDER_ENDPOINT
+    assert call["params"] == {
+        "query": "",
+        "start": "0",
+        "count": "1",
+        "appid": "753",
+        "category_753_Game[]": "tag_app_123",
+        "category_753_item_class[]": "tag_item_class_2",
+        "category_753_cardborder[]": "tag_cardborder_0",
+        "norender": "1",
+    }
+    assert call["headers"] == {
+        "Accept": "application/json",
+        "Cookie": "bMarketOptOut=1",
+        "Referer": "https://steamcommunity.com/market/",
+        "User-Agent": (
+            "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+        ),
+    }
 
 
 def test_provider_rejects_invalid_app_id_without_making_a_market_request() -> None:
@@ -390,6 +386,68 @@ def test_cache_persists_positive_and_negative_entries_without_cross_status_overw
     assert preserved is not None
     assert preserved.status == "positive"
     assert preserved.card_set_size == 7
+
+
+def test_cache_get_many_matches_individual_gets_beyond_sql_variable_bound(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "boosters.sqlite3"
+    cache = BoosterPriceCache(cache_path)
+    cache.put_positive("2000", 7, game_name="Example Game")
+    filler_ids = [str(app_id) for app_id in range(1, 1001)]
+    rows = [
+        (
+            game_app_id,
+            "positive" if index % 2 == 0 else "negative",
+            5 + index % 11 if index % 2 == 0 else None,
+            None,
+            1000.0,
+            2000.0,
+        )
+        for index, game_app_id in enumerate(filler_ids)
+    ]
+    malformed_positive_id = "888888"
+    malformed_negative_id = "888889"
+    rows.extend(
+        [
+            # Positive row missing the required card_set_size.
+            (malformed_positive_id, "positive", None, None, 1000.0, 2000.0),
+            # Negative row carrying a forbidden card_set_size.
+            (malformed_negative_id, "negative", 7, None, 1000.0, 2000.0),
+        ]
+    )
+    with sqlite3.connect(cache_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO booster_card_count_cache (
+                game_app_id, status, card_set_size, game_name,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    missing_ids = ["999999", "1000000"]
+    requested = [
+        "2000",
+        *filler_ids,
+        *missing_ids,
+        malformed_positive_id,
+        malformed_negative_id,
+        "2000",
+    ]
+
+    results = cache.get_many(requested)
+
+    expected = {
+        game_app_id: entry
+        for game_app_id in dict.fromkeys(requested)
+        if (entry := cache.get(game_app_id)) is not None
+    }
+    assert results == expected
+    assert results["2000"].game_name == "Example Game"
+    for game_app_id in [*missing_ids, malformed_positive_id, malformed_negative_id]:
+        assert game_app_id not in results
 
 
 def test_service_suppresses_fresh_negative_cache_and_requeues_expired_entry(
@@ -653,6 +711,27 @@ def test_positive_booster_cache_persists_validated_game_name() -> None:
         gem_cost=857,
         game_name="Example Game",
     )
+
+
+def test_cache_reput_without_game_name_preserves_prior_name() -> None:
+    cache = BoosterPriceCache(":memory:")
+
+    cache.put_positive("123", 7, game_name="Example Game")
+    cache.put_positive("123", 7, game_name=None)
+
+    entry = cache.get("123")
+    assert entry is not None
+    assert entry.game_name == "Example Game"
+    assert entry.resolution() == BoosterResolution(
+        card_set_size=7,
+        gem_cost=857,
+        game_name="Example Game",
+    )
+
+    cache.put_positive("123", 7, game_name="Renamed Game")
+    renamed = cache.get("123")
+    assert renamed is not None
+    assert renamed.game_name == "Renamed Game"
 
 
 def test_cached_count_only_resolution_can_be_marked_pending_for_optimizer() -> None:

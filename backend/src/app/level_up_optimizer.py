@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite, isqrt
@@ -510,6 +510,57 @@ class _SideQuote:
     timestamp: datetime
 
 
+@dataclass(slots=True)
+class _QuoteMemo:
+    """Per-request quote context with input-bounded memoization.
+
+    One instance serves a single :func:`optimize_level_up` call: the clock,
+    fee contract, and quote window are request constants, while the three
+    dictionaries remember results for price strings, quote timestamps, and
+    source fee inversions that repeat across the catalog's cards.  Nothing
+    survives the request.
+    """
+
+    contract: MarketFeeContract
+    now: datetime
+    quote_window: timedelta
+    prices: dict[str, int | None] = field(default_factory=dict)
+    timestamps: dict[datetime, datetime | None] = field(default_factory=dict)
+    receipts: dict[int, tuple[int, int, int] | None] = field(default_factory=dict)
+
+    def minor_units(self, price: str) -> int | None:
+        """Return the exact minor-unit amount for a price, or ``None``."""
+        if price in self.prices:
+            return self.prices[price]
+        try:
+            price_minor = _money_to_minor(price, self.contract)
+        except OptimizerInputError:
+            self.prices[price] = None
+            return None
+        self.prices[price] = price_minor
+        return price_minor
+
+    def coerced_timestamp(self, value: datetime) -> datetime | None:
+        """Return the UTC-coerced quote timestamp, or ``None`` when invalid."""
+        if value in self.timestamps:
+            return self.timestamps[value]
+        try:
+            timestamp = _coerce_utc(value, "quote timestamp")
+        except OptimizerInputError:
+            self.timestamps[value] = None
+            return None
+        self.timestamps[value] = timestamp
+        return timestamp
+
+    def source_fees(self, price_minor: int) -> tuple[int, int, int] | None:
+        """Return the exact fee components for one buyer total, or ``None``."""
+        if price_minor in self.receipts:
+            return self.receipts[price_minor]
+        fees = _source_fee_breakdown(price_minor, self.contract)
+        self.receipts[price_minor] = fees
+        return fees
+
+
 @dataclass(frozen=True, slots=True)
 class _SourceCandidate:
     source: SourcePlan
@@ -651,16 +702,15 @@ def optimize_level_up(
     current = _coerce_utc(now, "now")
     inventory_time = _coerce_utc(inventory_refreshed_at, "inventory_refreshed_at")
     contract_value = fee_contract
-    quote_window = contract_value.max_quote_age_seconds
-    inventory_window = contract_value.max_inventory_age_seconds
-    if current < inventory_time or current - inventory_time > timedelta(
-        seconds=inventory_window
-    ):
+    quote_window_delta = timedelta(seconds=contract_value.max_quote_age_seconds)
+    inventory_window_delta = timedelta(seconds=contract_value.max_inventory_age_seconds)
+    if current < inventory_time or current - inventory_time > inventory_window_delta:
         raise OptimizerInputError(
             "inventory_snapshot_too_old", "inventory snapshot is stale or in the future"
         )
-    if current < catalog.generated_at or current - catalog.generated_at > timedelta(
-        seconds=quote_window
+    if (
+        current < catalog.generated_at
+        or current - catalog.generated_at > quote_window_delta
     ):
         reason = (
             "price_generation_stale"
@@ -686,17 +736,18 @@ def optimize_level_up(
             "inventory contains a normal card outside the resolved catalog",
         )
 
-    destination_quotes = _destination_sell_quotes(
-        sets, current, quote_window, contract_value
+    memo = _QuoteMemo(
+        contract=contract_value,
+        now=current,
+        quote_window=quote_window_delta,
     )
+    destination_quotes = _destination_sell_quotes(sets, badges, memo)
     destination_options = _destination_options(
         sets,
         holdings_by_hash,
         badges,
-        current,
-        quote_window,
-        contract_value,
         destination_quotes,
+        memo,
     )
     destination_keys = tuple(
         _destination_sort_key(value, current) for value in destination_options
@@ -713,13 +764,7 @@ def optimize_level_up(
             continue
         source_set, source_card = cards_by_hash[source_hash]
         source_level = badges.level_for_game(source_set.app_id)
-        source_rows = _source_rows(
-            source_card,
-            holdings_by_hash,
-            current,
-            quote_window,
-            contract_value,
-        )
+        source_rows = _source_rows(source_card, holdings_by_hash, memo)
         if source_rows is None:
             continue
         saw_source = True
@@ -742,9 +787,6 @@ def optimize_level_up(
                 source_set,
                 holdings_by_hash,
                 badges,
-                current,
-                quote_window,
-                contract_value,
                 destination_quotes,
                 sold_hash=source_hash,
             )
@@ -849,14 +891,11 @@ def optimize_level_up(
     )
     player = _player_projection(badges, best.totals.funded_craft_xp)
     valid_until = min(
-        inventory_time + timedelta(seconds=inventory_window),
-        catalog.generated_at + timedelta(seconds=quote_window),
+        inventory_time + inventory_window_delta,
+        catalog.generated_at + quote_window_delta,
+        *(row.quote_timestamp + quote_window_delta for row in best.source.rows),
         *(
-            row.quote_timestamp + timedelta(seconds=quote_window)
-            for row in best.source.rows
-        ),
-        *(
-            row.quote_timestamp + timedelta(seconds=quote_window)
+            row.quote_timestamp + quote_window_delta
             for destination in best.destinations
             for row in destination.rows
         ),
@@ -905,17 +944,15 @@ def _craftable_count(
 def _source_rows(
     source_card: CatalogCard,
     holdings: Mapping[str, Holding],
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
+    memo: _QuoteMemo,
 ) -> tuple[SellRow, ...] | None:
     holding = holdings.get(source_card.market_hash_name)
     if holding is None or holding.owned_quantity < 1 or holding.sellable_quantity < 1:
         return None
-    quote = _side_quote(source_card, "buy", now, quote_window, contract)
+    quote = _side_quote(source_card, "buy", memo)
     if quote is None:
         return None
-    fees = _source_fee_breakdown(quote.price_minor, contract)
+    fees = memo.source_fees(quote.price_minor)
     if fees is None:
         return None
     return (
@@ -959,25 +996,29 @@ def _build_source_plan(
 
 def _destination_sell_quotes(
     sets: Sequence[CatalogSet],
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
+    badges: BadgeState,
+    memo: _QuoteMemo,
 ) -> dict[str, _SideQuote | None]:
-    return {
-        card.market_hash_name: _side_quote(card, "sell", now, quote_window, contract)
-        for current_set in sets
-        for card in current_set.cards
-    }
+    """Collect sell quotes for every set that can still be a destination.
+
+    A badge-maxed set returns ``None`` from ``_destination_plan`` before any
+    quote lookup, so its ask work is skipped entirely.
+    """
+
+    quotes: dict[str, _SideQuote | None] = {}
+    for current_set in sets:
+        if badges.level_for_game(current_set.app_id) >= 5:
+            continue
+        for card in current_set.cards:
+            quotes[card.market_hash_name] = _side_quote(card, "sell", memo)
+    return quotes
 
 
 def _destination_plan(
     destination_set: CatalogSet,
     holdings: Mapping[str, Holding],
     badges: BadgeState,
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
-    sell_quotes: Mapping[str, _SideQuote | None] | None = None,
+    sell_quotes: Mapping[str, _SideQuote | None],
     *,
     sold_hash: str | None = None,
 ) -> DestinationPlan | None:
@@ -994,11 +1035,7 @@ def _destination_plan(
         if owned_quantity >= 1:
             owned_card_count += 1
             continue
-        quote = (
-            sell_quotes.get(card.market_hash_name)
-            if sell_quotes is not None
-            else _side_quote(card, "sell", now, quote_window, contract)
-        )
+        quote = sell_quotes.get(card.market_hash_name)
         if quote is None or quote.quantity < 1:
             return None
         rows.append(
@@ -1053,11 +1090,10 @@ def _destination_options(
     sets: Sequence[CatalogSet],
     holdings: Mapping[str, Holding],
     badges: BadgeState,
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
-    sell_quotes: Mapping[str, _SideQuote | None] | None = None,
+    sell_quotes: Mapping[str, _SideQuote | None],
+    memo: _QuoteMemo,
 ) -> tuple[DestinationPlan, ...]:
+    now = memo.now
     options = [
         destination
         for destination_set in sets
@@ -1066,9 +1102,6 @@ def _destination_options(
                 destination_set,
                 holdings,
                 badges,
-                now,
-                quote_window,
-                contract,
                 sell_quotes,
             )
         )
@@ -1133,9 +1166,7 @@ def _select_destinations(
 def _side_quote(
     card: CatalogCard,
     side: Literal["buy", "sell"],
-    now: datetime,
-    quote_window: int,
-    contract: MarketFeeContract,
+    memo: _QuoteMemo,
 ) -> _SideQuote | None:
     if side == "buy":
         price = card.highest_buy
@@ -1154,17 +1185,14 @@ def _side_quote(
         return None
     if quantity < 1 or quantity > MAX_QUOTE_QUANTITY or timestamp_value is None:
         return None
-    try:
-        timestamp = _coerce_utc(timestamp_value, "quote timestamp")
-    except OptimizerInputError:
+    timestamp = memo.coerced_timestamp(timestamp_value)
+    if timestamp is None:
         return None
-    if timestamp > now or now - timestamp > timedelta(seconds=quote_window):
+    now = memo.now
+    if timestamp > now or now - timestamp > memo.quote_window:
         return None
-    try:
-        price_minor = _money_to_minor(price, contract)
-    except OptimizerInputError:
-        return None
-    if price_minor < 0:
+    price_minor = memo.minor_units(price)
+    if price_minor is None or price_minor < 0:
         return None
     return _SideQuote(price_minor=price_minor, quantity=quantity, timestamp=timestamp)
 
@@ -1177,7 +1205,7 @@ def _source_fee_breakdown(
         if receipt is None or receipt < 0:
             return None
         breakdown = _calculate_item_fees(receipt, contract)
-    except (TypeError, ValueError, ArithmeticError):
+    except TypeError, ValueError, ArithmeticError:
         return None
     if (
         breakdown is None

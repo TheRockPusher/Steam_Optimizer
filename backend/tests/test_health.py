@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     import pytest
 
@@ -14,7 +15,7 @@ from app import main as main_module
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import GemKey, GemScanResult
 from app.level_up_optimizer import LevelUpOptimizationResponse
-from app.main import app, create_app
+from app.main import create_app
 from app.settings import Settings
 from app.steam_gateway import BadgeCheck, InventoryCheck, ProfileCheck
 
@@ -91,9 +92,16 @@ class LifecycleHttpClient:
         self.events.append("client-close")
 
 
-def test_health_endpoint_returns_ok() -> None:
-    with TestClient(app) as client:
+def test_health_endpoint_returns_ok(tmp_path: Path) -> None:
+    settings = Settings(
+        environment="development",
+        gem_price_cache_path=str(tmp_path / "gem_prices.sqlite3"),
+        steamapis_price_cache_path=str(tmp_path / "steamapis_prices.sqlite3"),
+    )
+
+    with TestClient(create_app(settings)) as client:
         response = client.get("/api/health")
+
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 

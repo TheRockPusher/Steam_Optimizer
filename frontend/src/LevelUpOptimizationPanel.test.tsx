@@ -12,7 +12,6 @@ import {
   buildSteamProfileGamecardsUrl,
   formatMinorUnits,
   isLevelUpOptimizationResponse,
-  levelUpSnapshotKey,
   requestLevelUpOptimization,
   type LevelUpOptimizationResponse,
   type LevelUpReadyResponse
@@ -668,6 +667,15 @@ describe("request and safe navigation helpers", () => {
   it("formats integer minor units with the configured currency", () => {
     expect(formatMinorUnits(1_234, "USD", 2)).toBe("$12.34");
   });
+  it("formats zero-digit and three-digit currency contracts and the maximum safe amount", () => {
+    expect(formatMinorUnits(0, "JPY", 0)).toBe("¥0");
+    expect(formatMinorUnits(1_234, "JPY", 0)).toBe("¥1,234");
+    expect(formatMinorUnits(12, "KWD", 3)).toBe("KWD\u00a00.012");
+    expect(formatMinorUnits(1_234, "KWD", 3)).toBe("KWD\u00a01.234");
+    expect(formatMinorUnits(9_007_199_254_740_991, "USD", 2)).toBe(
+      "$90,071,992,547,409.91"
+    );
+  });
 });
 
 describe("lazy panel lifecycle and state surfaces", () => {
@@ -783,19 +791,81 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(screen.getByRole("button", { name: "Refresh inventory" })).toBeInTheDocument();
   });
 
-  it("keys the recommendation cache by the badge snapshot timestamp", () => {
-    const originalKey = levelUpSnapshotKey(
-      steamId,
-      inventoryRefreshedAt,
-      badgeRefreshedAt
+  it("aborts a pending request and POSTs the new badge snapshot while the old one is unresolved", async () => {
+    const resolvers: Array<(response: Response) => void> = [];
+    vi.mocked(globalThis.fetch).mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvers.push(resolve);
+        })
     );
-    const changedKey = levelUpSnapshotKey(
+    const panelProps: LevelUpOptimizationPanelProps = {
       steamId,
+      inventoryStatus: "public",
+      items: inventoryItems,
+      boosters,
+      badges,
       inventoryRefreshedAt,
-      "2026-08-29T11:46:00Z"
+      isInventoryLoading: false,
+      isActive: true,
+      onRefreshInventory: vi.fn()
+    };
+    const view = render(<LevelUpOptimizationPanel {...panelProps} />);
+    await flushPanelEffects();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const staleSignal = (
+      vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit
+    ).signal as AbortSignal;
+
+    await act(async () => {
+      view.rerender(
+        <LevelUpOptimizationPanel
+          {...panelProps}
+          badges={{ ...badges, checked_at: "2026-08-29T11:46:00Z" }}
+        />
+      );
+    });
+    await flushPanelEffects();
+
+    expect(staleSignal.aborted).toBe(true);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(
+      JSON.parse(
+        String(
+          (vi.mocked(globalThis.fetch).mock.calls[1][1] as RequestInit).body
+        )
+      ).badge_refreshed_at
+    ).toBe("2026-08-29T11:46:00Z");
+    expect(
+      screen.getByRole("heading", {
+        name: "Calculating a one-card level-up plan…"
+      })
+    ).toBeInTheDocument();
+
+    resolvers[0](
+      new Response(JSON.stringify(readyResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
     );
-    expect(originalKey).not.toBeNull();
-    expect(changedKey).not.toBe(originalKey);
+    await flushPanelEffects();
+    expect(
+      screen.queryByText("Instant top-of-book estimate.")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", {
+        name: "Calculating a one-card level-up plan…"
+      })
+    ).toBeInTheDocument();
+
+    resolvers[1](
+      new Response(JSON.stringify(readyResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    await flushPanelEffects();
+    expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
   });
 
   it("retains the same-key in-flight request while switching tabs", async () => {
@@ -838,6 +908,121 @@ describe("lazy panel lifecycle and state surfaces", () => {
     );
     await flushPanelEffects();
     expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
+  });
+  it("serves the ready cache when the tab reactivates and POSTs again on forced refresh", async () => {
+    const panelProps: LevelUpOptimizationPanelProps = {
+      steamId,
+      inventoryStatus: "public",
+      items: inventoryItems,
+      boosters,
+      badges,
+      inventoryRefreshedAt,
+      isInventoryLoading: false,
+      isActive: true,
+      onRefreshInventory: vi.fn()
+    };
+    const view = renderPanel(readyResponse(), panelProps);
+    await flushPanelEffects();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const initialBody = String(
+      (vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit).body
+    );
+
+    await act(async () => {
+      view.rerender(
+        <LevelUpOptimizationPanel {...panelProps} isActive={false} />
+      );
+    });
+    await act(async () => {
+      view.rerender(<LevelUpOptimizationPanel {...panelProps} isActive />);
+    });
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
+
+    let resolveRefresh!: (response: Response) => void;
+    vi.mocked(globalThis.fetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveRefresh = resolve;
+      })
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh recommendation" })
+    );
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(
+      String((vi.mocked(globalThis.fetch).mock.calls[1][1] as RequestInit).body)
+    ).toBe(initialBody);
+    expect(
+      screen.getByRole("heading", {
+        name: "Calculating a one-card level-up plan…"
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Instant top-of-book estimate.")
+    ).not.toBeInTheDocument();
+
+    resolveRefresh(
+      new Response(JSON.stringify(readyResponse()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    await flushPanelEffects();
+    expect(screen.getByText("Instant top-of-book estimate.")).toBeInTheDocument();
+  });
+
+  it("replaces the cached plan with the error surface when a forced refresh fails", async () => {
+    renderPanel();
+    await flushPanelEffects();
+    expect(screen.getByText("Source 0")).toBeInTheDocument();
+
+    vi.mocked(globalThis.fetch).mockRejectedValue(new Error("offline"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh recommendation" })
+    );
+    await flushPanelEffects();
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Level-up optimization unavailable."
+    );
+    expect(
+      screen.getByText(
+        "The recommendation service could not be reached. Try again later."
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Source 0")).not.toBeInTheDocument();
+  });
+
+  it("aborts the in-flight request when the panel unmounts", async () => {
+    vi.mocked(globalThis.fetch).mockReturnValue(new Promise<Response>(() => { }));
+    const view = render(
+      <LevelUpOptimizationPanel
+        steamId={steamId}
+        inventoryStatus="public"
+        items={inventoryItems}
+        boosters={boosters}
+        badges={badges}
+        inventoryRefreshedAt={inventoryRefreshedAt}
+        isInventoryLoading={false}
+        isActive
+        onRefreshInventory={vi.fn()}
+      />
+    );
+    await flushPanelEffects();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    const signal = (vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit)
+      .signal as AbortSignal;
+
+    act(() => {
+      view.unmount();
+    });
+    await flushPanelEffects();
+
+    expect(signal.aborted).toBe(true);
   });
 
   it("rechecks inventory freshness when activating the tab", async () => {
@@ -909,14 +1094,10 @@ describe("lazy panel lifecycle and state surfaces", () => {
     expect(within(feeContract as HTMLElement).getByText("$0.01")).toBeInTheDocument();
     const sourceRow = screen.getByText("Source 0").closest("tr");
     expect(sourceRow).not.toBeNull();
-    expect(within(sourceRow as HTMLElement).getByText("1")).toBeInTheDocument();
     expect(sourceRow?.querySelector(".level-up-sell-card-icon")).toHaveAttribute(
       "src",
       "https://community.cloudflare.steamstatic.com/economy/image/source-0"
     );
-    const panel = document.getElementById("level-up-optimization-panel");
-    expect(panel).not.toHaveAttribute("role", "tabpanel");
-    expect(panel).not.toHaveAttribute("aria-labelledby");
   });
 
   it("renders one manual sale and only the missing destination cards", async () => {

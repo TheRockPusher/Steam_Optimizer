@@ -1,5 +1,9 @@
 import {
+  Component,
+  lazy,
+  memo,
   type ReactNode,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -7,9 +11,6 @@ import {
   useState
 } from "react";
 import steamSignInWide from "./assets/steam/sits_01.png";
-import {
-  LevelUpOptimizationPanel
-} from "./LevelUpOptimizationPanel";
 import {
   isLevelUpIsoTimestamp,
   levelForXp,
@@ -24,6 +25,10 @@ import {
   writeInventoryCache
 } from "./inventoryCache";
 import "./App.css";
+
+const LevelUpOptimizationPanel = lazy(() =>
+  import("./LevelUpOptimizationPanel")
+);
 
 type VisibilityStatus = "public" | "private" | "unavailable";
 
@@ -1207,9 +1212,9 @@ async function requestGemRefreshBatch(
 }
 
 async function requestGemRefresh(
-  inventory: InventoryCheck
+  inventory: InventoryCheck,
+  groups: GemRefreshGroup[]
 ): Promise<GemRefreshResponse> {
-  const groups = gemRefreshGroups(inventory.items);
   const boosterGameAppIds = boosterRefreshGameAppIds(inventory.boosters);
   const values: GemRefreshValue[] = [];
   const boosters: BoosterRefreshValue[] = [];
@@ -1619,8 +1624,7 @@ function compareDecimalStrings(left: string, right: string): number {
 
 function isWorthMoreAsGems(
   item: InventoryItem,
-  gemCashContext: GemCashContext | null,
-  gemCashBasis: GemCashBasis
+  gemCashValue: string | null
 ): boolean {
   if (
     item.gem_key === null ||
@@ -1630,30 +1634,64 @@ function isWorthMoreAsGems(
   ) {
     return false;
   }
-  const gemCashValue = gemCashValueForItem(
-    item,
-    gemCashContext,
-    gemCashBasis
-  );
   return (
     gemCashValue !== null &&
     compareDecimalStrings(gemCashValue, item.price.lowest_sell) > 0
   );
 }
 
-function comparePriceTimestamps(left: string, right: string): number {
-  const leftTimestamp = Date.parse(left);
-  const rightTimestamp = Date.parse(right);
-  const leftIsValid = !Number.isNaN(leftTimestamp);
-  const rightIsValid = !Number.isNaN(rightTimestamp);
+type InventoryObservedTimestampKey = {
+  milliseconds: number | null;
+  raw: string;
+};
 
-  if (leftIsValid && rightIsValid) {
-    return leftTimestamp - rightTimestamp;
+type InventorySortIndex = {
+  gemCashValues: ReadonlyMap<InventoryItem, string | null>;
+  observedTimestamps: ReadonlyMap<InventoryItem, InventoryObservedTimestampKey>;
+};
+
+function compareObservedTimestampKeys(
+  left: InventoryObservedTimestampKey,
+  right: InventoryObservedTimestampKey
+): number {
+  if (left.milliseconds !== null && right.milliseconds !== null) {
+    return left.milliseconds - right.milliseconds;
   }
-  if (leftIsValid !== rightIsValid) {
-    return leftIsValid ? -1 : 1;
+  if (left.milliseconds !== null) {
+    return -1;
   }
-  return left.localeCompare(right);
+  if (right.milliseconds !== null) {
+    return 1;
+  }
+  return left.raw.localeCompare(right.raw);
+}
+
+function buildInventorySortIndex(
+  items: readonly InventoryItem[],
+  gemCashContext: GemCashContext | null,
+  gemCashBasis: GemCashBasis
+): InventorySortIndex {
+  const gemCashValues = new Map<InventoryItem, string | null>();
+  const observedTimestamps = new Map<
+    InventoryItem,
+    InventoryObservedTimestampKey
+  >();
+  for (const item of items) {
+    gemCashValues.set(
+      item,
+      gemCashValueForItem(item, gemCashContext, gemCashBasis)
+    );
+    const observedAt = item.price?.observed_at ?? null;
+    if (observedAt !== null) {
+      const parsedMilliseconds = Date.parse(observedAt);
+      observedTimestamps.set(item, {
+        milliseconds:
+          Number.isNaN(parsedMilliseconds) ? null : parsedMilliseconds,
+        raw: observedAt
+      });
+    }
+  }
+  return { gemCashValues, observedTimestamps };
 }
 
 function compareNullableValues<T>(
@@ -1677,8 +1715,7 @@ function compareInventoryItems(
   left: InventoryItem,
   right: InventoryItem,
   sort: InventorySort,
-  gemCashContext: GemCashContext | null,
-  gemCashBasis: GemCashBasis
+  sortIndex: InventorySortIndex
 ): number {
   switch (sort.field) {
     case "name":
@@ -1718,10 +1755,10 @@ function compareInventoryItems(
       );
     case "observed_at":
       return compareNullableValues(
-        left.price?.observed_at ?? null,
-        right.price?.observed_at ?? null,
+        sortIndex.observedTimestamps.get(left) ?? null,
+        sortIndex.observedTimestamps.get(right) ?? null,
         sort.direction,
-        comparePriceTimestamps
+        compareObservedTimestampKeys
       );
     case "gem_yield":
       return compareNullableValues(
@@ -1732,15 +1769,15 @@ function compareInventoryItems(
       );
     case "gem_cash_value":
       return compareNullableValues(
-        gemCashValueForItem(left, gemCashContext, gemCashBasis),
-        gemCashValueForItem(right, gemCashContext, gemCashBasis),
+        sortIndex.gemCashValues.get(left) ?? null,
+        sortIndex.gemCashValues.get(right) ?? null,
         sort.direction,
         compareDecimalStrings
       );
   }
 }
 
-function InventoryColumnHeader({
+const InventoryColumnHeader = memo(function InventoryColumnHeader({
   field,
   label,
   sort,
@@ -1778,8 +1815,9 @@ function InventoryColumnHeader({
       </button>
     </th>
   );
-}
-function InventoryItemRow({
+});
+
+const InventoryItemRow = memo(function InventoryItemRow({
   item,
   gemCashValue
 }: {
@@ -1894,7 +1932,7 @@ function InventoryItemRow({
       </td>
     </tr>
   );
-}
+});
 
 type InventoryGroupKind = "game" | "fallback" | "other";
 
@@ -1909,8 +1947,7 @@ type InventoryGroup = {
 function groupInventoryItems(
   items: InventoryItem[],
   sort: InventorySort | null,
-  gemCashContext: GemCashContext | null,
-  gemCashBasis: GemCashBasis
+  sortIndex: InventorySortIndex
 ): InventoryGroup[] {
   const groupsByKey = new Map<string, InventoryGroup>();
 
@@ -1996,18 +2033,12 @@ function groupInventoryItems(
       sort === null
         ? group.items
         : [...group.items].sort((left, right) =>
-          compareInventoryItems(
-            left,
-            right,
-            sort,
-            gemCashContext,
-            gemCashBasis
-          )
+          compareInventoryItems(left, right, sort, sortIndex)
         )
   }));
 }
 
-function InventoryBrowser({
+const InventoryBrowser = memo(function InventoryBrowser({
   items,
   gemCashContext,
   gemCashBasis
@@ -2030,12 +2061,19 @@ function InventoryBrowser({
   const allItemsPanelRef = useRef<HTMLDivElement>(null);
   const worthMoreAsGemsPanelRef = useRef<HTMLDivElement>(null);
   const focusWasWithinActivePanel = useRef(false);
+  const sortIndex = useMemo(
+    () => buildInventorySortIndex(items, gemCashContext, gemCashBasis),
+    [gemCashBasis, gemCashContext, items]
+  );
   const worthMoreAsGemsItems = useMemo(
     () =>
       items.filter((item) =>
-        isWorthMoreAsGems(item, gemCashContext, gemCashBasis)
+        isWorthMoreAsGems(
+          item,
+          sortIndex.gemCashValues.get(item) ?? null
+        )
       ),
-    [gemCashBasis, gemCashContext, items]
+    [items, sortIndex]
   );
   const activeItems =
     activeView === "all" ? items : worthMoreAsGemsItems;
@@ -2051,12 +2089,7 @@ function InventoryBrowser({
   const groupedItems = useMemo(
     () =>
       groupByGame
-        ? groupInventoryItems(
-          activeItems,
-          sort,
-          gemCashContext,
-          gemCashBasis
-        )
+        ? groupInventoryItems(activeItems, sort, sortIndex)
         : [
           {
             key: "all",
@@ -2067,17 +2100,11 @@ function InventoryBrowser({
               sort === null
                 ? activeItems
                 : [...activeItems].sort((left, right) =>
-                  compareInventoryItems(
-                    left,
-                    right,
-                    sort,
-                    gemCashContext,
-                    gemCashBasis
-                  )
+                  compareInventoryItems(left, right, sort, sortIndex)
                 )
           }
         ],
-    [activeItems, gemCashBasis, gemCashContext, groupByGame, sort]
+    [activeItems, groupByGame, sort, sortIndex]
   );
   const pageCount = Math.max(
     1,
@@ -2136,7 +2163,7 @@ function InventoryBrowser({
     return pageGroups;
   }, [firstItemIndex, groupedItems]);
 
-  function handleSort(field: InventorySortField) {
+  const handleSort = useCallback((field: InventorySortField) => {
     setSort((currentSort) => ({
       field,
       direction:
@@ -2145,7 +2172,7 @@ function InventoryBrowser({
           : "ascending"
     }));
     setRequestedPageIndex(0);
-  }
+  }, []);
 
   function renderInventoryLedger() {
     if (activeItems.length === 0) {
@@ -2264,11 +2291,9 @@ function InventoryBrowser({
                   <InventoryItemRow
                     key={`${item.class_id}:${item.instance_id}`}
                     item={item}
-                    gemCashValue={gemCashValueForItem(
-                      item,
-                      gemCashContext,
-                      gemCashBasis
-                    )}
+                    gemCashValue={
+                      sortIndex.gemCashValues.get(item) ?? null
+                    }
                   />
                 ))}
               </tbody>
@@ -2439,9 +2464,13 @@ function InventoryBrowser({
 
     </section>
   );
-}
+});
 
-function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
+const BoosterResults = memo(function BoosterResults({
+  boosters
+}: {
+  boosters: BoosterInfo[];
+}) {
   return (
     <section
       className="booster-coverage"
@@ -2538,9 +2567,9 @@ function BoosterResults({ boosters }: { boosters: BoosterInfo[] }) {
       </div>
     </section>
   );
-}
+});
 
-function InventoryPricingSummary({
+const InventoryPricingSummary = memo(function InventoryPricingSummary({
   inventory,
   gemCashBasis,
   isRefreshingGems,
@@ -2566,7 +2595,10 @@ function InventoryPricingSummary({
   )}/${INVENTORY_COUNT_FORMATTER.format(
     inventory.gem_priceable_item_count
   )}`;
-  const priceTotals = inventoryPriceTotals(inventory.items);
+  const priceTotals = useMemo(
+    () => inventoryPriceTotals(inventory.items),
+    [inventory.items]
+  );
   const highestBuyTotal =
     priceTotals.highestBuy === null
       ? priceTotals.priceableItemTypes === 0 && inventory.status === "public"
@@ -2675,7 +2707,7 @@ function InventoryPricingSummary({
       </button>
     </div>
   );
-}
+});
 
 function inventoryPriceCoverageMessage(inventory: InventoryCheck): string {
   return inventory.priceable_item_count === 0
@@ -2863,7 +2895,51 @@ function LevelUpCalculator({ badges }: { badges: BadgeCheck }) {
   );
 }
 
-function InventoryResults({
+function LevelUpOptimizationShell({
+  statusMessage,
+  children
+}: {
+  statusMessage: string;
+  children?: ReactNode;
+}) {
+  return (
+    <section className="level-up-optimization-panel">
+      <h2>Level-up optimization</h2>
+      <p role="status">{statusMessage}</p>
+      {children}
+    </section>
+  );
+}
+
+class LevelUpPanelBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (!this.state.failed) {
+      return this.props.children;
+    }
+    return (
+      <LevelUpOptimizationShell statusMessage="Level-up optimization could not load. Your inventory is still available.">
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => window.location.reload()}
+        >
+          Reload application
+        </button>
+      </LevelUpOptimizationShell>
+    );
+  }
+}
+
+const InventoryResults = memo(function InventoryResults({
   inventory,
   steamId,
   badges,
@@ -2895,6 +2971,7 @@ function InventoryResults({
   const isPublicInventory = inventory?.status === "public";
   const [activeResultView, setActiveResultView] =
     useState<InventoryResultView>("inventory");
+  const [hasActivatedLevelUp, setHasActivatedLevelUp] = useState(false);
   const resultTabRefs = useRef<
     Record<InventoryResultView, HTMLButtonElement | null>
   >({
@@ -2907,6 +2984,9 @@ function InventoryResults({
     focusTab = false
   ) {
     setActiveResultView(view);
+    if (view === "level-up") {
+      setHasActivatedLevelUp(true);
+    }
     if (focusTab) {
       resultTabRefs.current[view]?.focus();
     }
@@ -3065,25 +3145,35 @@ function InventoryResults({
           key={`level-up-calculator-${steamId}`}
           badges={badges}
         />
-        <LevelUpOptimizationPanel
-          key={`level-up-optimizer-${steamId}-${badges.status}-${badges.checked_at ?? "missing"}`}
-          steamId={steamId}
-          inventoryStatus={inventory?.status ?? "unavailable"}
-          items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
-          boosters={inventory?.boosters ?? []}
-          badges={badges}
-          inventoryRefreshedAt={inventoryRefreshedAt}
-          isInventoryLoading={isInventoryLoading}
-          isActive={activeResultView === "level-up"}
-          onRefreshInventory={onRefreshInventory}
-          onRefreshBadges={onRefreshBadges}
-        />
+        {hasActivatedLevelUp && (
+          <LevelUpPanelBoundary>
+            <Suspense
+              fallback={
+                <LevelUpOptimizationShell statusMessage="Loading level-up optimization…" />
+              }
+            >
+              <LevelUpOptimizationPanel
+                key={`level-up-optimizer-${steamId}-${badges.status}-${badges.checked_at ?? "missing"}`}
+                steamId={steamId}
+                inventoryStatus={inventory?.status ?? "unavailable"}
+                items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
+                boosters={inventory?.boosters ?? []}
+                badges={badges}
+                inventoryRefreshedAt={inventoryRefreshedAt}
+                isInventoryLoading={isInventoryLoading}
+                isActive={activeResultView === "level-up"}
+                onRefreshInventory={onRefreshInventory}
+                onRefreshBadges={onRefreshBadges}
+              />
+            </Suspense>
+          </LevelUpPanelBoundary>
+        )}
       </div>
     </section>
   );
-}
+});
 
-function InventoryFaq({
+const InventoryFaq = memo(function InventoryFaq({
   profile,
   inventory,
   gemCashBasis
@@ -3236,7 +3326,7 @@ function InventoryFaq({
       </div>
     </section>
   );
-}
+});
 
 
 function SignedInView({
@@ -3377,7 +3467,6 @@ function HomePage() {
   >(null);
   const [gemRefreshMessage, setGemRefreshMessage] = useState<string | null>(null);
   const [statusAnnouncement, setStatusAnnouncement] = useState("Checking session…");
-  const retryDeadlineRef = useRef<number | null>(null);
   const recheckInFlightRef = useRef(false);
   const inventoryRefreshInFlightRef = useRef(false);
   const gemRefreshInFlightRef = useRef(false);
@@ -3407,7 +3496,6 @@ function HomePage() {
           inventory?.retry_after_seconds !== undefined
           ? nowMs + inventory.retry_after_seconds * MILLISECONDS_PER_SECOND
           : null;
-      retryDeadlineRef.current = deadlineMs;
       setRetryDeadlineMs(deadlineMs);
       setCountdownNowMs(nowMs);
     },
@@ -3610,7 +3698,6 @@ function HomePage() {
         message: null
       });
       setRetryDeadlineMs(null);
-      retryDeadlineRef.current = null;
       setViewState({ kind: "signed-out" });
       return null;
     }
@@ -3723,7 +3810,6 @@ function HomePage() {
 
     const remainingMs = retryDeadlineMs - performance.now();
     if (remainingMs <= 0) {
-      retryDeadlineRef.current = null;
       return;
     }
 
@@ -3769,7 +3855,7 @@ function HomePage() {
     }
   }
 
-  async function handleRecheck() {
+  const handleRecheck = useCallback(async () => {
     if (
       recheckInFlightRef.current ||
       inventoryRefreshInFlightRef.current ||
@@ -3835,9 +3921,9 @@ function HomePage() {
       recheckInFlightRef.current = false;
       setIsRechecking(false);
     }
-  }
+  }, [isSigningOut, loadCurrentSession, presentSession]);
 
-  async function handleInventoryRefresh() {
+  const handleInventoryRefresh = useCallback(async () => {
     if (
       inventoryRefreshInFlightRef.current ||
       recheckInFlightRef.current ||
@@ -3845,7 +3931,7 @@ function HomePage() {
       isSigningOut ||
       inventoryStateRef.current.isLoading ||
       viewState.kind !== "signed-in" ||
-      retryAfterSeconds > 0
+      secondsUntilDeadline(retryDeadlineMs, performance.now()) > 0
     ) {
       return;
     }
@@ -3918,9 +4004,15 @@ function HomePage() {
       inventoryRefreshInFlightRef.current = false;
       setIsRefreshingInventory(false);
     }
-  }
+  }, [
+    isSigningOut,
+    loadCurrentSession,
+    loadInventoryForUser,
+    retryDeadlineMs,
+    viewState
+  ]);
 
-  async function handleGemRefresh() {
+  const handleGemRefresh = useCallback(async () => {
     if (
       gemRefreshInFlightRef.current ||
       recheckInFlightRef.current ||
@@ -3936,7 +4028,8 @@ function HomePage() {
     if (inventory === null || steamId === null) {
       return;
     }
-    if (gemRefreshGroups(inventory.items).length === 0) {
+    const refreshGroups = gemRefreshGroups(inventory.items);
+    if (refreshGroups.length === 0) {
       return;
     }
 
@@ -3947,7 +4040,7 @@ function HomePage() {
 
     try {
       const cacheEpoch = await readInventoryCacheEpoch();
-      const refresh = await requestGemRefresh(inventory);
+      const refresh = await requestGemRefresh(inventory, refreshGroups);
       const mergedInventory = mergeGemRefresh(inventory, refresh);
       if (activeSteamIdRef.current !== steamId) {
         return;
@@ -3989,7 +4082,7 @@ function HomePage() {
       gemRefreshInFlightRef.current = false;
       setIsRefreshingGems(false);
     }
-  }
+  }, [isSigningOut, updateInventoryState, viewState]);
 
   async function handleLogout() {
     if (
@@ -4030,7 +4123,6 @@ function HomePage() {
         message: null
       });
       setRetryDeadlineMs(null);
-      retryDeadlineRef.current = null;
       setViewState({ kind: "signed-out" });
       setStatusAnnouncement("Signed out successfully.");
     } catch {
@@ -4131,9 +4223,9 @@ function HomePage() {
             actionMessage={actionMessage}
             inventoryActionMessage={inventoryActionMessage}
             gemRefreshMessage={gemRefreshMessage}
-            onRefreshInventory={() => void handleInventoryRefresh()}
-            onRefreshBadges={() => void handleRecheck()}
-            onRefreshGems={() => void handleGemRefresh()}
+            onRefreshInventory={handleInventoryRefresh}
+            onRefreshBadges={handleRecheck}
+            onRefreshGems={handleGemRefresh}
           />
         )}
 

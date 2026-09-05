@@ -241,7 +241,7 @@ class LevelUpGame(BaseModel):
     def validate_app_id(self) -> LevelUpGame:
         try:
             app_id = int(self.app_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             raise ValueError(_LEVEL_UP_GAME_APP_ID_ERROR) from None
         if not 0 < app_id <= MAX_APP_ID:
             raise ValueError(_LEVEL_UP_GAME_APP_ID_ERROR)
@@ -327,12 +327,13 @@ async def _read_level_up_json(request: Request) -> object:
     async for chunk in request.stream():
         if not isinstance(chunk, (bytes, bytearray, memoryview)):
             raise TypeError
-        body.extend(chunk)
-        if len(body) > MAX_LEVEL_UP_REQUEST_BYTES:
+        chunk_size = chunk.nbytes if isinstance(chunk, memoryview) else len(chunk)
+        if len(body) + chunk_size > MAX_LEVEL_UP_REQUEST_BYTES:
             raise _RequestBodyTooLargeError
+        body.extend(chunk)
     try:
         return json.loads(
-            bytes(body).decode("utf-8"),
+            body.decode("utf-8"),
             object_pairs_hook=reject_duplicate_object_keys,
         )
     except (
@@ -481,7 +482,7 @@ def _level_up_unavailable_response(
             else inventory_refreshed_at
         )
         inventory_time = datetime.fromisoformat(text).astimezone(UTC)
-    except (TypeError, ValueError, AttributeError, OverflowError):
+    except TypeError, ValueError, AttributeError, OverflowError:
         inventory_time = now
     contract = None
     with suppress(AttributeError, TypeError, ValueError):
@@ -619,7 +620,7 @@ def create_auth_router(
             )
             _delete_cookie(response, settings, STATE_PURPOSE)
             return response
-        except (InvalidCookieError, OpenIDValidationError, ValueError):
+        except InvalidCookieError, OpenIDValidationError, ValueError:
             response = JSONResponse(
                 {"detail": "Invalid Steam authentication callback."}, status_code=400
             )
@@ -641,7 +642,7 @@ def create_auth_router(
                 codec,
                 now=current_time(),
             )
-        except (InvalidCookieError, ValueError):
+        except InvalidCookieError, ValueError:
             return UnauthenticatedSessionResponse()
         try:
             profile_result, badge_result = await asyncio.gather(
@@ -954,7 +955,7 @@ def create_auth_router(
                         ),
                     )
                 )
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 booster_values.append(
                     BoosterRefreshValue(
                         game_app_id=game_app_id,

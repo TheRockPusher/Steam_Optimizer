@@ -481,7 +481,7 @@ export async function clearInventoryCacheExcept(steamId: string): Promise<void> 
     };
     accountRequest.onerror = () => transaction.abort();
 
-    const request = store.openCursor();
+    const request = store.openKeyCursor();
     request.onsuccess = () => {
       const cursor = request.result;
       if (cursor === null) {
@@ -490,7 +490,7 @@ export async function clearInventoryCacheExcept(steamId: string): Promise<void> 
         return;
       }
       if (cursor.key !== steamId) {
-        cursor.delete();
+        store.delete(cursor.primaryKey);
         shouldIncrementEpoch = true;
       }
       cursor.continue();
