@@ -196,21 +196,23 @@ def calculate_item_fees(
         return None
     if not isinstance(contract, MarketFeeContract):
         return None
-    buyer_total_minor = _raw_buyer_total(seller_receipt_minor, contract)
+    steam_fee_minor = _component_fee(
+        seller_receipt_minor,
+        contract.steam_fee_bps,
+        contract.min_fee_minor,
+    )
+    publisher_fee_minor = _component_fee(
+        seller_receipt_minor,
+        contract.publisher_fee_bps,
+        contract.min_fee_minor,
+    )
+    buyer_total_minor = seller_receipt_minor + steam_fee_minor + publisher_fee_minor
     if buyer_total_minor > MAX_MINOR_UNITS:
         return None
     return MarketFeeBreakdown(
         seller_receipt_minor=seller_receipt_minor,
-        steam_fee_minor=_component_fee(
-            seller_receipt_minor,
-            contract.steam_fee_bps,
-            contract.min_fee_minor,
-        ),
-        publisher_fee_minor=_component_fee(
-            seller_receipt_minor,
-            contract.publisher_fee_bps,
-            contract.min_fee_minor,
-        ),
+        steam_fee_minor=steam_fee_minor,
+        publisher_fee_minor=publisher_fee_minor,
         buyer_total_minor=buyer_total_minor,
     )
 

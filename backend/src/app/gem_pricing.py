@@ -89,6 +89,10 @@ _GEM_CACHE_TABLE_INFO = (
     ("created_at", "REAL", 1, None, 0),
     ("expires_at", "REAL", 1, None, 0),
 )
+# get_many binds one row value of three variables per exact GemKey; 333 keys
+# per statement keeps every batch at SQLite's portable 999-variable ceiling.
+# Row values in comparisons require SQLite 3.15+.
+_GEM_GET_MANY_BATCH_SIZE = 333
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -450,7 +454,7 @@ def parse_get_goo_value_action(action: object) -> GemKey | None:
             item_type=item_type,
             border_color=0 if border_color == 0 else 1,
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -511,7 +515,7 @@ def _parse_market_bucket_id(value: object) -> _GemKeyParse:
                 border_color=1 if border_text == "1" else 0,
             )
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return _GemKeyParse(valid=False)
 
 
@@ -636,7 +640,7 @@ def canonical_decimal(value: str | Decimal) -> str | None:
 
     try:
         decimal = value if isinstance(value, Decimal) else Decimal(value)
-    except (ArithmeticError, TypeError, ValueError):
+    except ArithmeticError, TypeError, ValueError:
         return None
     if not decimal.is_finite() or decimal.is_signed():
         return None
@@ -662,7 +666,7 @@ def gem_cash_value(gem_yield: int, sack_price: str | Decimal | None) -> str | No
         return None
     try:
         product = int(price_digits) * gem_yield
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     scale = len(fraction) + 3
     padded = str(product).rjust(scale + 1, "0")
@@ -970,7 +974,7 @@ class GemPriceCache:
             return None
         try:
             result = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return None
         return result if math.isfinite(result) else None
 
@@ -1011,7 +1015,7 @@ class GemPriceCache:
             return None
         try:
             key = GemKey(app_id, item_type, border_color)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         if gem_yield is not None and not 0 <= gem_yield <= MAX_GEM_YIELD:
             return None
@@ -1049,7 +1053,7 @@ class GemPriceCache:
                 (key.app_id, key.item_type, key.border_color),
             ).fetchone()
             return None if row is None else self._entry(row)
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return None
         finally:
             if connection is not None:
@@ -1066,22 +1070,34 @@ class GemPriceCache:
         results: dict[GemKey, GemCacheEntry] = {}
         try:
             connection = self._connect()
-            for key in unique_keys:
-                row = connection.execute(
-                    """
-                    SELECT app_id, item_type, border_color, status,
+            requested = set(unique_keys)
+            for start in range(0, len(unique_keys), _GEM_GET_MANY_BATCH_SIZE):
+                chunk = unique_keys[start : start + _GEM_GET_MANY_BATCH_SIZE]
+                row_values = ",".join(["(?, ?, ?)"] * len(chunk))
+                parameters = [
+                    value
+                    for key in chunk
+                    for value in (key.app_id, key.item_type, key.border_color)
+                ]
+                rows = connection.execute(
+                    f"""
+                    WITH requested(app_id, item_type, border_color) AS (
+                        VALUES {row_values}
+                    )
+                    SELECT cached.app_id, cached.item_type, cached.border_color, status,
                            representative_hash, gem_yield, observed_at,
                            created_at, expires_at
-                      FROM gem_price_cache
-                     WHERE app_id = ? AND item_type = ? AND border_color = ?
-                    """,
-                    (key.app_id, key.item_type, key.border_color),
-                ).fetchone()
-                if row is not None:
+                      FROM requested
+                      JOIN gem_price_cache AS cached
+                        USING (app_id, item_type, border_color)
+                    """,  # noqa: S608 - row_values contains only literal "(?, ?, ?)"
+                    parameters,
+                ).fetchall()
+                for row in rows:
                     entry = self._entry(row)
-                    if entry is not None and entry.key == key:
-                        results[key] = entry
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+                    if entry is not None and entry.key in requested:
+                        results[entry.key] = entry
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return {}
         finally:
             if connection is not None:
@@ -1132,7 +1148,7 @@ class GemPriceCache:
                 ),
             )
             connection.commit()
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return
         finally:
             if connection is not None:
@@ -1175,7 +1191,7 @@ class GemPriceCache:
                 ),
             )
             connection.commit()
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             return
         finally:
             if connection is not None:
@@ -1206,10 +1222,6 @@ class SteamCommunityLimiter:
     @staticmethod
     def _clock() -> float:
         return time.monotonic()
-
-    def circuit_retry_after(self) -> int | None:
-        remaining = self._circuit_until - self._clock()
-        return max(0, math.ceil(remaining)) if remaining > 0 else None
 
     async def run[T](self, operation: Callable[[], Awaitable[T]]) -> T:
         async with self._lock:
@@ -1328,7 +1340,7 @@ class SteamCommunityGemProvider:
                 )
             try:
                 payload = listing_response.json()
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return CommunityLookup(
                     failure="Steam Community gem data is unavailable."
                 )
@@ -1362,7 +1374,7 @@ class SteamCommunityGemProvider:
                 )
             try:
                 value_payload = value_response.json()
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return CommunityLookup(
                     failure="Steam Community gem data is unavailable."
                 )

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -35,10 +34,6 @@ from app.market_fees import (
     seller_receipt_from_buyer_total as real_seller_receipt_from_buyer_total,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-
-
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
 
 
@@ -66,7 +61,7 @@ class Breakdown:
 def _decimal_to_minor(value: object, digits: int) -> int | None:
     try:
         scaled = Decimal(str(value)) * (10**digits)
-    except (ArithmeticError, TypeError, ValueError):
+    except ArithmeticError, TypeError, ValueError:
         return None
     if scaled != scaled.to_integral_value() or scaled < 0:
         return None
@@ -139,6 +134,27 @@ def game(
                 sell_quantity=sell_quantity,
             )
             for number in range(1, count + 1)
+        ),
+    )
+
+
+def sole_source_game(
+    app_id: int,
+    *,
+    buy: str,
+    other_sell: str = "0.10",
+    observed_at: datetime = NOW,
+) -> CatalogSet:
+    """First card (by hash) lacks a sell quote; its set siblings stay quoted."""
+    return CatalogSet(
+        app_id,
+        f"Game {app_id}",
+        (
+            card(app_id, 1, buy=buy, sell=None, observed_at=observed_at),
+            *(
+                card(app_id, number, buy=buy, sell=other_sell, observed_at=observed_at)
+                for number in range(2, 6)
+            ),
         ),
     )
 
@@ -451,6 +467,29 @@ def test_same_app_sole_copy_can_create_latent_fully_owned_destination() -> None:
     }
 
 
+def test_same_app_sole_copy_without_replacement_ask_excludes_pre_sale_option() -> None:
+    source = sole_source_game(440, buy="2.00")
+    result = run_optimizer(
+        catalog(source), holdings_for_cards(source.cards[0]), badges((440, 0))
+    )
+
+    assert result.status == "no_opportunity"
+    assert result.reason == "no_positive_xp_swap"
+
+    funded = run_optimizer(
+        catalog(source, game(441, sell="0.10")),
+        holdings_for_cards(source.cards[0]),
+        badges((440, 0)),
+    )
+
+    assert funded.status == "ready"
+    assert [destination.app_id for destination in funded.destinations] == [441]
+    assert funded.totals is not None
+    assert funded.totals.seller_receipt_total == 200
+    assert funded.totals.purchase_total == 50
+    assert funded.totals.unspent_swap_proceeds == 150
+
+
 def test_extra_source_copy_remains_owned_after_sale() -> None:
     source = game(440, buy="2.00", sell="0.10")
     result = run_optimizer(
@@ -517,43 +556,60 @@ def test_incomplete_and_maxed_sources_have_zero_foregone_craft_xp() -> None:
     assert maxed.totals.funded_craft_xp == 100
 
 
-def test_destination_options_are_built_once_for_many_sellable_sources(
+def test_real_fee_plan_identity_and_budgets_survive_input_permutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = game(440, buy="3.00")
-    destinations = tuple(game(app_id, sell="0.10") for app_id in range(441, 445))
-    calls = 0
-    original = optimizer._destination_options
-
-    def counted(
-        sets: Sequence[CatalogSet],
-        holdings: Mapping[str, Holding],
-        badges: BadgeState,
-        now: datetime,
-        quote_window: int,
-        contract: MarketFeeContract,
-        sell_quotes: Mapping[str, optimizer._SideQuote | None] | None = None,
-    ) -> tuple[optimizer.DestinationPlan, ...]:
-        nonlocal calls
-        calls += 1
-        return original(
-            sets,
-            holdings,
-            badges,
-            now,
-            quote_window,
-            contract,
-            sell_quotes,
-        )
-
-    monkeypatch.setattr(optimizer, "_destination_options", counted)
-    result = run_optimizer(
-        catalog(source, *destinations),
-        holdings_for_cards(*source.cards, owned_quantity=2),
+    monkeypatch.setattr(optimizer, "_decimal_to_minor", real_decimal_to_minor)
+    monkeypatch.setattr(
+        optimizer,
+        "_seller_receipt_from_buyer_total",
+        real_seller_receipt_from_buyer_total,
     )
+    monkeypatch.setattr(optimizer, "_calculate_item_fees", real_calculate_item_fees)
 
-    assert result.status == "ready"
-    assert calls == 1
+    weak = sole_source_game(440, buy="2.00")
+    strong = sole_source_game(445, buy="3.00")
+    unfundable = sole_source_game(446, buy="0.50")
+    destinations = tuple(game(app_id, sell="0.10") for app_id in range(441, 445))
+    sets = (weak, strong, unfundable, *destinations)
+    holdings = (
+        holdings_for_cards(weak.cards[0])
+        + holdings_for_cards(strong.cards[0])
+        + holdings_for_cards(unfundable.cards[0], owned_quantity=2, sellable_quantity=1)
+    )
+    baseline = run_optimizer(ResolvedCatalog(1, NOW, sets), holdings)
+
+    assert baseline.status == "ready"
+    assert baseline.source is not None
+    assert baseline.source.app_id == 445
+    source_row = baseline.source.rows[0]
+    assert (source_row.buyer_total, source_row.seller_receipt) == (300, 261)
+    assert (source_row.steam_fee, source_row.publisher_fee) == (13, 26)
+    assert [destination.app_id for destination in baseline.destinations] == [
+        440,
+        446,
+        441,
+        442,
+        443,
+    ]
+    assert baseline.totals is not None
+    assert baseline.totals.seller_receipt_total == 261
+    assert baseline.totals.purchase_total == 230
+    assert baseline.totals.unspent_swap_proceeds == 31
+    assert baseline.totals.funded_craft_xp == 500
+    assert baseline.totals.destination_count == 5
+    assert baseline.totals.scope_limited is False
+
+    reversed_run = run_optimizer(
+        ResolvedCatalog(1, NOW, tuple(reversed(sets))), tuple(reversed(holdings))
+    )
+    assert reversed_run.to_dict() == baseline.to_dict()
+
+    rotated_run = run_optimizer(
+        ResolvedCatalog(1, NOW, (strong, *destinations, unfundable, weak)),
+        holdings[1:] + holdings[:1],
+    )
+    assert rotated_run.to_dict() == baseline.to_dict()
 
 
 def test_maxed_destinations_are_excluded_and_level_four_advances_to_five() -> None:
@@ -658,6 +714,40 @@ def test_missing_side_quotes_depth_and_staleness_are_local() -> None:
     assert result.reason == "no_sellable_card"
 
 
+def test_quotes_and_snapshots_at_exact_freshness_window_are_accepted() -> None:
+    aged = NOW - timedelta(seconds=900)
+    source = game(440, buy="6.00", sell="0.10", observed_at=aged)
+    destination = game(441, sell="0.10", observed_at=aged)
+    holdings = holdings_for_cards(source.cards[0])
+    accepted = run_optimizer(
+        ResolvedCatalog(1, aged, (source, destination)),
+        holdings,
+        inventory_refreshed_at=NOW - timedelta(seconds=3_600),
+    )
+
+    assert accepted.status == "ready"
+    assert [item.app_id for item in accepted.destinations] == [440, 441]
+    assert accepted.destinations[0].owned_card_count == 0
+    assert accepted.valid_until == NOW
+    assert accepted.totals is not None
+    assert accepted.totals.purchase_total == 100
+    assert accepted.totals.unspent_swap_proceeds == 500
+
+    just_over = game(441, sell="0.10", observed_at=NOW - timedelta(seconds=901))
+    rejected = run_optimizer(
+        ResolvedCatalog(1, aged, (source, just_over)),
+        holdings,
+        inventory_refreshed_at=NOW - timedelta(seconds=3_600),
+    )
+
+    assert rejected.status == "ready"
+    assert [item.app_id for item in rejected.destinations] == [440]
+    assert rejected.destinations[0].owned_card_count == 0
+    assert rejected.totals is not None
+    assert rejected.totals.purchase_total == 50
+    assert rejected.totals.unspent_swap_proceeds == 550
+
+
 def test_serialization_uses_final_singular_and_missing_card_fields() -> None:
     source = game(440, buy="2.00")
     destination = game(441, sell="0.10")
@@ -676,16 +766,14 @@ def test_serialization_uses_final_singular_and_missing_card_fields() -> None:
     assert isinstance(destination_payload, dict)
     assert destination_payload["owned_card_count"] == 0
     assert destination_payload["missing_cards_total"] == 50
-    assert "set_subtotal" not in destination_payload
+    assert isinstance(destination_payload["rows"], list)
+    assert len(destination_payload["rows"]) == 5
     totals_payload = payload["totals"]
     assert isinstance(totals_payload, dict)
     assert "foregone_craft_xp" in totals_payload
     assert "funded_craft_xp" in totals_payload
-    assert "direct_craft_xp" not in totals_payload
-    assert "swap_path_xp" not in totals_payload
-    assert "catalog_total_sets" not in payload
-    assert "catalog_resolved_sets" not in payload
-    assert "catalog_pending_sets" not in payload
+    assert "purchase_total" in totals_payload
+    assert "unspent_swap_proceeds" in totals_payload
 
 
 @pytest.mark.parametrize(

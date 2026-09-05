@@ -54,7 +54,7 @@ CREATE TABLE steamapis_price_cache (
 """
 _PRICE_INDEX_SQL = f"""
 CREATE INDEX {_PRICE_INDEX_NAME}
-    ON {_PRICE_TABLE_NAME} (generation, normal_card_app_id)
+    ON {_PRICE_TABLE_NAME} (generation, normal_card_app_id, market_hash_name)
 """
 _PRICE_META_TABLE_SQL = """
 CREATE TABLE steamapis_price_cache_meta (
@@ -90,7 +90,10 @@ _PRICE_META_TABLE_INFO = (
 _PRICE_INDEX_INFO = (
     (0, "generation"),
     (1, "normal_card_app_id"),
+    (2, "market_hash_name"),
 )
+# Normalized forms of the module DDL constants, computed once per process.
+_NORMALIZED_DDL: dict[str, str] = {}
 _CACHE_CONNECTION_ERROR = "SQLite connection was not created."
 _CACHE_READ_ONLY_REPLACE_ERROR = "Cannot replace a read-only or missing SQLite cache."
 _CACHE_SCHEMA_VERSION_TYPE_ERROR = "schema_version must be an integer."
@@ -140,14 +143,6 @@ class NormalCardCatalogRead:
         if self.refreshed_at is None:
             return None
         return max(0.0, time.time() - self.refreshed_at)
-
-    @property
-    def cards(self) -> dict[int, tuple[CachedPrice, ...]]:
-        return self.groups
-
-    @property
-    def by_app_id(self) -> dict[int, tuple[CachedPrice, ...]]:
-        return self.groups
 
     @property
     def rows(self) -> tuple[CachedPrice, ...]:
@@ -297,6 +292,15 @@ class SteamApisPriceCache:
         flush_outside_quote()
         return "".join(parts)
 
+    @classmethod
+    def _normalized_expected_sql(cls, expected_sql: str) -> str:
+        """Normalize one of the module DDL constants, memoized per process."""
+        normalized = _NORMALIZED_DDL.get(expected_sql)
+        if normalized is None:
+            normalized = cls._normalized_sql(expected_sql)
+            _NORMALIZED_DDL[expected_sql] = normalized
+        return normalized
+
     @staticmethod
     def _table_signature(
         connection: sqlite3.Connection,
@@ -356,7 +360,8 @@ class SteamApisPriceCache:
             cls._object_type(connection, index_name) == "index"
             and cls._index_signature(connection, index_name) == expected_info
             and index_sql is not None
-            and cls._normalized_sql(index_sql) == cls._normalized_sql(expected_sql)
+            and cls._normalized_sql(index_sql)
+            == cls._normalized_expected_sql(expected_sql)
         )
 
     @classmethod
@@ -371,7 +376,8 @@ class SteamApisPriceCache:
         return (
             cls._table_signature(connection, table_name) == expected_info
             and table_sql is not None
-            and cls._normalized_sql(table_sql) == cls._normalized_sql(expected_sql)
+            and cls._normalized_sql(table_sql)
+            == cls._normalized_expected_sql(expected_sql)
         )
 
     @staticmethod
@@ -440,7 +446,28 @@ class SteamApisPriceCache:
             index_object,
         )
 
+    def _enable_wal(self, connection: sqlite3.Connection) -> None:
+        """Keep committed generations readable while a refresh streams.
+
+        WAL lets readers snapshot the last committed generation instead of
+        stalling behind the streaming writer's exclusive lock. The mode is a
+        persistent file property and the pragma runs outside any transaction.
+        """
+        if self.path == ":memory:":
+            return
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as error:
+            # A read-only file or externally locked database keeps its
+            # previous journal mode and previous behavior; the next
+            # connection retries enabling WAL.
+            message = str(error).casefold()
+            if self._is_read_only(error) or "database is locked" in message:
+                return
+            raise
+
     def _initialize(self, connection: sqlite3.Connection) -> None:
+        self._enable_wal(connection)
         (
             initial_version,
             initial_price,
@@ -476,11 +503,16 @@ class SteamApisPriceCache:
             ):
                 connection.commit()
                 return
-            if version == 0 and price_compatible and meta_compatible:
+            if (
+                price_compatible
+                and meta_compatible
+                and version in (0, self.schema_version)
+            ):
                 if not index_compatible:
                     self._drop_object(connection, _PRICE_INDEX_NAME, index_object)
                     connection.execute(_PRICE_INDEX_SQL)
-                connection.execute(f"PRAGMA user_version = {self.schema_version}")
+                if version != self.schema_version:
+                    connection.execute(f"PRAGMA user_version = {self.schema_version}")
             else:
                 self._drop_object(connection, _PRICE_TABLE_NAME, price_object)
                 self._drop_object(connection, _PRICE_META_TABLE_NAME, meta_object)
@@ -493,12 +525,12 @@ class SteamApisPriceCache:
         except sqlite3.Error as error:
             connection.rollback()
             if (
-                initial_version == 0
+                initial_version in (0, self.schema_version)
                 and initial_price
                 and initial_meta
-                and initial_index
                 and self._is_read_only(error)
             ):
+                # Index repair is optional for reads of compatible tables.
                 return
             raise
         except BaseException:
@@ -518,6 +550,12 @@ class SteamApisPriceCache:
             raise OSError(_CACHE_READ_ONLY_REPLACE_ERROR)
         archive = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
         path.replace(archive)
+        # Quarantine journal/WAL/SHM sidecars together with the corrupt
+        # database so stale recovery data never sits beside the replacement.
+        for suffix in ("-journal", "-shm", "-wal"):
+            sidecar = path.with_name(f"{path.name}{suffix}")
+            if sidecar.is_file():
+                sidecar.replace(archive.with_name(f"{archive.name}{suffix}"))
 
     def _connect(self) -> sqlite3.Connection:
         in_memory = self.path == ":memory:"
@@ -597,7 +635,7 @@ class SteamApisPriceCache:
             return None
         try:
             result = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return None
         return result if math.isfinite(result) else None
 
@@ -636,7 +674,7 @@ class SteamApisPriceCache:
             return None
         try:
             app_id = int(match.group(1))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         card_name = match.group(2)
         if (
@@ -678,7 +716,7 @@ class SteamApisPriceCache:
             if fixed_length > MAX_PRICE_TEXT_LENGTH:
                 return None
             fixed = format(decimal, "f")
-        except (ArithmeticError, TypeError, ValueError):
+        except ArithmeticError, TypeError, ValueError:
             return None
         if len(fixed) > MAX_PRICE_TEXT_LENGTH or not _PRICE_AMOUNT_PATTERN.fullmatch(
             fixed
@@ -837,7 +875,7 @@ class SteamApisPriceCache:
             )
             connection.commit()
             transaction_started = False
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             if connection is not None and transaction_started:
                 connection.rollback()
             return self._empty_read()
@@ -866,7 +904,7 @@ class SteamApisPriceCache:
                     if index >= MAX_NORMAL_CARD_APP_IDS:
                         return NormalCardCatalogRead(0, None, {})
                     unique_app_ids.setdefault(app_id, None)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return NormalCardCatalogRead(0, None, {})
             raw_app_ids = tuple(unique_app_ids)
             if any(
@@ -987,7 +1025,7 @@ class SteamApisPriceCache:
             )
             connection.commit()
             transaction_started = False
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             if connection is not None and transaction_started:
                 connection.rollback()
             return NormalCardCatalogRead(0, None, {})
@@ -996,14 +1034,6 @@ class SteamApisPriceCache:
         finally:
             if connection is not None:
                 self._close(connection)
-
-    def read_normal_card_catalog(
-        self,
-        *,
-        max_rows: int = MAX_NORMAL_CARD_CATALOG_ROWS,
-        app_ids: Iterable[int] | None = None,
-    ) -> NormalCardCatalogRead:
-        return self.read_catalog(max_rows=max_rows, app_ids=app_ids)
 
     def begin_refresh(self) -> SteamApisPriceRefresh:
         connection: sqlite3.Connection | None = None
@@ -1081,7 +1111,7 @@ class SteamApisPriceCache:
                     failure_values,
                 )
             connection.commit()
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except OSError, sqlite3.Error, TypeError, ValueError:
             if connection is not None:
                 connection.rollback()
         finally:

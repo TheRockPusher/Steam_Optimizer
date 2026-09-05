@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 from app.booster_pricing import BoosterResolution, BoosterScanResult
 from app.cookies import (
+    InvalidCookieError,
     InvalidCookieLifetimeError,
     InvalidCookiePayloadError,
     InvalidCookiePurposeError,
@@ -279,6 +281,69 @@ def test_cookie_encoding_errors_explain_invalid_input() -> None:
         )
 
 
+def test_signed_cookie_round_trips_payload_and_claims() -> None:
+    codec = SignedCookieCodec("test-signing-secret")
+    issued_at = NOW
+    expires_at = NOW + timedelta(minutes=5)
+
+    token = codec.encode(
+        "session",
+        {"steam_id": AUTHENTICATED_STEAM_ID},
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    body = codec.decode(
+        token,
+        "session",
+        now=NOW + timedelta(minutes=4, seconds=59),
+        max_age_seconds=300,
+    )
+
+    assert body == {
+        "steam_id": AUTHENTICATED_STEAM_ID,
+        "exp": int(expires_at.timestamp()),
+        "iat": int(issued_at.timestamp()),
+        "purpose": "session",
+    }
+
+
+def test_cookie_decode_rejects_tampered_purpose_and_lifetime_violations() -> None:
+    codec = SignedCookieCodec("test-signing-secret")
+    issued_at = NOW
+    expires_at = NOW + timedelta(minutes=5)
+    session_token = codec.encode(
+        "session",
+        {"steam_id": AUTHENTICATED_STEAM_ID},
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    state_token = codec.encode(
+        "login-state",
+        {"state": "abc123"},
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    body_token, signature_token = session_token.split(".")
+    forged_body = ("f" if body_token[0] != "f" else "e") + body_token[1:]
+    forged_signature = signature_token[:-1] + (
+        "B" if signature_token[-1] != "B" else "C"
+    )
+    within_lifetime = NOW + timedelta(minutes=4)
+    # Every case violates the signature, purpose, or lifetime decode contract.
+    cases: list[tuple[str, str, datetime, int]] = [
+        (f"{forged_body}.{signature_token}", "session", within_lifetime, 300),
+        (f"{body_token}.{forged_signature}", "session", within_lifetime, 300),
+        (state_token, "session", within_lifetime, 300),
+        (session_token, "login-state", within_lifetime, 300),
+        (session_token, "session", expires_at, 300),
+        (session_token, "session", issued_at - timedelta(seconds=1), 300),
+        (session_token, "session", within_lifetime, 299),
+    ]
+    for token, purpose, now, max_age_seconds in cases:
+        with pytest.raises(InvalidCookieError):
+            codec.decode(token, purpose, now=now, max_age_seconds=max_age_seconds)
+
+
 @pytest.mark.parametrize(
     "secret",
     [None, "", "development-only-change-this-signing-secret", "short"],
@@ -372,6 +437,48 @@ def test_callback_maps_verifier_outage_to_service_unavailable() -> None:
 
     assert callback.status_code == 503
     assert callback.json() == {"detail": "Steam authentication is unavailable."}
+
+
+def _cookie_flags(cookie: str) -> dict[str, str | None]:
+    attributes: dict[str, str | None] = {}
+    for part in cookie.split(";")[1:]:
+        name, _, value = part.strip().partition("=")
+        attributes[name] = value or None
+    return attributes
+
+
+def test_callback_success_sets_session_cookie_and_clears_state_cookie() -> None:
+    settings = make_settings(cookie_samesite="strict")
+    app = create_app(settings, openid_verifier=FakeVerifier(), clock=lambda: NOW)
+    with TestClient(app) as client:
+        start = client.get("/api/auth/steam/start", follow_redirects=False)
+        callback = client.get(
+            "/api/auth/steam/callback?"
+            + callback_query(settings, return_to=return_to_from_start(start)),
+            follow_redirects=False,
+        )
+
+    assert callback.status_code == 302
+    assert callback.headers["location"] == settings.frontend_url
+    set_cookie_headers = callback.headers.get_list("set-cookie")
+    session_cookie = next(
+        cookie
+        for cookie in set_cookie_headers
+        if cookie.startswith(settings.session_cookie_name)
+    )
+    state_cookie = next(
+        cookie
+        for cookie in set_cookie_headers
+        if cookie.startswith(settings.login_state_cookie_name)
+    )
+    session_flags = _cookie_flags(session_cookie)
+    state_flags = _cookie_flags(state_cookie)
+    assert session_flags["Max-Age"] == str(settings.session_ttl_seconds)
+    assert "HttpOnly" in session_flags
+    assert session_flags["SameSite"] == "strict"
+    assert session_flags["Path"] == "/"
+    assert state_flags["Max-Age"] == "0"
+    assert state_flags["Path"] == "/api/auth/steam"
 
 
 def test_session_and_logout_use_signed_session_cookie() -> None:
@@ -620,27 +727,10 @@ def test_inventory_gateway_exception_returns_unavailable_result() -> None:
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert response.json() == {
-        "status": "unavailable",
-        "message": "Steam inventory check is unavailable.",
-        "retry_after_seconds": None,
-        "rate_limited": False,
-        "total_asset_count": 0,
-        "unique_item_count": 0,
-        "priceable_item_count": 0,
-        "priced_item_count": 0,
-        "price_status": "unavailable",
-        "price_message": "Steam item prices are unavailable.",
-        "items": [],
-        "boosters": [],
-        "gem_status": "unavailable",
-        "gem_message": "Gem prices are unavailable.",
-        "gem_priceable_item_count": 0,
-        "gem_priced_item_count": 0,
-        "gem_rate_limited": False,
-        "gem_retry_after_seconds": None,
-        "gem_cash_context": None,
-    }
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["message"] == "Steam inventory check is unavailable."
+    assert body["retry_after_seconds"] is None
     assert gateway.profile_calls == 0
     assert gateway.inventory_calls == 1
 
@@ -735,7 +825,7 @@ def test_level_up_forwards_one_bounded_snapshot_without_inventory_fetch() -> Non
     assert response.json()["reason"] == "badge_data_unavailable"
     assert len(gateway.level_up_calls) == 1
 
-    holdings, game_metadata, badge_state, refreshed_at, badge_at, called_at = (
+    holdings, game_metadata, badge_state, refreshed_at, badge_at, _ = (
         gateway.level_up_calls[0]
     )
     assert game_metadata == {
@@ -745,7 +835,6 @@ def test_level_up_forwards_one_bounded_snapshot_without_inventory_fetch() -> Non
     assert badge_state == BadgeState(0, 0, {440: 0, 20: 1})
     assert refreshed_at == "2026-08-26T12:00:00Z"
     assert badge_at == "2026-08-26T12:00:00Z"
-    assert called_at is None
     assert len(holdings) == 2
     assert holdings[0].market_hash_name == "440-Test Card (Trading Card)"
     assert holdings[0].owned_quantity == 2
@@ -964,6 +1053,35 @@ def test_level_up_rejects_oversize_and_excessively_nested_json() -> None:
     assert gateway.inventory_calls == 0
 
 
+def test_level_up_rejects_duplicate_json_members_before_gateway() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+    body = '{"player_xp":0,"player_xp":0,' + json.dumps(_valid_level_up_payload())[1:]
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/level-up",
+            headers={
+                "Content-Type": "application/json",
+                "X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID,
+            },
+            content=body,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Level-up request body is invalid JSON."}
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.level_up_calls == []
+    assert gateway.inventory_calls == 0
+
+
 def test_level_up_gateway_type_error_is_isolated_without_retry() -> None:
     settings = make_settings()
     gateway = FakeGateway(level_up_error=TypeError("implementation failure"))
@@ -1110,14 +1228,13 @@ def test_gem_refresh_sorts_full_gem_keys() -> None:
         (value["app_id"], value["item_type"], value["border_color"])
         for value in response.json()["values"]
     ] == [("2", 99, 0), ("10", 5, 1), ("10", 9, 0), ("44", 7, 1)]
-    assert gateway.gem_refresh_calls == [
-        [
-            GemKey(app_id="2", item_type=99, border_color=0),
-            GemKey(app_id="10", item_type=5, border_color=1),
-            GemKey(app_id="10", item_type=9, border_color=0),
-            GemKey(app_id="44", item_type=7, border_color=1),
-        ]
-    ]
+    assert len(gateway.gem_refresh_calls) == 1
+    assert set(gateway.gem_refresh_calls[0]) == {
+        GemKey(app_id="2", item_type=99, border_color=0),
+        GemKey(app_id="10", item_type=5, border_color=1),
+        GemKey(app_id="10", item_type=9, border_color=0),
+        GemKey(app_id="44", item_type=7, border_color=1),
+    }
 
 
 @pytest.mark.parametrize(

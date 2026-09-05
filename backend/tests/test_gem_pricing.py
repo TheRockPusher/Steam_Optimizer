@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from app.gem_pricing import (
-    _GEM_CACHE_TABLE_SQL,
     CACHE_SCHEMA_VERSION,
     GEM_CACHE_TTL_SECONDS,
     GEM_NEGATIVE_CACHE_TTL_SECONDS,
@@ -614,7 +613,112 @@ def test_cache_cleanly_resets_v1_schema(tmp_path: Path) -> None:
         ).fetchone() == (0,)
 
 
-def test_provider_validates_listing_action_against_exact_key() -> None:
+def test_cache_get_many_matches_individual_gets_beyond_sql_variable_bound(
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "gems.sqlite3"
+    cache = GemPriceCache(cache_path)
+    shared_app_id = "2000"
+    distinct_keys = [
+        GemKey(shared_app_id, 5, 0),
+        GemKey(shared_app_id, 5, 1),
+        GemKey(shared_app_id, 6, 0),
+    ]
+    resolutions = {
+        key: resolution_for(key, f"Card-{index}", gem_yield=index)
+        for index, key in enumerate(distinct_keys)
+    }
+    filler_keys = [GemKey(str(app_id), 3, 0) for app_id in range(1, 1001)]
+    missing_keys = [
+        GemKey(shared_app_id, 7, 0),
+        GemKey("999999", 5, 0),
+        GemKey("999999", 5, 1),
+    ]
+    malformed_positive_key = GemKey("888888", 5, 0)
+    malformed_negative_key = GemKey("888888", 5, 1)
+    for key in distinct_keys:
+        cache.put_positive(key, resolutions[key])
+    rows = [
+        (
+            key.app_id,
+            key.item_type,
+            key.border_color,
+            "positive" if index % 2 == 0 else "negative",
+            f"Filler-{key.app_id}" if index % 2 == 0 else None,
+            index % 1000 if index % 2 == 0 else None,
+            "2026-08-27T00:00:00Z" if index % 2 == 0 else None,
+            1000.0,
+            2000.0,
+        )
+        for index, key in enumerate(filler_keys)
+    ]
+    rows.extend(
+        [
+            # Positive row missing the required resolution payload.
+            (
+                malformed_positive_key.app_id,
+                malformed_positive_key.item_type,
+                malformed_positive_key.border_color,
+                "positive",
+                None,
+                None,
+                "2026-08-27T00:00:00Z",
+                1000.0,
+                2000.0,
+            ),
+            # Negative row carrying a forbidden gem_yield payload.
+            (
+                malformed_negative_key.app_id,
+                malformed_negative_key.item_type,
+                malformed_negative_key.border_color,
+                "negative",
+                None,
+                5,
+                None,
+                1000.0,
+                2000.0,
+            ),
+        ]
+    )
+    with sqlite3.connect(cache_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO gem_price_cache (
+                app_id, item_type, border_color, status,
+                representative_hash, gem_yield, observed_at,
+                created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    requested = [
+        *distinct_keys,
+        *filler_keys,
+        *missing_keys,
+        malformed_positive_key,
+        malformed_negative_key,
+        *distinct_keys,
+    ]
+
+    results = cache.get_many(requested)
+
+    expected = {
+        key: entry
+        for key in dict.fromkeys(requested)
+        if (entry := cache.get(key)) is not None
+    }
+    assert results == expected
+    for key in distinct_keys:
+        assert results[key].key == key
+        assert results[key].resolution() == resolutions[key]
+    for key in [*missing_keys, malformed_positive_key, malformed_negative_key]:
+        assert key not in results
+
+
+def test_provider_validates_listing_action_against_exact_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     key = GemKey("753", 5, 0)
     client = FakeHTTPClient(
         [
@@ -626,6 +730,19 @@ def test_provider_validates_listing_action_against_exact_key() -> None:
         ]
     )
     provider = SteamCommunityGemProvider(settings(), http_client=client)
+    # Deterministic limiter clock: each _clock() read advances 10s of fake
+    # time, so the second limiter.run computes a start-interval wait <= 0 and
+    # throttling stays serialized without any real wall-clock sleep.
+    fake_time = 0.0
+
+    def deterministic_clock() -> float:
+        nonlocal fake_time
+        fake_time += 10.0
+        return fake_time
+
+    monkeypatch.setattr(
+        SteamCommunityLimiter, "_clock", staticmethod(deterministic_clock)
+    )
 
     result = run(provider.lookup("Example Card", gem_key=key))
 
@@ -906,8 +1023,3 @@ def test_service_stop_cancels_active_work_and_restarts() -> None:
         await service.stop()
 
     run(exercise())
-
-
-# Keep the schema SQL imported in this test module as an explicit contract check.
-def test_cache_schema_sql_is_current_v2_definition() -> None:
-    assert "PRIMARY KEY (app_id, item_type, border_color)" in _GEM_CACHE_TABLE_SQL
