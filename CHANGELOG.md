@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.12.0
+
+
+### Documentation
+- Update changelog for v0.11.0
+
+
+### Features
+- Show top-ten exchange alternatives when no plan exists
+
+
+### Maintenance
+- Prepare release v0.12.0
+
 ## v0.11.0
 
 
