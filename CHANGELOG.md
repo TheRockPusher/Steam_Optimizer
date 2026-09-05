@@ -1,23 +1,23 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v0.11.0
 
-## Unreleased
 
-### Performance
-- Keep committed price generations readable during refreshes and index scoped catalog reads.
-- Batch exact-key gem and booster cache lookups without increasing provider requests.
-- Yield during bulk parsing, avoid redundant inventory copies, and reuse request-local quote calculations.
-- Precompute inventory sort values, reuse number/date formatters, and defer the optimizer panel bundle.
-- Cache content-hashed production assets while revalidating HTML and excluding missing assets.
+### Documentation
+- Update changelog for v0.10.2
+- Document caching, runtime, and recovery behavior
 
-### Bug Fixes
-- Preserve readable price generations when a read-only cache cannot upgrade its index.
-- Contain deferred-panel download failures without losing inventory or the local level calculator.
 
 ### Maintenance
-- Align Python, tooling, CI, and the backend container with Python 3.14.
-- Replace implementation-pinning and duplicate tests with behavioral cache, cancellation, and lifecycle coverage.
+- Require Python 3.14 across tooling and container
+- Prepare release v0.11.0
+
+
+### Performance
+- Keep cache reads responsive during refreshes
+- Defer the optimizer bundle and cut render work
+- Cache immutable assets and revalidate HTML
 
 ## v0.10.2
 
