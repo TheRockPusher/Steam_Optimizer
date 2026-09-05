@@ -203,8 +203,10 @@ The endpoint returns exactly one of these read-only states:
 - `ready`: one complete deterministic, fully funded plan that sells one selected card, reuses
   retained destination cards, buys only missing cards, and reports per-item fees, quote depth/times,
   foregone versus funded XP, and configured currency metadata.
-- `no_opportunity`: valid complete inputs but no card with a usable current bid or no strictly
-  better fee-funded badge route; no zero-valued action cards are rendered.
+- `no_opportunity`: no fully funded positive-XP route. When valid one-sale/one-craft exchanges
+  remain, `exchange_alternatives` carries up to ten ranked alternatives with instant net and
+  optional patient estimates. Negative net requires additional wallet funds; these are not
+  presented as funded plans. Missing patient quotes remain absent rather than zero.
 - `unavailable`: a required contract, badge snapshot, price, depth, catalog, identity, or freshness
   gate is unresolved.
 
@@ -383,8 +385,9 @@ The following remain outside their contracts:
 - Leftover-portfolio optimization, unrestricted whole-Steam-catalog optimization, or a claim of
   global maximum XP beyond the scoped snapshot.
 - Raw XP targets, automatic wallet-balance discovery, or cross-session preference persistence.
-- Patient listings, buy orders, order-book walking, fill-probability models, taxes, regional
-  pricing, market holds, or account-specific restrictions.
+- Execution of patient listings or buy orders, order-book walking, fill-probability models,
+  taxes, regional pricing, market holds, or account-specific restrictions. Advanced exchange
+  alternatives provide patient estimates only, not guaranteed fills.
 - Foil, seasonal/event, sale, or non-game badges; booster drops; random craft rewards; coupons;
   emoticons; backgrounds; gems; or reward expected value.
 - General-purpose PostgreSQL application persistence, Redis-backed services, a staging environment,
