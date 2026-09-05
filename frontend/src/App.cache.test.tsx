@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -8,6 +9,7 @@ import {
   within
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 
 const cacheMocks = vi.hoisted(() => ({
   clearInventoryCache: vi.fn().mockResolvedValue(undefined),
@@ -200,33 +202,95 @@ describe("App inventory cache orchestration", () => {
     expect(cacheMocks.writeInventoryCache).not.toHaveBeenCalled();
   });
 
-  it.each(["cache miss", "mismatched record", "corrupt record", "old schema"])(
-    "fetches exactly once for a %s and stores the result",
-    async (reason) => {
-      cacheMocks.readInventoryCache.mockResolvedValueOnce(null);
-      const fetchMock = vi
-        .spyOn(globalThis, "fetch")
-        .mockResolvedValueOnce(jsonResponse(signedInSession))
-        .mockResolvedValueOnce(jsonResponse(privateInventory));
+  it("fetches the inventory exactly once for a cache miss and stores the result", async () => {
+    cacheMocks.readInventoryCache.mockResolvedValueOnce(null);
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(privateInventory));
 
-      render(<App />);
+    render(<App />);
 
-      expect(
-        await screen.findByRole("definition", {
-          name: "Steam inventory: Private"
-        })
-      ).toBeInTheDocument();
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(fetchMock).toHaveBeenNthCalledWith(
-        2,
-        "/api/auth/inventory",
-        expect.objectContaining({ credentials: "include", method: "POST" })
+    expect(
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Private"
+      })
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/auth/inventory",
+      expect.objectContaining({ credentials: "include", method: "POST" })
+    );
+    expect(cacheMocks.clearInventoryCacheExcept).toHaveBeenCalledWith(steamId);
+    expect(cacheMocks.writeInventoryCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the inventory exactly once across StrictMode's double mount effect", async () => {
+    const sessionResolvers: Array<(response: Response) => void> = [];
+    let resolveInventory!: (response: Response) => void;
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            sessionResolvers.push(resolve);
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            sessionResolvers.push(resolve);
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveInventory = resolve;
+          })
       );
-      expect(cacheMocks.clearInventoryCacheExcept).toHaveBeenCalledWith(steamId);
-      expect(cacheMocks.writeInventoryCache).toHaveBeenCalledTimes(1);
-      expect(reason).toMatch(/cache miss|mismatched|corrupt|old schema/);
-    }
-  );
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session");
+
+    await act(async () => {
+      sessionResolvers[0](jsonResponse(signedInSession));
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      sessionResolvers[1](jsonResponse(signedInSession));
+      resolveInventory(jsonResponse(privateInventory));
+    });
+
+    expect(
+      await screen.findByRole("definition", {
+        name: "Steam inventory: Private"
+      })
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Inventory check complete: Private."))
+      .toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/auth/inventory",
+      expect.objectContaining({ credentials: "include", method: "POST" })
+    );
+    expect(cacheMocks.clearInventoryCacheExcept).toHaveBeenCalledTimes(1);
+    expect(cacheMocks.writeInventoryCache).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByText(/We could not load your Steam inventory/i)
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Steam connection is unavailable.")
+    ).not.toBeInTheDocument();
+  });
 
   it("refreshes inventory only after the explicit Refresh inventory action", async () => {
     cacheMocks.readInventoryCache.mockResolvedValueOnce(

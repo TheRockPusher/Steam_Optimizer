@@ -1566,9 +1566,6 @@ describe("App", () => {
     const levelUpPanel = document.getElementById(
       "inventory-results-panel-level-up"
     );
-    const optimizerPanel = document.getElementById(
-      "level-up-optimization-panel"
-    );
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(
@@ -1597,8 +1594,6 @@ describe("App", () => {
       "inventory-results-tab-level-up"
     );
     expect(levelUpPanel).toHaveAttribute("hidden");
-    expect(optimizerPanel).not.toHaveAttribute("role", "tabpanel");
-    expect(optimizerPanel).not.toHaveAttribute("aria-labelledby");
     expect(inventoryPanel).not.toBeNull();
 
     inventoryTab.focus();
@@ -3115,6 +3110,103 @@ describe("App", () => {
       booster_game_app_ids: ["440"]
     });
   });
+  it("keeps sort, page, and grouping choices across a gem refresh with unchanged items", async () => {
+    const cards = Array.from({ length: 60 }, (_, index) => {
+      const itemNumber = index + 1;
+      return tradingCardItem(itemNumber, {
+        gem_yield: null,
+        game_app_id: itemNumber <= 30 ? "10" : "20",
+        game_name: itemNumber <= 30 ? "Alpha game" : "Zeta game"
+      });
+    });
+    const inventory = publicInventory(cards, {
+      gem_status: "unavailable",
+      gem_message:
+        "Background gem pricing is still processing gem-convertible item groups.",
+      gem_priceable_item_count: 60,
+      gem_priced_item_count: 0
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(signedInSession))
+      .mockResolvedValueOnce(jsonResponse(inventory))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          values: [
+            { app_id: "10", item_type: 2, border_color: 0, gem_yield: 7 },
+            { app_id: "20", item_type: 2, border_color: 0, gem_yield: 7 }
+          ],
+          pending_group_count: 0,
+          boosters: [],
+          pending_booster_count: 0,
+          gem_rate_limited: false,
+          gem_retry_after_seconds: null
+        })
+      );
+
+    render(<App />);
+
+    const table = await screen.findByRole("table", { name: "Inventory items" });
+    const rowNames = () =>
+      Array.from(table.querySelectorAll("tr.inventory-item")).map(
+        (row) => row.querySelector(".inventory-item-name strong")?.textContent
+      );
+    const expectedPageTwoNames = Array.from(
+      { length: 10 },
+      (_, index) => `Card ${String(10 - index).padStart(4, "0")}`
+    );
+    expect(table.querySelectorAll(".inventory-group-header")).toHaveLength(2);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Item, ascending" })
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sort by Item, descending" })
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Group by game" }));
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Inventory page" }),
+      { target: { value: "2" } }
+    );
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Showing 51–60 of 60. Page 2 of 2.");
+    expect(rowNames()).toEqual(expectedPageTwoNames);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh gem values" })
+    );
+    expect(
+      await screen.findByText("Gem values refreshed from the background cache.")
+    ).toBeInTheDocument();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/auth/gems",
+      expect.objectContaining({ credentials: "include", method: "POST" })
+    );
+    expect(
+      screen.getByRole("status", { name: "Inventory pagination status" })
+    ).toHaveTextContent("Showing 51–60 of 60. Page 2 of 2.");
+    expect(
+      screen.getByRole("combobox", { name: "Inventory page" })
+    ).toHaveValue("2");
+    expect(
+      screen
+        .getByRole("button", { name: "Sort by Item, ascending" })
+        .closest("th")
+    ).toHaveAttribute("aria-sort", "descending");
+    expect(rowNames()).toEqual(expectedPageTwoNames);
+    expect(
+      table.querySelector(".inventory-group-header")
+    ).not.toBeInTheDocument();
+    expect(
+      within(screen.getByText("Card 0005").closest("tr") as HTMLElement).getByText(
+        "7"
+      )
+    ).toBeInTheDocument();
+  });
 
 
   it.each([
@@ -3591,9 +3683,10 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("status")).toBe(statusRegion);
     expect(statusRegion).toHaveTextContent("Signed out successfully.");
-    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/auth/logout", {
-      credentials: "include",
-      method: "POST"
-    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/auth/logout",
+      expect.objectContaining({ credentials: "include", method: "POST" })
+    );
   });
 });

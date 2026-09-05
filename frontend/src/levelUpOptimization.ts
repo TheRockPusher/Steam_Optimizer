@@ -394,11 +394,6 @@ export function levelForXp(xp: number): number {
   return low;
 }
 
-export function xpToNextLevel(xp: number): number {
-  const level = levelForXp(xp);
-  return minimumXpForLevel(level + 1) - xp;
-}
-
 function isNonEmptyText(
   value: unknown,
   maxLength = MAX_MARKET_HASH_NAME_LENGTH
@@ -1235,10 +1230,6 @@ export function buildSteamMarketListingUrl(marketHashName: string): string {
   return `${STEAM_COMMUNITY_ORIGIN}/market/listings/753/${encodeURIComponent(marketHashName)}`;
 }
 
-export const buildMarketListingUrl = buildSteamMarketListingUrl;
-
-export const steamMarketListingUrl = buildSteamMarketListingUrl;
-
 export function buildSteamProfileGamecardsUrl(steamId: string, appId: string): string {
   validateSteamId(steamId);
   if (!isPositiveDecimalId(appId, MAX_APP_ID_LENGTH)) {
@@ -1247,9 +1238,59 @@ export function buildSteamProfileGamecardsUrl(steamId: string, appId: string): s
   return `${STEAM_COMMUNITY_ORIGIN}/profiles/${encodeURIComponent(steamId)}/gamecards/${encodeURIComponent(appId)}/`;
 }
 
-export const buildProfileGamecardsUrl = buildSteamProfileGamecardsUrl;
+let lastMoneyFormat: { key: string; formatter: Intl.NumberFormat } | null = null;
 
-export const steamProfileGamecardsUrl = buildSteamProfileGamecardsUrl;
+function moneyFormatter(
+  locale: string,
+  currencyCode: string,
+  minorDigits: number
+): Intl.NumberFormat {
+  const key = `${locale}\u0000${currencyCode}\u0000${minorDigits}`;
+  if (lastMoneyFormat?.key === key) {
+    return lastMoneyFormat.formatter;
+  }
+  const formatter = new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency: currencyCode,
+    currencyDisplay: "symbol",
+    minimumFractionDigits: minorDigits,
+    maximumFractionDigits: minorDigits
+  });
+  lastMoneyFormat = { key, formatter };
+  return formatter;
+}
+
+let lastAbsoluteTimeFormat: {
+  key: string;
+  formatter: Intl.DateTimeFormat;
+} | null = null;
+
+function absoluteTimeFormatter(locale: string): Intl.DateTimeFormat {
+  if (lastAbsoluteTimeFormat?.key === locale) {
+    return lastAbsoluteTimeFormat.formatter;
+  }
+  const formatter = new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  });
+  lastAbsoluteTimeFormat = { key: locale, formatter };
+  return formatter;
+}
+
+let lastRelativeTimeFormat: {
+  key: string;
+  formatter: Intl.RelativeTimeFormat;
+} | null = null;
+
+function relativeTimeFormatter(locale: string): Intl.RelativeTimeFormat {
+  if (lastRelativeTimeFormat?.key === locale) {
+    return lastRelativeTimeFormat.formatter;
+  }
+  const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  lastRelativeTimeFormat = { key: locale, formatter };
+  return formatter;
+}
+
 export function formatMinorUnits(
   amountMinor: number,
   currencyCode: string,
@@ -1263,13 +1304,7 @@ export function formatMinorUnits(
   ) {
     throw new Error("The monetary amount or currency contract is invalid.");
   }
-  const formatter = new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: currencyCode,
-    currencyDisplay: "symbol",
-    minimumFractionDigits: minorDigits,
-    maximumFractionDigits: minorDigits
-  });
+  const formatter = moneyFormatter(locale, currencyCode, minorDigits);
   const scale = 10n ** BigInt(minorDigits);
   const amount = BigInt(amountMinor);
   const major = amount / scale;
@@ -1280,21 +1315,12 @@ export function formatMinorUnits(
     .join("");
 }
 
-export const formatMoney = formatMinorUnits;
-
-export const formatCurrency = formatMinorUnits;
-
 export function formatAbsoluteTime(timestamp: string, locale = "en-US"): string {
   if (!isIsoTimestamp(timestamp)) {
     throw new Error("The timestamp is invalid.");
   }
-  return new Intl.DateTimeFormat(locale, {
-    dateStyle: "medium",
-    timeStyle: "short"
-  }).format(new Date(timestamp));
+  return absoluteTimeFormatter(locale).format(new Date(timestamp));
 }
-
-export const formatTimestamp = formatAbsoluteTime;
 
 export function formatRelativeTime(
   timestamp: string,
@@ -1318,24 +1344,7 @@ export function formatRelativeTime(
         : absoluteSeconds < 86_400
           ? [Math.round(differenceSeconds / 3_600), "hour"]
           : [Math.round(differenceSeconds / 86_400), "day"];
-  return new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(value, unit);
-}
-
-export const formatRelativeTimestamp = formatRelativeTime;
-
-export function formatQuoteAge(timestamp: string, now: number | Date = Date.now()): string {
-  return formatRelativeTime(timestamp, now);
-}
-
-export function quoteAgeMilliseconds(timestamp: string, now: number | Date = Date.now()): number {
-  if (!isIsoTimestamp(timestamp)) {
-    throw new Error("The timestamp is invalid.");
-  }
-  const nowMilliseconds = now instanceof Date ? now.getTime() : now;
-  if (!Number.isFinite(nowMilliseconds)) {
-    throw new Error("The current time is invalid.");
-  }
-  return Math.max(0, nowMilliseconds - timestampMilliseconds(timestamp));
+  return relativeTimeFormatter(locale).format(value, unit);
 }
 
 export function isLevelUpResponseExpired(
@@ -1377,9 +1386,6 @@ export async function requestLevelUpOptimization(
   }
   return payload;
 }
-
-export type LevelUpPanelInventoryItem = LevelUpInventoryItem;
-
 
 export function isInventorySnapshotFresh(
   inventoryRefreshedAt: string | null,

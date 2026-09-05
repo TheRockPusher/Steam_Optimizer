@@ -72,8 +72,13 @@ const REASON_COPY: Record<LevelUpReason, string> = {
     "No one-card sale funds a badge path with more XP than the immediate craft opportunity it gives up."
 };
 
+let xpNumberFormatter: Intl.NumberFormat | null = null;
+
 function formatXp(value: number): string {
-  return `${new Intl.NumberFormat("en-US").format(value)} XP`;
+  if (xpNumberFormatter === null) {
+    xpNumberFormatter = new Intl.NumberFormat("en-US");
+  }
+  return `${xpNumberFormatter.format(value)} XP`;
 }
 
 function formatFeeRate(basisPoints: number): string {
@@ -126,10 +131,11 @@ function RefreshButton({
 }
 
 function QuoteTime({ timestamp }: { timestamp: string }) {
+  const absolute = formatAbsoluteTime(timestamp);
   return (
-    <time dateTime={timestamp} title={formatAbsoluteTime(timestamp)}>
+    <time dateTime={timestamp} title={absolute}>
       {formatRelativeTime(timestamp)}
-      <span className="level-up-quote-time-absolute"> ({formatAbsoluteTime(timestamp)})</span>
+      <span className="level-up-quote-time-absolute"> ({absolute})</span>
     </time>
   );
 }
@@ -653,11 +659,15 @@ export function LevelUpOptimizationPanel({
     steamId
   ]);
 
-  const snapshotKey = levelUpSnapshotKey(
-    steamId,
-    inventoryRefreshedAt,
-    badges.checked_at,
-    requestInput.request
+  const snapshotKey = useMemo(
+    () =>
+      levelUpSnapshotKey(
+        steamId,
+        inventoryRefreshedAt,
+        badges.checked_at,
+        requestInput.request
+      ),
+    [badges.checked_at, inventoryRefreshedAt, requestInput.request, steamId]
   );
   useEffect(() => {
     const timestamps = [inventoryRefreshedAt, badges.checked_at].filter(
@@ -709,18 +719,15 @@ export function LevelUpOptimizationPanel({
 
   const requestForKey = useCallback((key: string, force = false) => {
     const current = inputRef.current;
+    const request = current.request;
     if (
       current.steamId === null ||
       current.inventoryRefreshedAt === null ||
       !isLevelUpIsoTimestamp(current.inventoryRefreshedAt) ||
       !isInventorySnapshotFresh(current.inventoryRefreshedAt, Date.now()) ||
       !isInventorySnapshotFresh(current.badges.checked_at, Date.now()) ||
-      current.request === null
+      request === null
     ) {
-      return;
-    }
-    const request = current.request;
-    if (request === null) {
       return;
     }
     const existingRequest = requestRef.current;
@@ -896,16 +903,19 @@ export function LevelUpOptimizationPanel({
     setState({ kind: "idle", key: null });
     onRefreshInventory();
   }, [abortCurrent, onRefreshInventory, snapshotKey]);
-  const sourceIcons = new Map<string, string>();
-  for (const item of items) {
-    if (
-      typeof item.market_hash_name === "string" &&
-      typeof item.icon_url === "string" &&
-      item.icon_url.length > 0
-    ) {
-      sourceIcons.set(item.market_hash_name, item.icon_url);
+  const sourceIcons = useMemo(() => {
+    const icons = new Map<string, string>();
+    for (const item of items) {
+      if (
+        typeof item.market_hash_name === "string" &&
+        typeof item.icon_url === "string" &&
+        item.icon_url.length > 0
+      ) {
+        icons.set(item.market_hash_name, item.icon_url);
+      }
     }
-  }
+    return icons;
+  }, [items]);
 
   const activeState: LevelUpState = state.key === snapshotKey
     ? state
