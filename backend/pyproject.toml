@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "steam-optimizer-backend"
 version = "0.10.2"
 description = "Read-only Steam Optimizer API"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
   "fastapi>=0.115,<1.0",
   "httpx2>=2.12,<3.0",
@@ -31,12 +31,12 @@ testpaths = ["tests"]
 
 [tool.pyrefly]
 project-includes = ["src/**/*.py", "tests/**/*.py"]
-python-version = "3.12"
+python-version = "3.14"
 search-path = ["src"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
