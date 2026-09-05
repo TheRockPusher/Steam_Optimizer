@@ -146,6 +146,14 @@ The current connection, inventory, and read-only recommendation stage provides:
   `foregone_craft_xp / 100 + 1`. It compares the exact seller receipt with the cumulative
   threshold and funds the maximum prefix of five, never comparing a gross bid directly with a
   purchase subtotal.
+- When no funded positive route exists, the `no_opportunity` response may still carry up to ten
+  `exchange_alternatives`: the best one-sale/one-craft routes ranked by instant net result. Each
+  alternative sells one owned sellable card and buys the missing cards for one non-maxed badge,
+  reporting two money outcomes: an instant estimate (sell into the highest bid, buy at lowest
+  asks) and a patient estimate (list at the lowest ask, place buy orders at highest bids), both
+  net of the exact sale fees. A negative value is the wallet shortfall the user would add; a
+  missing side quote leaves that patient estimate absent rather than zero. These routes may need
+  external funds and imply no XP advantage; they are estimates for manual navigation only.
 - Plans remain in React memory only while the account, inventory snapshot, and badge snapshot are
   unchanged. They are never written to IndexedDB, `localStorage`, cookies, or a server-side user
   cache. Account changes, logout, inventory refresh, session badge changes, and component unmount
@@ -194,6 +202,9 @@ Known unavailable states are explicit: `currency_contract_missing`, `steamapi_ke
 and scoped catalog data also fail closed as unavailable. Valid inputs with no sellable card
 carrying a usable current bid return `no_sellable_card`; evaluated cards with no strictly better
 funded badge route return `no_positive_xp_swap`. They do not render a zero-valued recommendation.
+  When at least one such route is still valid, the response carries `exchange_alternatives`
+  (up to ten, one strict quote deadline, ranked by instant net result); the UI shows them in a
+  table with both money outcomes while the status remains non-actionable.
 No response is treated as actionable when any contract, identity, badge, catalog, or global
 freshness gate is unresolved.
 

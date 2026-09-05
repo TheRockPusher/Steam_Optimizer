@@ -1194,7 +1194,7 @@ h3 {
 
 .level-up-freshness-banner {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
   align-items: center;
   gap: var(--space-4);
   padding: var(--space-4);
@@ -1219,7 +1219,7 @@ h3 {
 
 .level-up-freshness-banner dl {
   display: grid;
-  grid-template-columns: repeat(3, minmax(5rem, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-3);
   margin: 0;
 }
@@ -1603,6 +1603,70 @@ h3 {
   color: var(--color-ink-soft);
   font-size: var(--text-sm);
   line-height: var(--leading-copy);
+}
+
+.level-up-exchange-table {
+  min-width: 74rem;
+}
+
+.level-up-exchange-table th,
+.level-up-exchange-table td {
+  vertical-align: top;
+}
+
+.level-up-exchange-source-game {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--color-ink-soft);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
+.level-up-exchange-table .level-up-sell-card-identity a {
+  font-size: var(--text-sm);
+}
+
+.level-up-exchange-table .level-up-exchange-destination {
+  min-width: 12rem;
+  white-space: normal;
+}
+
+.level-up-exchange-destination strong {
+  display: block;
+  color: var(--color-ink);
+}
+
+.level-up-exchange-destination > span,
+.level-up-exchange-destination > a {
+  display: block;
+  margin-top: var(--space-1);
+  font-weight: 400;
+}
+
+.level-up-exchange-missing-cards {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.level-up-net {
+  font-weight: 700;
+}
+
+.level-up-net-gain {
+  color: var(--color-public);
+}
+
+.level-up-net-loss {
+  color: var(--color-private);
+}
+
+.level-up-missing-quote {
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
 }
 
 

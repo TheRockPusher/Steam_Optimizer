@@ -18,6 +18,7 @@ export const MAX_MINOR_AMOUNT = Number.MAX_SAFE_INTEGER;
 export const LEVEL_UP_INVENTORY_MAX_AGE_MS = 60 * 60 * 1000;
 
 const MAX_BADGE_APP_ID = 2_147_483_647;
+const MAX_EXCHANGE_ALTERNATIVES = 10;
 
 const NORMAL_CARD_HASH_PATTERN = /^([1-9][0-9]*)-(.+) \(Trading Card\)$/;
 const POSITIVE_DECIMAL_ID_PATTERN = /^[1-9][0-9]*$/;
@@ -172,6 +173,21 @@ export type LevelUpTotals = {
   scope_limited: boolean;
 };
 
+export type LevelUpExchangeAlternative = {
+  source: LevelUpSourcePlan;
+  destination: LevelUpDestinationPlan;
+  foregone_craft_xp: 0 | 100;
+  instant_net: number;
+  patient_seller_receipt: number | null;
+  patient_purchase_total: number | null;
+  patient_net: number | null;
+};
+
+export type LevelUpExchangeAlternatives = {
+  valid_until: string;
+  exchanges: LevelUpExchangeAlternative[];
+};
+
 
 type LevelUpResponseCommon = {
   status: LevelUpStatus;
@@ -219,6 +235,8 @@ export type LevelUpNoOpportunityResponse = LevelUpResponseCommon & {
   source: null;
   destinations: [];
   totals: null;
+  /** Present only when at least one valid exchange alternative exists. */
+  exchange_alternatives?: LevelUpExchangeAlternatives;
 };
 
 
@@ -406,6 +424,18 @@ function isCurrencyCode(value: unknown): value is string {
 }
 
 
+function validateMoneyContract(value: Record<string, unknown>): boolean {
+  return (
+    isCurrencyCode(value.currency_code) &&
+    isSafeInteger(value.minor_digits, 0, 3) &&
+    value.price_basis === "instant_top_of_book" &&
+    isSafeInteger(value.steam_fee_bps, 0, 10_000) &&
+    isSafeInteger(value.publisher_fee_bps, 0, 10_000) &&
+    isSafeInteger(value.min_fee_minor, 0, MAX_MINOR_AMOUNT) &&
+    value.taxes_included === false
+  );
+}
+
 function validateMoneyFields(value: Record<string, unknown>): boolean {
   const fields = [
     value.currency_code,
@@ -416,19 +446,7 @@ function validateMoneyFields(value: Record<string, unknown>): boolean {
     value.min_fee_minor,
     value.taxes_included
   ];
-  const allUnset = fields.every((field) => field === null);
-  if (allUnset) {
-    return true;
-  }
-  return (
-    isCurrencyCode(value.currency_code) &&
-    isSafeInteger(value.minor_digits, 0, 3) &&
-    value.price_basis === "instant_top_of_book" &&
-    isSafeInteger(value.steam_fee_bps, 0, 10_000) &&
-    isSafeInteger(value.publisher_fee_bps, 0, 10_000) &&
-    isSafeInteger(value.min_fee_minor, 0, MAX_MINOR_AMOUNT) &&
-    value.taxes_included === false
-  );
+  return fields.every((field) => field === null) || validateMoneyContract(value);
 }
 
 function validatePlayer(value: unknown): value is LevelUpPlayerState {
@@ -604,6 +622,91 @@ function validateDestination(
   return missingCardsTotal === value.missing_cards_total;
 }
 
+function validateExchangeAlternative(
+  value: unknown,
+  generatedAt: number
+): value is LevelUpExchangeAlternative {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "source",
+      "destination",
+      "foregone_craft_xp",
+      "instant_net",
+      "patient_seller_receipt",
+      "patient_purchase_total",
+      "patient_net"
+    ]) ||
+    (value.foregone_craft_xp !== 0 && value.foregone_craft_xp !== 100) ||
+    !validateSource(value.source, generatedAt) ||
+    !validateDestination(value.destination, generatedAt)
+  ) {
+    return false;
+  }
+  const source = value.source as LevelUpSourcePlan;
+  const destination = value.destination as LevelUpDestinationPlan;
+  if (source.badge_level >= 5 && value.foregone_craft_xp !== 0) {
+    return false;
+  }
+  if (
+    destination.rows.length === 1 &&
+    destination.rows[0].market_hash_name === source.rows[0].market_hash_name
+  ) {
+    return false;
+  }
+  if (
+    value.instant_net !==
+    source.rows[0].seller_receipt - destination.missing_cards_total
+  ) {
+    return false;
+  }
+  if (
+    value.patient_seller_receipt !== null &&
+    !isSafeInteger(value.patient_seller_receipt, 0, MAX_MINOR_AMOUNT)
+  ) {
+    return false;
+  }
+  if (
+    value.patient_purchase_total !== null &&
+    !isSafeInteger(value.patient_purchase_total, 0, MAX_MINOR_AMOUNT)
+  ) {
+    return false;
+  }
+  if (value.patient_seller_receipt === null || value.patient_purchase_total === null) {
+    return value.patient_net === null;
+  }
+  return value.patient_net === value.patient_seller_receipt - value.patient_purchase_total;
+}
+
+function validateExchangeAlternatives(
+  value: unknown,
+  generatedAt: number
+): value is LevelUpExchangeAlternatives {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["valid_until", "exchanges"]) ||
+    !isIsoTimestamp(value.valid_until) ||
+    timestampMilliseconds(value.valid_until) <= generatedAt ||
+    !Array.isArray(value.exchanges) ||
+    value.exchanges.length < 1 ||
+    value.exchanges.length > MAX_EXCHANGE_ALTERNATIVES
+  ) {
+    return false;
+  }
+  const routes = new Set<string>();
+  for (const exchange of value.exchanges) {
+    if (!validateExchangeAlternative(exchange, generatedAt)) {
+      return false;
+    }
+    const route = `${exchange.source.rows[0].market_hash_name}\u0000${exchange.destination.app_id}`;
+    if (routes.has(route)) {
+      return false;
+    }
+    routes.add(route);
+  }
+  return true;
+}
+
 function validateTotals(
   value: unknown,
   source: LevelUpSourcePlan,
@@ -745,7 +848,7 @@ function validateCommon(value: Record<string, unknown>): boolean {
         "destinations",
         "totals"
       ],
-      ["message"]
+      ["message", "exchange_alternatives"]
     ) &&
     isIsoTimestamp(value.generated_at) &&
     isIsoTimestamp(value.inventory_refreshed_at) &&
@@ -768,6 +871,7 @@ export function isLevelUpOptimizationResponse(
   switch (response.status) {
     case "ready": {
       if (
+        response.exchange_alternatives !== undefined ||
         response.reason !== "ready" ||
         !isCurrencyCode(response.currency_code) ||
         !isSafeInteger(response.minor_digits, 0, 3) ||
@@ -789,19 +893,34 @@ export function isLevelUpOptimizationResponse(
       }
       return validateReadyPlan(response, generatedAt, player, response.scope_limited);
     }
-    case "no_opportunity":
+    case "no_opportunity": {
+      if (
+        response.reason !== "no_sellable_card" &&
+        response.reason !== "no_positive_xp_swap"
+      ) {
+        return false;
+      }
+      if (
+        response.valid_until !== null ||
+        response.player !== null ||
+        response.source !== null ||
+        response.destinations.length !== 0 ||
+        response.totals !== null ||
+        response.scope_limited !== false
+      ) {
+        return false;
+      }
+      if (response.exchange_alternatives === undefined) {
+        return true;
+      }
       return (
-        (response.reason === "no_sellable_card" ||
-          response.reason === "no_positive_xp_swap") &&
-        response.valid_until === null &&
-        response.player === null &&
-        response.source === null &&
-        response.destinations.length === 0 &&
-        response.totals === null &&
-        response.scope_limited === false
+        validateMoneyContract(response) &&
+        validateExchangeAlternatives(response.exchange_alternatives, generatedAt)
       );
+    }
     case "unavailable":
       return (
+        response.exchange_alternatives === undefined &&
         (response.reason === "currency_contract_missing" ||
           response.reason === "steamapi_key_missing" ||
           response.reason === "badge_data_unavailable" ||
@@ -832,6 +951,64 @@ export function assertLevelUpOptimizationResponse(
     throw new Error("The level-up optimization service returned an invalid response.");
   }
 }
+function sourcePlanMatchesRequest(
+  source: LevelUpSourcePlan,
+  request: LevelUpOptimizationRequest,
+  games: Map<string, LevelUpGame>
+): boolean {
+  const sourceGame = games.get(source.app_id);
+  if (
+    sourceGame === undefined ||
+    source.game_name !== sourceGame.game_name ||
+    source.badge_level !== sourceGame.badge_level ||
+    (sourceGame.card_set_size !== null &&
+      source.set_size !== sourceGame.card_set_size)
+  ) {
+    return false;
+  }
+  const sourceOwnership = request.cards.find(
+    (card) => card.market_hash_name === source.rows[0].market_hash_name
+  );
+  return sourceOwnership !== undefined && sourceOwnership.sellable_quantity >= 1;
+}
+
+function destinationPlanMatchesRequest(
+  destination: LevelUpDestinationPlan,
+  request: LevelUpOptimizationRequest,
+  games: Map<string, LevelUpGame>,
+  soldMarketHashName: string
+): boolean {
+  const game = games.get(destination.app_id);
+  if (
+    game === undefined ||
+    destination.game_name !== game.game_name ||
+    destination.badge_level_before !== game.badge_level ||
+    (game.card_set_size !== null &&
+      destination.set_size !== game.card_set_size)
+  ) {
+    return false;
+  }
+  const missingHashes = new Set(
+    destination.rows.map((row) => row.market_hash_name)
+  );
+  let ownedCardCount = 0;
+  for (const card of request.cards) {
+    if (normalCardAppId(card.market_hash_name) !== destination.app_id) {
+      continue;
+    }
+    const soldQuantity =
+      card.market_hash_name === soldMarketHashName ? 1 : 0;
+    if (card.owned_quantity <= soldQuantity) {
+      continue;
+    }
+    if (missingHashes.has(card.market_hash_name)) {
+      return false;
+    }
+    ownedCardCount += 1;
+  }
+  return ownedCardCount === destination.owned_card_count;
+}
+
 function responseMatchesRequest(
   response: LevelUpOptimizationResponse,
   request: LevelUpOptimizationRequest
@@ -842,8 +1019,25 @@ function responseMatchesRequest(
   ) {
     return false;
   }
-  if (response.status !== "ready") {
+  const games = new Map(request.games.map((game) => [game.app_id, game]));
+  if (response.status === "unavailable") {
     return true;
+  }
+  if (response.status === "no_opportunity") {
+    const alternatives = response.exchange_alternatives;
+    if (alternatives === undefined) {
+      return true;
+    }
+    return alternatives.exchanges.every(
+      (exchange) =>
+        sourcePlanMatchesRequest(exchange.source, request, games) &&
+        destinationPlanMatchesRequest(
+          exchange.destination,
+          request,
+          games,
+          exchange.source.rows[0].market_hash_name
+        )
+    );
   }
   if (
     response.player.current_xp !== request.player_xp ||
@@ -851,58 +1045,18 @@ function responseMatchesRequest(
   ) {
     return false;
   }
-  const games = new Map(request.games.map((game) => [game.app_id, game]));
-  const sourceGame = games.get(response.source.app_id);
-  if (
-    sourceGame === undefined ||
-    response.source.game_name !== sourceGame.game_name ||
-    response.source.badge_level !== sourceGame.badge_level ||
-    (sourceGame.card_set_size !== null &&
-      response.source.set_size !== sourceGame.card_set_size)
-  ) {
+  if (!sourcePlanMatchesRequest(response.source, request, games)) {
     return false;
   }
   const sourceRow = response.source.rows[0];
-  const sourceOwnership = request.cards.find(
-    (card) => card.market_hash_name === sourceRow.market_hash_name
+  return response.destinations.every((destination) =>
+    destinationPlanMatchesRequest(
+      destination,
+      request,
+      games,
+      sourceRow.market_hash_name
+    )
   );
-  if (sourceOwnership === undefined || sourceOwnership.sellable_quantity < 1) {
-    return false;
-  }
-  for (const destination of response.destinations) {
-    const game = games.get(destination.app_id);
-    if (
-      game === undefined ||
-      destination.game_name !== game.game_name ||
-      destination.badge_level_before !== game.badge_level ||
-      (game.card_set_size !== null &&
-        destination.set_size !== game.card_set_size)
-    ) {
-      return false;
-    }
-    const missingHashes = new Set(
-      destination.rows.map((row) => row.market_hash_name)
-    );
-    let ownedCardCount = 0;
-    for (const card of request.cards) {
-      if (normalCardAppId(card.market_hash_name) !== destination.app_id) {
-        continue;
-      }
-      const soldQuantity =
-        card.market_hash_name === sourceRow.market_hash_name ? 1 : 0;
-      if (card.owned_quantity <= soldQuantity) {
-        continue;
-      }
-      if (missingHashes.has(card.market_hash_name)) {
-        return false;
-      }
-      ownedCardCount += 1;
-    }
-    if (ownedCardCount !== destination.owned_card_count) {
-      return false;
-    }
-  }
-  return true;
 }
 
 
