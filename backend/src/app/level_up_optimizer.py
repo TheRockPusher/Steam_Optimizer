@@ -7,6 +7,7 @@ server turns its cache rows into the small immutable values in this file and cal
 
 from __future__ import annotations
 
+import heapq
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from app.market_fees import (
 MIN_NORMAL_SET_SIZE = 5
 MAX_NORMAL_SET_SIZE = 15
 MAX_DESTINATION_SETS = 5
+MAX_EXCHANGE_ALTERNATIVES = 10
 NORMAL_BADGE_XP = 100
 MAX_APP_ID = 2_147_483_647
 MAX_HASH_LENGTH = 512
@@ -351,6 +353,36 @@ class DestinationPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ExchangeAlternative:
+    """One sell-one-card, craft-one-badge route that may need external funds.
+
+    Unlike a recommendation an alternative may run a funding deficit and may
+    gain no XP.  ``patient_seller_receipt`` and ``patient_purchase_total`` are
+    ``None`` whenever their order-book side cannot be priced exactly; both are
+    non-negative when present and ``patient_net`` is their difference.
+    """
+
+    source: SourcePlan
+    destination: DestinationPlan
+    foregone_craft_xp: int
+    instant_net: int
+    patient_seller_receipt: int | None
+    patient_purchase_total: int | None
+    patient_net: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeAlternatives:
+    """Bounded best alternatives sharing one strict quote-validity deadline."""
+
+    valid_until: datetime
+    exchanges: tuple[ExchangeAlternative, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exchanges", tuple(self.exchanges))
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerProjection:
     current_xp: int
     current_level: int
@@ -394,13 +426,14 @@ class LevelUpOptimizationResponse:
     source: SourcePlan | None = None
     destinations: tuple[DestinationPlan, ...] = ()
     totals: PlanTotals | None = None
+    exchange_alternatives: ExchangeAlternatives | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "destinations", tuple(self.destinations))
 
     def to_dict(self) -> dict[str, object]:
         """Return the exact flat wire shape consumed by the frontend."""
-        return {
+        result: dict[str, object] = {
             "status": self.status,
             "reason": self.reason,
             "generated_at": _json_value(self.generated_at),
@@ -419,6 +452,15 @@ class LevelUpOptimizationResponse:
             "destinations": [_destination_json(value) for value in self.destinations],
             "totals": _totals_json(self.totals),
         }
+        if self.exchange_alternatives is not None:
+            result["exchange_alternatives"] = {
+                "valid_until": _json_value(self.exchange_alternatives.valid_until),
+                "exchanges": [
+                    _exchange_json(item)
+                    for item in self.exchange_alternatives.exchanges
+                ],
+            }
+        return result
 
 
 def _sell_row_json(row: SellRow) -> dict[str, object]:
@@ -503,6 +545,18 @@ def _totals_json(totals: PlanTotals | None) -> dict[str, object] | None:
     }
 
 
+def _exchange_json(item: ExchangeAlternative) -> dict[str, object]:
+    return {
+        "source": _source_json(item.source),
+        "destination": _destination_json(item.destination),
+        "foregone_craft_xp": item.foregone_craft_xp,
+        "instant_net": item.instant_net,
+        "patient_seller_receipt": item.patient_seller_receipt,
+        "patient_purchase_total": item.patient_purchase_total,
+        "patient_net": item.patient_net,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _SideQuote:
     price_minor: int
@@ -568,6 +622,20 @@ class _SourceCandidate:
     totals: PlanTotals
     oldest_quote: timedelta
     card_actions: int
+
+
+@dataclass(slots=True)
+class _AlternativeCandidate:
+    """One ranked fallback alternative and its used-quote validity deadline."""
+
+    alternative: ExchangeAlternative
+    rank: tuple[int, int, int, str, int, tuple[str, ...]]
+    deadline: datetime
+
+    def __lt__(self, other: _AlternativeCandidate) -> bool:
+        # The bounded heap is a min-heap of candidates, i.e. a max-heap of
+        # ranks: popping always discards the worst alternative.
+        return self.rank > other.rank
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,7 +758,9 @@ def optimize_level_up(
     The catalog's generation and every quote are validated against the explicit
     clock before any plan is returned.  Destination plans are built and sorted
     once; each source only merges a possible same-app post-sale variant into
-    the first six sorted options.
+    the first six sorted options.  When no funded positive-XP plan exists, the
+    response instead carries the bounded best one-sale/one-craft exchange
+    alternatives.
     """
 
     if not isinstance(catalog, ResolvedCatalog):
@@ -782,6 +852,7 @@ def optimize_level_up(
 
         adjusted_destination: DestinationPlan | None = None
         replaced_index: int | None = None
+        adjusted_key: tuple[int, timedelta, int, int, tuple[str, ...]] | None = None
         if holding.owned_quantity == 1:
             adjusted_destination = _destination_plan(
                 source_set,
@@ -791,12 +862,15 @@ def optimize_level_up(
                 sold_hash=source_hash,
             )
             replaced_index = destination_indices.get(source_set.app_id)
+            if adjusted_destination is not None:
+                adjusted_key = _destination_sort_key(adjusted_destination, current)
         destination_candidates = _destination_prefix(
             destination_options,
             destination_keys,
-            current,
+            MAX_DESTINATION_SETS + 1,
             replaced_index,
             adjusted_destination,
+            adjusted_key,
         )
         if len(destination_candidates) < minimum_required_crafts:
             continue
@@ -857,6 +931,16 @@ def optimize_level_up(
 
     if not candidates:
         reason = "no_positive_xp_swap" if saw_source else "no_sellable_card"
+        exchange_alternatives = _exchange_alternatives(
+            holdings_by_hash,
+            badges,
+            cards_by_hash,
+            destination_quotes,
+            destination_options,
+            memo,
+            inventory_deadline=inventory_time + inventory_window_delta,
+            generation_deadline=catalog.generated_at + quote_window_delta,
+        )
         return LevelUpOptimizationResponse(
             status="no_opportunity",
             reason=reason,
@@ -869,6 +953,7 @@ def optimize_level_up(
             publisher_fee_bps=contract_value.publisher_fee_bps,
             min_fee_minor=contract_value.min_fee_minor,
             taxes_included=False,
+            exchange_alternatives=exchange_alternatives,
         )
 
     best = min(
@@ -1086,6 +1171,22 @@ def _destination_sort_key(
     )
 
 
+def _alternative_destination_key(
+    value: DestinationPlan,
+) -> tuple[int, int, tuple[str, ...]]:
+    """Order one destination by the shared fallback tie-break identities.
+
+    Alternatives rank ties by AppID and row hashes only, so their destination
+    prefixes must never order by quote age or row count; doing so could drop a
+    globally better tie candidate from a bounded prefix.
+    """
+    return (
+        value.missing_cards_total,
+        value.app_id,
+        tuple(row.market_hash_name for row in value.rows),
+    )
+
+
 def _destination_options(
     sets: Sequence[CatalogSet],
     holdings: Mapping[str, Holding],
@@ -1111,24 +1212,22 @@ def _destination_options(
     return tuple(options)
 
 
-def _destination_prefix(
+def _destination_prefix[DestinationSortKey: tuple[object, ...]](
     options: Sequence[DestinationPlan],
-    option_keys: Sequence[tuple[int, timedelta, int, int, tuple[str, ...]]],
-    now: datetime,
+    option_keys: Sequence[DestinationSortKey],
+    limit: int,
     replaced_index: int | None,
     adjusted: DestinationPlan | None,
+    adjusted_key: DestinationSortKey | None,
 ) -> tuple[DestinationPlan, ...]:
-    """Merge one same-app variant into sorted options and return six rows."""
+    """Merge one same-app variant into sorted options and return ``limit`` rows."""
 
     if replaced_index is None and adjusted is None:
-        return tuple(options[: MAX_DESTINATION_SETS + 1])
-    adjusted_key = (
-        _destination_sort_key(adjusted, now) if adjusted is not None else None
-    )
+        return tuple(options[:limit])
     selected: list[DestinationPlan] = []
     index = 0
     inserted = adjusted is None
-    while len(selected) < MAX_DESTINATION_SETS + 1:
+    while len(selected) < limit:
         while index < len(options) and index == replaced_index:
             index += 1
         if (
@@ -1145,6 +1244,193 @@ def _destination_prefix(
         selected.append(options[index])
         index += 1
     return tuple(selected)
+
+
+def _is_rebuy_no_opportunity(destination: DestinationPlan, sold_hash: str) -> bool:
+    """A post-sale destination missing only the sold card is a pure rebuy."""
+
+    return (
+        len(destination.rows) == 1 and destination.rows[0].market_hash_name == sold_hash
+    )
+
+
+def _patient_seller_receipt(
+    source_card: CatalogCard, memo: _QuoteMemo
+) -> tuple[int, datetime] | None:
+    """Exact receipt for listing the source card at the lowest ask, or ``None``.
+
+    The returned deadline covers the used lowest-ask quote.
+    """
+
+    quote = _side_quote(source_card, "sell", memo)
+    if quote is None:
+        return None
+    fees = memo.source_fees(quote.price_minor)
+    if fees is None:
+        return None
+    return fees[2], quote.timestamp + memo.quote_window
+
+
+def _patient_purchase_total(
+    destination: DestinationPlan,
+    cards_by_hash: Mapping[str, tuple[CatalogSet, CatalogCard]],
+    memo: _QuoteMemo,
+    cache: dict[DestinationPlan, tuple[int | None, datetime | None]],
+) -> tuple[int | None, datetime | None]:
+    """Exact buy-order total for the destination's missing cards, or ``None``.
+
+    One unusable ``highest_buy`` quote makes the whole total ``None`` instead
+    of a silently partial amount.  The returned deadline covers every used
+    quote and is ``None`` exactly when the total is ``None``.
+    """
+
+    cached = cache.get(destination)
+    if cached is not None:
+        return cached
+    total = 0
+    deadline: datetime | None = None
+    for row in destination.rows:
+        entry = cards_by_hash.get(row.market_hash_name)
+        quote = None if entry is None else _side_quote(entry[1], "buy", memo)
+        if quote is None:
+            result: tuple[int | None, datetime | None] = (None, None)
+            cache[destination] = result
+            return result
+        total += quote.price_minor
+        row_deadline = quote.timestamp + memo.quote_window
+        deadline = row_deadline if deadline is None else min(deadline, row_deadline)
+    result = (total, deadline)
+    cache[destination] = result
+    return result
+
+
+def _exchange_alternatives(
+    holdings_by_hash: Mapping[str, Holding],
+    badges: BadgeState,
+    cards_by_hash: Mapping[str, tuple[CatalogSet, CatalogCard]],
+    sell_quotes: Mapping[str, _SideQuote | None],
+    destination_options: Sequence[DestinationPlan],
+    memo: _QuoteMemo,
+    *,
+    inventory_deadline: datetime,
+    generation_deadline: datetime,
+) -> ExchangeAlternatives | None:
+    """Best one-sale/one-craft routes when no funded recommendation exists.
+
+    Destinations are re-ordered once by the shared fallback ranking (cost,
+    AppID, hashes); each source then walks only its first ten eligible
+    destinations, which that ranking proves sufficient for a global best ten.
+    Only quotes that end up on a selected alternative bound the deadline.
+    """
+
+    window = memo.quote_window
+    fallback_options = sorted(destination_options, key=_alternative_destination_key)
+    fallback_keys = [_alternative_destination_key(value) for value in fallback_options]
+    original_index_by_app = {
+        value.app_id: index for index, value in enumerate(fallback_options)
+    }
+    purchase_cache: dict[DestinationPlan, tuple[int | None, datetime | None]] = {}
+    heap: list[_AlternativeCandidate] = []
+    for source_hash in sorted(holdings_by_hash):
+        holding = holdings_by_hash[source_hash]
+        if holding.sellable_quantity < 1:
+            continue
+        source_set, source_card = cards_by_hash[source_hash]
+        source_rows = _source_rows(source_card, holdings_by_hash, memo)
+        if source_rows is None:
+            continue
+        source_level = badges.level_for_game(source_set.app_id)
+        source = _build_source_plan(source_set, source_level, source_rows)
+        before_crafts = _craftable_count(source_set, holdings_by_hash, source_level)
+        after_crafts = _craftable_count(
+            source_set,
+            holdings_by_hash,
+            source_level,
+            sold_hash=source_hash,
+        )
+        foregone_craft_xp = (before_crafts - after_crafts) * NORMAL_BADGE_XP
+        adjusted: DestinationPlan | None = None
+        replaced_index: int | None = None
+        if holding.owned_quantity == 1:
+            replaced_index = original_index_by_app.get(source_set.app_id)
+            adjusted = _destination_plan(
+                source_set,
+                holdings_by_hash,
+                badges,
+                sell_quotes,
+                sold_hash=source_hash,
+            )
+            if adjusted is not None and _is_rebuy_no_opportunity(adjusted, source_hash):
+                adjusted = None
+        adjusted_key = (
+            _alternative_destination_key(adjusted) if adjusted is not None else None
+        )
+        patient_seller = _patient_seller_receipt(source_card, memo)
+        for destination in _destination_prefix(
+            fallback_options,
+            fallback_keys,
+            MAX_EXCHANGE_ALTERNATIVES,
+            replaced_index,
+            adjusted,
+            adjusted_key,
+        ):
+            instant_net = source.seller_receipt - destination.missing_cards_total
+            patient_purchase, purchase_deadline = _patient_purchase_total(
+                destination,
+                cards_by_hash,
+                memo,
+                purchase_cache,
+            )
+            deadline = (
+                min(
+                    source.rows[0].quote_timestamp,
+                    *(row.quote_timestamp for row in destination.rows),
+                )
+                + window
+            )
+            if patient_seller is not None:
+                deadline = min(deadline, patient_seller[1])
+            if purchase_deadline is not None:
+                deadline = min(deadline, purchase_deadline)
+            patient_seller_receipt = (
+                patient_seller[0] if patient_seller is not None else None
+            )
+            patient_net = (
+                None
+                if patient_seller_receipt is None or patient_purchase is None
+                else patient_seller_receipt - patient_purchase
+            )
+            alternative = ExchangeAlternative(
+                source=source,
+                destination=destination,
+                foregone_craft_xp=foregone_craft_xp,
+                instant_net=instant_net,
+                patient_seller_receipt=patient_seller_receipt,
+                patient_purchase_total=patient_purchase,
+                patient_net=patient_net,
+            )
+            rank = (
+                -instant_net,
+                foregone_craft_xp - NORMAL_BADGE_XP,
+                source.app_id,
+                source_hash,
+                destination.app_id,
+                tuple(row.market_hash_name for row in destination.rows),
+            )
+            heapq.heappush(heap, _AlternativeCandidate(alternative, rank, deadline))
+            if len(heap) > MAX_EXCHANGE_ALTERNATIVES:
+                heapq.heappop(heap)
+    if not heap:
+        return None
+    ranked = sorted(heap, key=lambda candidate: candidate.rank)
+    return ExchangeAlternatives(
+        valid_until=min(
+            inventory_deadline,
+            generation_deadline,
+            *(candidate.deadline for candidate in ranked),
+        ),
+        exchanges=tuple(candidate.alternative for candidate in ranked),
+    )
 
 
 def _select_destinations(

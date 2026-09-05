@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -23,8 +24,10 @@ import {
   type LevelUpBooster,
   type LevelUpBuyRow,
   type LevelUpDestinationPlan,
+  type LevelUpExchangeAlternatives,
   type LevelUpInventoryItem,
   type LevelUpMoneyMetadata,
+  type LevelUpNoOpportunityResponse,
   type LevelUpOptimizationResponse,
   type LevelUpReason,
   type LevelUpReadyResponse,
@@ -140,14 +143,20 @@ function QuoteTime({ timestamp }: { timestamp: string }) {
   );
 }
 
-function MarketLink({ marketHashName }: { marketHashName: string }) {
+function MarketLink({
+  marketHashName,
+  children = "Open Steam Market listing"
+}: {
+  marketHashName: string;
+  children?: ReactNode;
+}) {
   return (
     <a
       href={buildSteamMarketListingUrl(marketHashName)}
       target="_blank"
       rel="noreferrer"
     >
-      Open Steam Market listing
+      {children}
     </a>
   );
 }
@@ -169,7 +178,29 @@ function Metric({
   );
 }
 
-function responseMoney(response: LevelUpReadyResponse): LevelUpMoneyMetadata {
+type MoneyFields = Pick<
+  LevelUpOptimizationResponse,
+  | "currency_code"
+  | "minor_digits"
+  | "price_basis"
+  | "steam_fee_bps"
+  | "publisher_fee_bps"
+  | "min_fee_minor"
+  | "taxes_included"
+>;
+
+function moneyMetadata(response: MoneyFields): LevelUpMoneyMetadata | null {
+  if (
+    response.currency_code === null ||
+    response.minor_digits === null ||
+    response.price_basis === null ||
+    response.steam_fee_bps === null ||
+    response.publisher_fee_bps === null ||
+    response.min_fee_minor === null ||
+    response.taxes_included === null
+  ) {
+    return null;
+  }
   return {
     currency_code: response.currency_code,
     minor_digits: response.minor_digits,
@@ -181,11 +212,34 @@ function responseMoney(response: LevelUpReadyResponse): LevelUpMoneyMetadata {
   };
 }
 
+function responseMoney(response: LevelUpReadyResponse): LevelUpMoneyMetadata {
+  const money = moneyMetadata(response);
+  if (money === null) {
+    throw new Error("The ready response is missing its currency contract.");
+  }
+  return money;
+}
+
 function formatAmount(
   amount: number,
   money: LevelUpMoneyMetadata
 ): string {
   return formatMinorUnits(amount, money.currency_code, money.minor_digits);
+}
+
+function formatSignedAmount(
+  amountMinor: number,
+  money: LevelUpMoneyMetadata
+): string {
+  if (amountMinor === 0) {
+    return formatAmount(0, money);
+  }
+  const magnitude = formatMinorUnits(
+    Math.abs(amountMinor),
+    money.currency_code,
+    money.minor_digits
+  );
+  return amountMinor < 0 ? `-${magnitude}` : `+${magnitude}`;
 }
 
 function SellTable({
@@ -490,9 +544,314 @@ function ReadyContent({
   );
 }
 
+function NetCell({
+  amount,
+  money
+}: {
+  amount: number;
+  money: LevelUpMoneyMetadata;
+}) {
+  const className =
+    amount > 0
+      ? "level-up-net level-up-net-gain"
+      : amount < 0
+        ? "level-up-net level-up-net-loss"
+        : "level-up-net";
+  return <span className={className}>{formatSignedAmount(amount, money)}</span>;
+}
+
+function MissingQuoteLabel() {
+  return <span className="level-up-missing-quote">No current quote</span>;
+}
+
+function ExchangeAlternativesTable({
+  alternatives,
+  steamId,
+  money,
+  sourceIcons
+}: {
+  alternatives: LevelUpExchangeAlternatives;
+  steamId: string | null;
+  money: LevelUpMoneyMetadata;
+  sourceIcons: ReadonlyMap<string, string>;
+}) {
+  return (
+    <div className="level-up-table-wrapper">
+      <table className="level-up-card-table level-up-exchange-table">
+        <caption>
+          One-card sale exchange alternatives ranked by instant net, then XP
+          advantage
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Card to sell</th>
+            <th scope="col">Estimated seller receipt</th>
+            <th scope="col">Destination badge</th>
+            <th scope="col">Missing cards to buy</th>
+            <th scope="col">Missing-card purchase total</th>
+            <th scope="col">XP advantage</th>
+            <th scope="col">Instant net (receipt minus purchases)</th>
+            <th scope="col">Patient sale receipt</th>
+            <th scope="col">Patient purchase total</th>
+            <th scope="col">Patient net</th>
+            <th scope="col">Quote time</th>
+          </tr>
+        </thead>
+        <tbody>
+          {alternatives.exchanges.map((exchange) => {
+            const sourceRow = exchange.source.rows[0];
+            const xpAdvantage = 100 - exchange.foregone_craft_xp;
+            return (
+              <tr
+                key={`${sourceRow.market_hash_name}\u0000${exchange.destination.app_id}`}
+              >
+                <th scope="row">
+                  <span className="level-up-sell-card-identity">
+                    {sourceIcons.has(sourceRow.market_hash_name) && (
+                      <img
+                        src={sourceIcons.get(sourceRow.market_hash_name)}
+                        alt=""
+                        className="level-up-sell-card-icon"
+                        loading="lazy"
+                      />
+                    )}
+                    <span>
+                      <span>{sourceRow.card_name}</span>
+                      <span className="level-up-market-hash">
+                        {sourceRow.market_hash_name}
+                      </span>
+                      <span className="level-up-exchange-source-game">
+                        {exchange.source.game_name} · normal badge level{" "}
+                        {exchange.source.badge_level}
+                      </span>
+                      <MarketLink marketHashName={sourceRow.market_hash_name}>
+                        Market listing
+                      </MarketLink>
+                    </span>
+                  </span>
+                </th>
+                <td>{formatAmount(sourceRow.seller_receipt, money)}</td>
+                <td className="level-up-exchange-destination">
+                  <strong>{exchange.destination.game_name}</strong>
+                  <span>
+                    Normal badge level {exchange.destination.badge_level_before}{" "}
+                    → {exchange.destination.badge_level_after};{" "}
+                    {exchange.destination.owned_card_count} of{" "}
+                    {exchange.destination.set_size} cards already owned.
+                  </span>
+                  {steamId !== null && (
+                    <a
+                      href={buildSteamProfileGamecardsUrl(
+                        steamId,
+                        exchange.destination.app_id
+                      )}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open Steam gamecards navigation
+                    </a>
+                  )}
+                </td>
+                <td className="level-up-exchange-destination">
+                  <span>
+                    Buy {exchange.destination.rows.length} missing{" "}
+                    {exchange.destination.rows.length === 1 ? "card" : "cards"}.
+                  </span>
+                  <ul className="level-up-exchange-missing-cards">
+                    {exchange.destination.rows.map((row) => (
+                      <li key={row.market_hash_name}>
+                        <MarketLink marketHashName={row.market_hash_name}>
+                          {row.card_name}
+                        </MarketLink>
+                      </li>
+                    ))}
+                  </ul>
+                </td>
+                <td>
+                  {formatAmount(exchange.destination.missing_cards_total, money)}
+                </td>
+                <td>
+                  {xpAdvantage > 0
+                    ? `+${formatXp(xpAdvantage)}`
+                    : formatXp(xpAdvantage)}
+                </td>
+                <td><NetCell amount={exchange.instant_net} money={money} /></td>
+                <td>
+                  {exchange.patient_seller_receipt === null ? (
+                    <MissingQuoteLabel />
+                  ) : (
+                    formatAmount(exchange.patient_seller_receipt, money)
+                  )}
+                </td>
+                <td>
+                  {exchange.patient_purchase_total === null ? (
+                    <MissingQuoteLabel />
+                  ) : (
+                    formatAmount(exchange.patient_purchase_total, money)
+                  )}
+                </td>
+                <td>
+                  {exchange.patient_net === null ? (
+                    <MissingQuoteLabel />
+                  ) : (
+                    <NetCell amount={exchange.patient_net} money={money} />
+                  )}
+                </td>
+                <td><QuoteTime timestamp={sourceRow.quote_timestamp} /></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function NoOpportunityContent({
+  response,
+  steamId,
+  alternativesExpired,
+  snapshotStale,
+  onRefresh,
+  onRefreshInventory,
+  sourceIcons
+}: {
+  response: LevelUpNoOpportunityResponse;
+  steamId: string | null;
+  alternativesExpired: boolean;
+  snapshotStale: boolean;
+  onRefresh: () => void;
+  onRefreshInventory: () => void;
+  sourceIcons: ReadonlyMap<string, string>;
+}) {
+  const alternatives = response.exchange_alternatives;
+  const money = alternatives === undefined ? null : moneyMetadata(response);
+  if (alternatives === undefined || money === null) {
+    return (
+      <StatusSurface status="no-opportunity" title="No one-card level-up opportunity">
+        <p>{REASON_COPY[response.reason]}</p>
+        <p>No manual action plan is shown because there is no strictly positive XP advantage to recommend.</p>
+      </StatusSurface>
+    );
+  }
+  const refresh = snapshotStale
+    ? { onClick: onRefreshInventory, label: "Refresh inventory" as const }
+    : { onClick: onRefresh, label: "Refresh recommendation" as const };
+  const firstQuote =
+    alternatives.exchanges[0]?.source.rows[0]?.quote_timestamp ??
+    response.generated_at;
+  return (
+    <StatusSurface status="no-opportunity" title="No one-card level-up opportunity">
+      <p>{REASON_COPY[response.reason]}</p>
+      <p>
+        No funded positive-XP swap exists right now. The alternatives below pair
+        one sellable card you own with the missing cards of one completable
+        normal badge. They are ranked estimates only: each may need extra wallet
+        funds, and some offer no XP advantage. Nothing is automated.
+      </p>
+      <div
+        className={
+          alternativesExpired
+            ? "level-up-ready level-up-ready-expired"
+            : "level-up-ready"
+        }
+      >
+        {alternativesExpired && (
+          <div className="level-up-expired-banner">
+            <strong>Alternative quotes expired.</strong> Live Steam values can
+            differ. Refresh before treating these comparisons as current.
+            <RefreshButton onClick={refresh.onClick}>{refresh.label}</RefreshButton>
+          </div>
+        )}
+        <div className="level-up-freshness-banner">
+          <div>
+            <strong>Exchange alternative estimates.</strong>
+            <span> Prices can move before any manual Steam navigation.</span>
+          </div>
+          <dl
+            className="level-up-fee-contract"
+            aria-label="Alternative quote and fee contract"
+          >
+            <Metric label="Currency" value={money.currency_code} />
+            <Metric label="Quote time" value={<QuoteTime timestamp={firstQuote} />} />
+            <Metric
+              label="Valid until"
+              value={
+                <time
+                  dateTime={alternatives.valid_until}
+                  title={formatAbsoluteTime(alternatives.valid_until)}
+                >
+                  {alternativesExpired
+                    ? "Expired"
+                    : formatRelativeTime(alternatives.valid_until)}
+                </time>
+              }
+            />
+            <Metric label="Price basis" value="Buyer total at instant top of book" />
+            <Metric label="Steam fee rate" value={formatFeeRate(money.steam_fee_bps)} />
+            <Metric
+              label="Game-publisher fee rate"
+              value={formatFeeRate(money.publisher_fee_bps)}
+            />
+            <Metric
+              label="Minimum per fee component"
+              value={formatAmount(money.min_fee_minor, money)}
+            />
+          </dl>
+          {!alternativesExpired && (
+            <RefreshButton onClick={refresh.onClick}>{refresh.label}</RefreshButton>
+          )}
+        </div>
+        <ExchangeAlternativesTable
+          alternatives={alternatives}
+          steamId={steamId}
+          money={money}
+          sourceIcons={sourceIcons}
+        />
+        <aside className="level-up-assumptions">
+          <h4>How to read the alternatives</h4>
+          <ul>
+            <li>
+              Instant net is the estimated seller receipt minus the missing-card
+              purchase total. A negative instant net needs extra wallet funds;
+              the shortfall is not covered by the sale.
+            </li>
+            <li>
+              Patient estimates assume the sale eventually fills at the current
+              lowest ask and each missing-card purchase eventually fills at the
+              current highest bid. These resting-order fills are uncertain and
+              can take a long time or never happen.
+            </li>
+            <li>
+              Patient cells show No current quote when a usable resting-order
+              depth quote is missing; no estimate is invented.
+            </li>
+            <li>
+              The same Steam and game-publisher fee contract as the
+              recommendation applies; the estimated seller receipt is the buyer
+              total minus both fee components.
+            </li>
+            <li>
+              Every step is manual: sell the source card on the Steam Market,
+              buy the listed missing cards, then craft the badge on its Steam
+              gamecards page.
+            </li>
+            <li>
+              Owned destination cards are reused; only the listed missing cards
+              are bought, using holdings after the one-card sale.
+            </li>
+          </ul>
+        </aside>
+      </div>
+    </StatusSurface>
+  );
+}
+
 function ResponseSurface({
   response,
   steamId,
+  snapshotStale,
+  alternativesExpired,
   onRefresh,
   onRefreshInventory,
   onRefreshBadges,
@@ -500,6 +859,8 @@ function ResponseSurface({
 }: {
   response: LevelUpOptimizationResponse;
   steamId: string | null;
+  snapshotStale: boolean;
+  alternativesExpired: boolean;
   onRefresh: () => void;
   onRefreshInventory: () => void;
   onRefreshBadges: () => void;
@@ -523,10 +884,15 @@ function ResponseSurface({
       );
     case "no_opportunity":
       return (
-        <StatusSurface status="no-opportunity" title="No one-card level-up opportunity">
-          <p>{REASON_COPY[response.reason]}</p>
-          <p>No manual action plan is shown because there is no strictly positive XP advantage to recommend.</p>
-        </StatusSurface>
+        <NoOpportunityContent
+          response={response}
+          steamId={steamId}
+          alternativesExpired={alternativesExpired}
+          snapshotStale={snapshotStale}
+          onRefresh={onRefresh}
+          onRefreshInventory={onRefreshInventory}
+          sourceIcons={sourceIcons}
+        />
       );
     case "unavailable":
       if (response.reason === "price_generation_refreshing") {
@@ -614,6 +980,10 @@ export function LevelUpOptimizationPanel({
   const tokenRef = useRef(0);
   const mountedRef = useRef(true);
   const [inventoryClock, setInventoryClock] = useState(Date.now);
+  const [expiredAlternatives, setExpiredAlternatives] = useState<{
+    key: string;
+    validUntil: string;
+  } | null>(null);
   const requestInput = useMemo(() => {
     try {
       return {
@@ -869,6 +1239,35 @@ export function LevelUpOptimizationPanel({
     return () => window.clearTimeout(timer);
   }, [state]);
 
+  useLayoutEffect(() => {
+    if (
+      !isActive ||
+      state.kind !== "response" ||
+      state.response.status !== "no_opportunity" ||
+      state.key !== snapshotKey ||
+      state.response.exchange_alternatives === undefined
+    ) {
+      return;
+    }
+    const validUntil = state.response.exchange_alternatives.valid_until;
+    const markExpired = () => {
+      setExpiredAlternatives((current) =>
+        current !== null &&
+        current.key === state.key &&
+        current.validUntil === validUntil
+          ? current
+          : { key: state.key, validUntil }
+      );
+    };
+    const delay = Date.parse(validUntil) - Date.now();
+    if (delay <= 0) {
+      markExpired();
+      return;
+    }
+    const timer = window.setTimeout(markExpired, delay + 1);
+    return () => window.clearTimeout(timer);
+  }, [isActive, snapshotKey, state]);
+
   const refreshRecommendation = useCallback(() => {
     if (
       snapshotKey !== null &&
@@ -929,6 +1328,15 @@ export function LevelUpOptimizationPanel({
         ? activeState.response
         : null;
   const badgeUnavailable = badges.status !== "public" || !badgeIsFresh;
+  const snapshotStale = !inventoryIsFresh || !badgeIsFresh;
+  const alternativesExpired =
+    activeState.kind === "response" &&
+    activeState.response.status === "no_opportunity" &&
+    activeState.response.exchange_alternatives !== undefined &&
+    expiredAlternatives !== null &&
+    expiredAlternatives.key === activeState.key &&
+    expiredAlternatives.validUntil ===
+      activeState.response.exchange_alternatives.valid_until;
   let content: ReactNode;
   if (!isActive) {
     content = null;
@@ -1023,6 +1431,8 @@ export function LevelUpOptimizationPanel({
       <ResponseSurface
         response={activeState.response}
         steamId={steamId}
+        snapshotStale={snapshotStale}
+        alternativesExpired={alternativesExpired}
         onRefresh={refreshRecommendation}
         onRefreshInventory={refreshInventory}
         onRefreshBadges={onRefreshBadges}
