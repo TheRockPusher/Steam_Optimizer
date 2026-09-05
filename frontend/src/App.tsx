@@ -14,7 +14,6 @@ import steamSignInWide from "./assets/steam/sits_01.png";
 import {
   isLevelUpIsoTimestamp,
   levelForXp,
-  minimumXpForLevel,
   type LevelUpNormalBadgeLevel
 } from "./levelUpOptimization";
 import {
@@ -26,9 +25,7 @@ import {
 } from "./inventoryCache";
 import "./App.css";
 
-const LevelUpOptimizationPanel = lazy(() =>
-  import("./LevelUpOptimizationPanel")
-);
+const BadgeWorkspace = lazy(() => import("./BadgeWorkspace"));
 
 type VisibilityStatus = "public" | "private" | "unavailable";
 
@@ -151,14 +148,16 @@ type InventoryViewDefinition = {
   tabId: string;
   panelId: string;
 };
-type InventoryResultView = "inventory" | "level-up";
+type WorkspaceSection = "badges" | "plan" | "inventory";
 
-type InventoryResultViewDefinition = {
-  key: InventoryResultView;
+type WorkspaceSectionDefinition = {
+  key: WorkspaceSection;
   label: string;
   tabId: string;
   panelId: string;
 };
+
+const EMPTY_BOOSTER_PACKS: readonly BoosterInfo[] = [];
 
 
 type InventoryCheck = VisibilityCheck & {
@@ -258,10 +257,9 @@ const MAX_BADGE_XP = 1_000_000_000_000;
 const MAX_BADGE_LEVEL = 100_000;
 const MAX_BADGE_APP_ID = 2_147_483_647;
 const MAX_NORMAL_BADGE_LEVEL_ROWS = 10_000;
-const MAX_LEVEL_UP_TARGET_LEVEL = 100_000;
+const GEM_MAX_APP_ID_LENGTH = 20;
 const MAX_RETRY_AFTER_SECONDS = 900;
 const MAX_DECIMAL_LENGTH = 16_384;
-const GEM_MAX_APP_ID_LENGTH = 20;
 const GEM_MAX_ITEM_TYPE = 1_000_000_000;
 const MAX_GEM_REFRESH_GROUPS = 10_000;
 const MAX_BOOSTER_REFRESH_GROUPS = 10_000;
@@ -350,18 +348,24 @@ const INVENTORY_VIEWS: ReadonlyArray<InventoryViewDefinition> = [
     panelId: "inventory-panel-worth-gems"
   }
 ];
-const INVENTORY_RESULT_VIEWS: ReadonlyArray<InventoryResultViewDefinition> = [
+const WORKSPACE_SECTIONS: ReadonlyArray<WorkspaceSectionDefinition> = [
+  {
+    key: "badges",
+    label: "Badges",
+    tabId: "workspace-tab-badges",
+    panelId: "workspace-panel-planning"
+  },
+  {
+    key: "plan",
+    label: "Plan",
+    tabId: "workspace-tab-plan",
+    panelId: "workspace-panel-planning"
+  },
   {
     key: "inventory",
     label: "Inventory",
-    tabId: "inventory-results-tab-inventory",
-    panelId: "inventory-results-panel-inventory"
-  },
-  {
-    key: "level-up",
-    label: "Level-up",
-    tabId: "inventory-results-tab-level-up",
-    panelId: "inventory-results-panel-level-up"
+    tabId: "workspace-tab-inventory",
+    panelId: "workspace-panel-inventory"
   }
 ];
 
@@ -2731,171 +2735,7 @@ function inventoryGemCoverageMessage(inventory: InventoryCheck): string {
     }.`;
 }
 
-function LevelUpCalculator({ badges }: { badges: BadgeCheck }) {
-  const currentXp = badges.status === "public" ? badges.player_xp : null;
-  const currentLevel = badges.status === "public" ? badges.player_level : null;
-  const [targetLevelInput, setTargetLevelInput] = useState(
-    currentLevel === null ? "" : String(currentLevel)
-  );
-  const previousCurrentLevelRef = useRef(currentLevel);
-  useEffect(() => {
-    const previousCurrentLevel = previousCurrentLevelRef.current;
-    setTargetLevelInput((currentTarget) => {
-      if (currentLevel === null) {
-        return "";
-      }
-
-      const trimmedTarget = currentTarget.trim();
-      const parsedTarget = /^[0-9]+$/.test(trimmedTarget)
-        ? Number(trimmedTarget)
-        : Number.NaN;
-      const wasPreviousDefault =
-        previousCurrentLevel !== null &&
-        trimmedTarget === String(previousCurrentLevel);
-      if (
-        trimmedTarget.length === 0 ||
-        wasPreviousDefault ||
-        !Number.isSafeInteger(parsedTarget) ||
-        parsedTarget < currentLevel
-      ) {
-        return String(currentLevel);
-      }
-      return currentTarget;
-    });
-    previousCurrentLevelRef.current = currentLevel;
-  }, [currentLevel]);
-
-  const calculation = useMemo(() => {
-    if (currentXp === null || currentLevel === null) {
-      return {
-        error: null,
-        xpNeeded: null,
-        badgesNeeded: null
-      };
-    }
-
-    const trimmedInput = targetLevelInput.trim();
-    if (!/^[0-9]+$/.test(trimmedInput)) {
-      return {
-        error: `Target level must be a whole number from ${currentLevel} to ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
-        xpNeeded: null,
-        badgesNeeded: null
-      };
-    }
-
-    const targetLevel = Number(trimmedInput);
-    if (!Number.isSafeInteger(targetLevel)) {
-      return {
-        error: `Target level must be a whole number from ${currentLevel} to ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
-        xpNeeded: null,
-        badgesNeeded: null
-      };
-    }
-    if (targetLevel < currentLevel) {
-      return {
-        error: `Target level cannot be below your current level (${currentLevel}).`,
-        xpNeeded: null,
-        badgesNeeded: null
-      };
-    }
-    if (targetLevel > MAX_LEVEL_UP_TARGET_LEVEL) {
-      return {
-        error: `Target level cannot exceed ${MAX_LEVEL_UP_TARGET_LEVEL}.`,
-        xpNeeded: null,
-        badgesNeeded: null
-      };
-    }
-
-    const xpNeeded = Math.max(
-      0,
-      minimumXpForLevel(targetLevel) - currentXp
-    );
-    return {
-      error: null,
-      xpNeeded,
-      badgesNeeded: Math.ceil(xpNeeded / 100)
-    };
-  }, [currentLevel, currentXp, targetLevelInput]);
-
-  const targetErrorId = "level-up-target-level-error";
-  const hasBadgeData = currentXp !== null && currentLevel !== null;
-
-  return (
-    <section
-      className="level-up-calculator"
-      aria-labelledby="level-up-calculator-title"
-    >
-      <p className="section-label">Badge progress</p>
-      <h3 id="level-up-calculator-title">Level-up calculator</h3>
-      {hasBadgeData ? (
-        <p className="level-up-calculator-copy">
-          Estimate the XP and badges required to reach a target Steam level.
-        </p>
-      ) : (
-        <p className="level-up-calculator-unavailable" role="status">
-          Badge data is unavailable: {badges.message}
-        </p>
-      )}
-      <dl className="level-up-calculator-metrics">
-        <div>
-          <dt>Current total XP</dt>
-          <dd>
-            {currentXp === null
-              ? "Unavailable"
-              : `${INVENTORY_COUNT_FORMATTER.format(currentXp)} XP`}
-          </dd>
-        </div>
-        <div>
-          <dt>Current level</dt>
-          <dd>
-            {currentLevel === null
-              ? "Unavailable"
-              : INVENTORY_COUNT_FORMATTER.format(currentLevel)}
-          </dd>
-        </div>
-        {calculation?.error === null && calculation.xpNeeded !== null && (
-          <>
-            <div>
-              <dt>XP needed</dt>
-              <dd>{INVENTORY_COUNT_FORMATTER.format(calculation.xpNeeded)} XP</dd>
-            </div>
-            <div>
-              <dt>Badges needed</dt>
-              <dd>{INVENTORY_COUNT_FORMATTER.format(calculation.badgesNeeded ?? 0)}</dd>
-            </div>
-          </>
-        )}
-      </dl>
-      <label className="level-up-target-field" htmlFor="level-up-target-level">
-        <span>Target level</span>
-        <input
-          id="level-up-target-level"
-          type="number"
-          inputMode="numeric"
-          min={currentLevel ?? undefined}
-          max={MAX_LEVEL_UP_TARGET_LEVEL}
-          step={1}
-          value={targetLevelInput}
-          disabled={!hasBadgeData}
-          aria-invalid={calculation?.error !== null}
-          aria-describedby={calculation?.error !== null ? targetErrorId : undefined}
-          onChange={(event) => setTargetLevelInput(event.currentTarget.value)}
-        />
-      </label>
-      {calculation?.error !== null && (
-        <p
-          id={targetErrorId}
-          className="level-up-target-error"
-          role="alert"
-        >
-          {calculation.error}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function LevelUpOptimizationShell({
+function WorkspaceShell({
   statusMessage,
   children
 }: {
@@ -2903,15 +2743,15 @@ function LevelUpOptimizationShell({
   children?: ReactNode;
 }) {
   return (
-    <section className="level-up-optimization-panel">
-      <h2>Level-up optimization</h2>
-      <p role="status">{statusMessage}</p>
+    <section className="workspace-shell">
+      <h3>Badge workspace</h3>
+      <p aria-live="polite">{statusMessage}</p>
       {children}
     </section>
   );
 }
 
-class LevelUpPanelBoundary extends Component<
+class WorkspaceBoundary extends Component<
   { children: ReactNode },
   { failed: boolean }
 > {
@@ -2926,250 +2766,308 @@ class LevelUpPanelBoundary extends Component<
       return this.props.children;
     }
     return (
-      <LevelUpOptimizationShell statusMessage="Level-up optimization could not load. Your inventory is still available.">
+      <WorkspaceShell statusMessage="The badge workspace could not load. Your inventory is still available.">
         <button
           type="button"
-          className="secondary-button"
+          className="secondary-action"
           onClick={() => window.location.reload()}
         >
           Reload application
         </button>
-      </LevelUpOptimizationShell>
+      </WorkspaceShell>
     );
   }
 }
 
-const InventoryResults = memo(function InventoryResults({
-  inventory,
+function WorkspaceHeader({
+  badges,
+  inventoryState,
+  isRefreshingInventory,
+  isInventoryRefreshDisabled,
+  retryAfterSeconds,
+  onRefreshInventory
+}: {
+  badges: BadgeCheck;
+  inventoryState: InventoryState;
+  isRefreshingInventory: boolean;
+  isInventoryRefreshDisabled: boolean;
+  retryAfterSeconds: number;
+  onRefreshInventory: () => void;
+}) {
+  const hasBadgeData =
+    badges.status === "public" &&
+    badges.player_level !== null &&
+    badges.player_xp !== null;
+  const levelSummary = hasBadgeData
+    ? `Level ${INVENTORY_COUNT_FORMATTER.format(badges.player_level ?? 0)} · ${INVENTORY_COUNT_FORMATTER.format(badges.player_xp ?? 0)} XP`
+    : "Level and XP unavailable";
+
+  return (
+    <header className="workspace-header">
+      <div className="workspace-header-titles">
+        <p className="section-label">Badge workspace</p>
+        <h2 id="workspace-title">Badges, planning, and inventory</h2>
+        <p className="workspace-level-summary" aria-label="Current Steam level summary">
+          {levelSummary}
+        </p>
+      </div>
+      <div className="inventory-cache-toolbar">
+        <p className="inventory-cache-status" aria-live="polite">
+          {inventoryState.refreshedAt !== null ? (
+            <>
+              Inventory last refreshed{" "}
+              <time dateTime={inventoryState.refreshedAt}>
+                {formatPriceTimestamp(inventoryState.refreshedAt)}
+              </time>
+              {inventoryState.source === "cache" ? " (cached)" : ""}.
+            </>
+          ) : inventoryState.isLoading ? (
+            "Checking your Steam inventory…"
+          ) : (
+            inventoryState.message ?? "Inventory has not been loaded yet."
+          )}
+        </p>
+        <button
+          className="secondary-action"
+          type="button"
+          onClick={onRefreshInventory}
+          disabled={isInventoryRefreshDisabled}
+          aria-describedby={
+            retryAfterSeconds > 0 ? "inventory-cooldown" : undefined
+          }
+        >
+          {isRefreshingInventory
+            ? "Refreshing inventory…"
+            : inventoryState.isLoading
+              ? "Checking inventory…"
+              : "Refresh inventory"}
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function WorkspaceTabs({
+  activeSection,
+  onActivate
+}: {
+  activeSection: WorkspaceSection;
+  onActivate: (section: WorkspaceSection) => void;
+}) {
+  const sectionTabRefs = useRef<
+    Record<WorkspaceSection, HTMLButtonElement | null>
+  >({
+    badges: null,
+    plan: null,
+    inventory: null
+  });
+
+  return (
+    <div
+      className="inventory-view-tabs workspace-tabs"
+      role="tablist"
+      aria-label="Workspace sections"
+    >
+      {WORKSPACE_SECTIONS.map((section, index) => {
+        const isActive = activeSection === section.key;
+
+        return (
+          <button
+            key={section.key}
+            ref={(element) => {
+              sectionTabRefs.current[section.key] = element;
+            }}
+            className="inventory-view-tab"
+            id={section.tabId}
+            type="button"
+            role="tab"
+            aria-controls={section.panelId}
+            aria-selected={isActive}
+            tabIndex={isActive ? 0 : -1}
+            onClick={() => onActivate(section.key)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onActivate(section.key);
+                sectionTabRefs.current[section.key]?.focus();
+                return;
+              }
+
+              let nextIndex: number | null = null;
+              if (event.key === "ArrowLeft") {
+                nextIndex =
+                  (index - 1 + WORKSPACE_SECTIONS.length) %
+                  WORKSPACE_SECTIONS.length;
+              } else if (event.key === "ArrowRight") {
+                nextIndex = (index + 1) % WORKSPACE_SECTIONS.length;
+              } else if (event.key === "Home") {
+                nextIndex = 0;
+              } else if (event.key === "End") {
+                nextIndex = WORKSPACE_SECTIONS.length - 1;
+              }
+
+              if (nextIndex === null) {
+                return;
+              }
+
+              event.preventDefault();
+              sectionTabRefs.current[
+                WORKSPACE_SECTIONS[nextIndex].key
+              ]?.focus();
+            }}
+          >
+            {section.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const WorkspaceMount = memo(function WorkspaceMount({
   steamId,
+  inventoryStatus,
+  items,
+  boosters,
   badges,
   inventoryRefreshedAt,
   isInventoryLoading,
+  isActive,
+  view,
+  onRefreshInventory,
+  onRefreshBadges
+}: {
+  steamId: string;
+  inventoryStatus: VisibilityStatus;
+  items: readonly InventoryItem[];
+  boosters: readonly BoosterInfo[];
+  badges: BadgeCheck;
+  inventoryRefreshedAt: string | null;
+  isInventoryLoading: boolean;
+  isActive: boolean;
+  view: "badges" | "plan";
+  onRefreshInventory: () => void;
+  onRefreshBadges: () => void;
+}) {
+  return (
+    <WorkspaceBoundary>
+      <Suspense
+        fallback={
+          <WorkspaceShell statusMessage="Loading badge workspace…" />
+        }
+      >
+        <BadgeWorkspace
+          key={steamId}
+          steamId={steamId}
+          inventoryStatus={inventoryStatus}
+          items={items}
+          boosters={boosters}
+          badges={badges}
+          inventoryRefreshedAt={inventoryRefreshedAt}
+          isInventoryLoading={isInventoryLoading}
+          isActive={isActive}
+          view={view}
+          onRefreshInventory={onRefreshInventory}
+          onRefreshBadges={onRefreshBadges}
+        />
+      </Suspense>
+    </WorkspaceBoundary>
+  );
+});
+
+const InventoryPanel = memo(function InventoryPanel({
+  inventory,
+  profile,
+  isInventoryLoading,
   gemCashBasis,
-  inventoryMessage,
   isRefreshingGems,
   refreshMessage,
-  onRefreshInventory,
-  onRefreshBadges,
   onGemCashBasisChange,
   onRefreshGems
 }: {
   inventory: InventoryCheck | null;
-  steamId: string;
-  badges: BadgeCheck;
-  inventoryRefreshedAt: string | null;
+  profile: VisibilityCheck;
   isInventoryLoading: boolean;
   gemCashBasis: GemCashBasis;
-  inventoryMessage: string | null;
   isRefreshingGems: boolean;
   refreshMessage: string | null;
-  onRefreshInventory: () => void;
-  onRefreshBadges: () => void;
   onGemCashBasisChange: (basis: GemCashBasis) => void;
   onRefreshGems: () => void;
 }) {
   const isPublicInventory = inventory?.status === "public";
-  const [activeResultView, setActiveResultView] =
-    useState<InventoryResultView>("inventory");
-  const [hasActivatedLevelUp, setHasActivatedLevelUp] = useState(false);
-  const resultTabRefs = useRef<
-    Record<InventoryResultView, HTMLButtonElement | null>
-  >({
-    inventory: null,
-    "level-up": null
-  });
-
-  function activateResultView(
-    view: InventoryResultView,
-    focusTab = false
-  ) {
-    setActiveResultView(view);
-    if (view === "level-up") {
-      setHasActivatedLevelUp(true);
-    }
-    if (focusTab) {
-      resultTabRefs.current[view]?.focus();
-    }
-  }
 
   return (
-    <section className="inventory-results" aria-labelledby="inventory-results-title">
-      <div className="inventory-results-heading">
-        <div>
-          <p className="section-label">Inventory</p>
-          <h2 id="inventory-results-title">Inventory and level-up planning</h2>
-        </div>
-      </div>
+    <div className="inventory-panel">
       {refreshMessage !== null && (
         <p className="inventory-refresh-status" aria-live="polite">
           {refreshMessage}
         </p>
       )}
-      <div
-        className="inventory-view-tabs inventory-result-tabs"
-        role="tablist"
-        aria-label="Inventory result views"
-      >
-        {INVENTORY_RESULT_VIEWS.map((view, index) => {
-          const isActive = activeResultView === view.key;
-
-          return (
-            <button
-              key={view.key}
-              ref={(element) => {
-                resultTabRefs.current[view.key] = element;
-              }}
-              className="inventory-view-tab"
-              id={view.tabId}
-              type="button"
-              role="tab"
-              aria-controls={view.panelId}
-              aria-selected={isActive}
-              tabIndex={isActive ? 0 : -1}
-              onClick={() => activateResultView(view.key, true)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  activateResultView(view.key, true);
-                  return;
-                }
-
-                let nextIndex: number | null = null;
-                if (event.key === "ArrowLeft") {
-                  nextIndex =
-                    (index - 1 + INVENTORY_RESULT_VIEWS.length) %
-                    INVENTORY_RESULT_VIEWS.length;
-                } else if (event.key === "ArrowRight") {
-                  nextIndex = (index + 1) % INVENTORY_RESULT_VIEWS.length;
-                } else if (event.key === "Home") {
-                  nextIndex = 0;
-                } else if (event.key === "End") {
-                  nextIndex = INVENTORY_RESULT_VIEWS.length - 1;
-                }
-
-                if (nextIndex === null) {
-                  return;
-                }
-
-                event.preventDefault();
-                resultTabRefs.current[
-                  INVENTORY_RESULT_VIEWS[nextIndex].key
-                ]?.focus();
-              }}
-            >
-              {view.label}
-            </button>
-          );
-        })}
-      </div>
-
-      <div
-        className="inventory-view-panel"
-        id="inventory-results-panel-inventory"
-        role="tabpanel"
-        aria-labelledby="inventory-results-tab-inventory"
-        tabIndex={activeResultView === "inventory" ? 0 : -1}
-        hidden={activeResultView !== "inventory"}
-      >
-        {inventory === null ? (
-          <div className="inventory-empty">
-            <h3>
-              {isInventoryLoading ? "Loading inventory…" : "Inventory unavailable"}
-            </h3>
-            <p>
-              {isInventoryLoading
-                ? "Checking your Steam inventory while badge progress remains available."
-                : inventoryMessage ??
-                "Steam inventory data is unavailable. Refresh when the service is available."}
-            </p>
-          </div>
-        ) : (
-          <>
-            <InventoryPricingSummary
-              inventory={inventory}
+      {inventory === null ? (
+        <div className="inventory-empty">
+          <h3>
+            {isInventoryLoading ? "Loading inventory…" : "Inventory unavailable"}
+          </h3>
+          <p>
+            {isInventoryLoading
+              ? "Checking your Steam inventory while badge progress remains available."
+              : "Steam inventory data is unavailable. Refresh when the service is available."}
+          </p>
+        </div>
+      ) : (
+        <>
+          <InventoryPricingSummary
+            inventory={inventory}
+            gemCashBasis={gemCashBasis}
+            isRefreshingGems={isRefreshingGems}
+            onGemCashBasisChange={onGemCashBasisChange}
+            onRefreshGems={onRefreshGems}
+          />
+          {inventory.items.length > 0 ? (
+            <InventoryBrowser
+              key={inventory.unique_item_count}
+              items={inventory.items}
+              gemCashContext={inventory.gem_cash_context}
               gemCashBasis={gemCashBasis}
-              isRefreshingGems={isRefreshingGems}
-              onGemCashBasisChange={onGemCashBasisChange}
-              onRefreshGems={onRefreshGems}
             />
-            {inventory.items.length > 0 ? (
-              <InventoryBrowser
-                key={inventory.unique_item_count}
-                items={inventory.items}
-                gemCashContext={inventory.gem_cash_context}
-                gemCashBasis={gemCashBasis}
-              />
-            ) : (
-              <div className="inventory-empty">
-                <h3>
-                  {isPublicInventory
-                    ? "No inventory items to display"
-                    : "Inventory items unavailable"}
-                </h3>
-                <p>
-                  {isPublicInventory
-                    ? "Steam returned a public inventory with no items. Recheck after your inventory changes."
-                    : inventory.message}
-                </p>
-              </div>
-            )}
-            {inventory.boosters.length > 0 ? (
-              <BoosterResults boosters={inventory.boosters} />
-            ) : (
-              <div className="inventory-empty">
-                <h3>
-                  {isPublicInventory
-                    ? "No booster packs to display"
-                    : "Booster details unavailable"}
-                </h3>
-                <p>
-                  {isPublicInventory
-                    ? "No trading-card games were identified in this inventory, so there are no related booster packs to display."
-                    : inventory.message}
-                </p>
-              </div>
-            )}
-          </>
-        )}
-      </div>
-
-      <div
-        className="inventory-view-panel"
-        id="inventory-results-panel-level-up"
-        role="tabpanel"
-        aria-labelledby="inventory-results-tab-level-up"
-        tabIndex={activeResultView === "level-up" ? 0 : -1}
-        hidden={activeResultView !== "level-up"}
-      >
-        <LevelUpCalculator
-          key={`level-up-calculator-${steamId}`}
-          badges={badges}
-        />
-        {hasActivatedLevelUp && (
-          <LevelUpPanelBoundary>
-            <Suspense
-              fallback={
-                <LevelUpOptimizationShell statusMessage="Loading level-up optimization…" />
-              }
-            >
-              <LevelUpOptimizationPanel
-                key={`level-up-optimizer-${steamId}-${badges.status}-${badges.checked_at ?? "missing"}`}
-                steamId={steamId}
-                inventoryStatus={inventory?.status ?? "unavailable"}
-                items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
-                boosters={inventory?.boosters ?? []}
-                badges={badges}
-                inventoryRefreshedAt={inventoryRefreshedAt}
-                isInventoryLoading={isInventoryLoading}
-                isActive={activeResultView === "level-up"}
-                onRefreshInventory={onRefreshInventory}
-                onRefreshBadges={onRefreshBadges}
-              />
-            </Suspense>
-          </LevelUpPanelBoundary>
-        )}
-      </div>
-    </section>
+          ) : (
+            <div className="inventory-empty">
+              <h3>
+                {isPublicInventory
+                  ? "No inventory items to display"
+                  : "Inventory items unavailable"}
+              </h3>
+              <p>
+                {isPublicInventory
+                  ? "Steam returned a public inventory with no items. Recheck after your inventory changes."
+                  : inventory.message}
+              </p>
+            </div>
+          )}
+          {inventory.boosters.length > 0 ? (
+            <BoosterResults boosters={inventory.boosters} />
+          ) : (
+            <div className="inventory-empty">
+              <h3>
+                {isPublicInventory
+                  ? "No booster packs to display"
+                  : "Booster details unavailable"}
+              </h3>
+              <p>
+                {isPublicInventory
+                  ? "No trading-card games were identified in this inventory, so there are no related booster packs to display."
+                  : inventory.message}
+              </p>
+            </div>
+          )}
+          <InventoryFaq
+            profile={profile}
+            inventory={inventory}
+            gemCashBasis={gemCashBasis}
+          />
+        </>
+      )}
+    </div>
   );
 });
 
@@ -3358,12 +3256,16 @@ function SignedInView({
 }) {
   const [gemCashBasis, setGemCashBasis] =
     useState<GemCashBasis>("lowest_sell");
+  const [activeSection, setActiveSection] =
+    useState<WorkspaceSection>("badges");
+  const isWorkspaceHidden = activeSection === "inventory";
   const isInventoryRefreshDisabled =
     isRefreshingInventory ||
     inventoryState.isLoading ||
     isRechecking ||
     isRefreshingGems ||
     retryAfterSeconds > 0;
+  const inventory = inventoryState.inventory;
 
   return (
     <section className="account-view">
@@ -3387,61 +3289,66 @@ function SignedInView({
           {retryAfterSeconds}s.
         </p>
       )}
-      <div className="inventory-cache-toolbar">
-        <p className="inventory-cache-status" aria-live="polite">
-          {inventoryState.refreshedAt !== null ? (
-            <>
-              Inventory last refreshed{" "}
-              <time dateTime={inventoryState.refreshedAt}>
-                {formatPriceTimestamp(inventoryState.refreshedAt)}
-              </time>
-              {inventoryState.source === "cache" ? " (cached)" : ""}.
-            </>
-          ) : inventoryState.isLoading ? (
-            "Checking your Steam inventory…"
-          ) : (
-            inventoryState.message ?? "Inventory has not been loaded yet."
-          )}
-        </p>
-        <button
-          className="secondary-action"
-          type="button"
-          onClick={onRefreshInventory}
-          disabled={isInventoryRefreshDisabled}
-          aria-describedby={
-            retryAfterSeconds > 0 ? "inventory-cooldown" : undefined
-          }
-        >
-          {isRefreshingInventory
-            ? "Refreshing inventory…"
-            : inventoryState.isLoading
-              ? "Checking inventory…"
-              : "Refresh inventory"}
-        </button>
+
+      <WorkspaceHeader
+        badges={session.checks.badges}
+        inventoryState={inventoryState}
+        isRefreshingInventory={isRefreshingInventory}
+        isInventoryRefreshDisabled={isInventoryRefreshDisabled}
+        retryAfterSeconds={retryAfterSeconds}
+        onRefreshInventory={onRefreshInventory}
+      />
+
+      <WorkspaceTabs
+        activeSection={activeSection}
+        onActivate={setActiveSection}
+      />
+
+      <div
+        className="inventory-view-panel workspace-panel"
+        id="workspace-panel-planning"
+        role="tabpanel"
+        aria-labelledby={
+          activeSection === "plan"
+            ? "workspace-tab-plan"
+            : "workspace-tab-badges"
+        }
+        tabIndex={isWorkspaceHidden ? -1 : 0}
+        hidden={isWorkspaceHidden}
+      >
+        <WorkspaceMount
+          steamId={session.user.steam_id}
+          inventoryStatus={inventory?.status ?? "unavailable"}
+          items={inventory?.items ?? EMPTY_INVENTORY_ITEMS}
+          boosters={inventory?.boosters ?? EMPTY_BOOSTER_PACKS}
+          badges={session.checks.badges}
+          inventoryRefreshedAt={inventoryState.refreshedAt}
+          isInventoryLoading={inventoryState.isLoading}
+          isActive={!isWorkspaceHidden}
+          view={activeSection === "plan" ? "plan" : "badges"}
+          onRefreshInventory={onRefreshInventory}
+          onRefreshBadges={onRefreshBadges}
+        />
       </div>
 
-      <InventoryResults
-        inventory={inventoryState.inventory}
-        steamId={session.user.steam_id}
-        badges={session.checks.badges}
-        inventoryRefreshedAt={inventoryState.refreshedAt}
-        isInventoryLoading={inventoryState.isLoading}
-        gemCashBasis={gemCashBasis}
-        inventoryMessage={inventoryState.message}
-        isRefreshingGems={isRefreshingGems}
-        refreshMessage={gemRefreshMessage}
-        onRefreshInventory={onRefreshInventory}
-        onRefreshBadges={onRefreshBadges}
-        onGemCashBasisChange={setGemCashBasis}
-        onRefreshGems={onRefreshGems}
-      />
-      {inventoryState.inventory !== null && (
-        <InventoryFaq
+      <div
+        className="inventory-view-panel workspace-panel"
+        id="workspace-panel-inventory"
+        role="tabpanel"
+        aria-labelledby="workspace-tab-inventory"
+        hidden={!isWorkspaceHidden}
+      >
+        <InventoryPanel
+          inventory={inventory}
           profile={session.checks.profile}
-          inventory={inventoryState.inventory}
+          isInventoryLoading={inventoryState.isLoading}
           gemCashBasis={gemCashBasis}
+          isRefreshingGems={isRefreshingGems}
+          refreshMessage={gemRefreshMessage}
+          onGemCashBasisChange={setGemCashBasis}
+          onRefreshGems={onRefreshGems}
         />
-      )}
+      </div>
     </section>
   );
 }
@@ -4193,9 +4100,44 @@ function HomePage() {
       <main id="main-content" className="page-main">
         {viewState.kind !== "signed-in" && (
           <section className="hero" aria-labelledby="page-title">
-            <h1 id="page-title">Compare your Steam inventory.</h1>
+            <h1 id="page-title">
+              Plan badge crafting around your own inventory.
+            </h1>
             <p className="hero-copy">
-              Check public access, market prices, and card gem values.
+              Sign in with Steam to review the badges, trading cards, and
+              prices Steam already exposes publicly, then decide what to craft
+              next. Steam Optimizer is read-only: it never trades, sells,
+              crafts, buys, or changes your account, and every suggestion
+              stays a manual action you take on Steam.
+            </p>
+            <dl className="hero-workflows">
+              <div>
+                <dt>Badges</dt>
+                <dd>
+                  Scan your normal game badges for craftable sets, closest
+                  completions, and games you protected or excluded.
+                </dd>
+              </div>
+              <div>
+                <dt>Plan</dt>
+                <dd>
+                  Set a target level or a Steam Wallet budget, then compare
+                  cheapest, fewest-purchase, and card-preserving plans before
+                  buying anything.
+                </dd>
+              </div>
+              <div>
+                <dt>Inventory</dt>
+                <dd>
+                  Price your items, compare gem values, and review booster
+                  packs with exact coverage of what Steam reported.
+                </dd>
+              </div>
+            </dl>
+            <p className="hero-note">
+              Your Steam password never reaches this app. Plans are estimates
+              from the latest snapshot and expire with it; confirm every
+              purchase and craft on Steam itself.
             </p>
           </section>
         )}
@@ -4248,9 +4190,9 @@ function FaqPage() {
       <main id="main-content" className="page-main faq-main">
         <header className="faq-hero">
           <p className="eyebrow">FAQ</p>
-          <h1>Steam inventory questions, answered.</h1>
+          <h1>Steam badge planning questions, answered.</h1>
           <p className="hero-copy">
-            The details on access, pricing, gems, and privacy.
+            The details on access, planning, pricing, gems, and privacy.
           </p>
         </header>
 
@@ -4265,6 +4207,55 @@ function FaqPage() {
             <p>
               Sign-in is handled by Steam Community. Your Steam password never
               reaches this app.
+            </p>
+          </section>
+
+          <section id="badge-workspace">
+            <h2>What does the Badges tab cover?</h2>
+            <p>
+              The Badges tab summarizes the normal game badges your trading
+              cards can build: craftable sets, closest completions, maxed
+              badges, and games you excluded or protected. Only normal game
+              badges represented by your inventory are listed; event badges,
+              foil sets, and badges outside your inventory are out of scope.
+            </p>
+          </section>
+
+          <section id="planner-modes">
+            <h2>How do target-level and budget plans work?</h2>
+            <p>
+              Plan mode reaches a target Steam level with the least purchase
+              spend, and reports a shortfall when the snapshot cannot reach it.
+              Budget mode maximizes craft XP under the Steam Wallet ceiling you
+              enter. Both compare cheapest, fewest-purchase, and
+              card-preserving policies using the current inventory, badge, and
+              price snapshot.
+            </p>
+            <p>
+              Plans use real quotes with their order-book depth and never fold
+              sale proceeds into your budget. Protected keep quantities are
+              excluded from crafting and selling, and excluded games are never
+              crafted.
+            </p>
+          </section>
+          <section id="protections">
+            <h2>Do card protections persist?</h2>
+            <p>
+              Keep quantities and never-sell choices apply to this workspace
+              session in this browser tab. They are not saved to an account,
+              synced between devices, or restored after you sign out or reload
+              the page.
+            </p>
+          </section>
+
+          <section id="sale-funded-swaps">
+            <h2>What is the advanced sale-funded swap?</h2>
+            <p>
+              Inside the workspace you can open a separate, opt-in workflow
+              that estimates whether selling one card funds a badge path with
+              more XP than the craft it gives up. Its sale receipts never merge
+              into the planner budget, and you confirm every sale and purchase
+              manually on Steam.
             </p>
           </section>
 
@@ -4312,6 +4303,11 @@ function FaqPage() {
               Steam Community and pricing providers can rate-limit requests.
               Cached values remain visible while a refresh is delayed or only
               partly complete.
+            </p>
+            <p>
+              Badge and budget plans expire with the snapshot they were built
+              from. Treat an expired or stale plan as background only and
+              refresh before acting on it.
             </p>
           </section>
 

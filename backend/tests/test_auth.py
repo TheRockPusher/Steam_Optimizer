@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from httpx2 import Response
 
+from app.badge_planner import BadgePlanningOptions, BadgePlanningResponse
 from app.booster_pricing import BoosterResolution, BoosterScanResult
 from app.cookies import (
     InvalidCookieError,
@@ -68,6 +69,8 @@ class FakeGateway:
         inventory_error: Exception | None = None,
         level_up_result: LevelUpOptimizationResponse | None = None,
         level_up_error: Exception | None = None,
+        badge_planning_result: BadgePlanningResponse | None = None,
+        badge_planning_error: Exception | None = None,
         profile_error: Exception | None = None,
         badge_result: BadgeCheck | None = None,
         badge_error: Exception | None = None,
@@ -76,6 +79,8 @@ class FakeGateway:
         self.inventory_error = inventory_error
         self.level_up_result = level_up_result
         self.level_up_error = level_up_error
+        self.badge_planning_result = badge_planning_result
+        self.badge_planning_error = badge_planning_error
         self.profile_error = profile_error
         self.badge_result = badge_result
         self.badge_error = badge_error
@@ -89,6 +94,17 @@ class FakeGateway:
                 BadgeState,
                 datetime | str | int,
                 datetime | str | int,
+                datetime | str | int | None,
+            ]
+        ] = []
+        self.badge_planning_calls: list[
+            tuple[
+                Sequence[Holding],
+                Mapping[int, tuple[str, int | None]],
+                BadgeState,
+                datetime | str | int,
+                datetime | str | int,
+                BadgePlanningOptions,
                 datetime | str | int | None,
             ]
         ] = []
@@ -163,6 +179,48 @@ class FakeGateway:
             reason="badge_data_unavailable",
             generated_at=NOW,
             inventory_refreshed_at=NOW,
+        )
+
+    async def check_badge_planning(
+        self,
+        holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
+        inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
+        options: BadgePlanningOptions,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> BadgePlanningResponse:
+        self.badge_planning_calls.append(
+            (
+                holdings,
+                game_metadata,
+                badge_state,
+                inventory_refreshed_at,
+                badge_refreshed_at,
+                options,
+                now,
+            )
+        )
+        if self.badge_planning_error is not None:
+            raise self.badge_planning_error
+        if self.badge_planning_result is not None:
+            return self.badge_planning_result
+        return BadgePlanningResponse(
+            status="unavailable",
+            reason="badge_data_unavailable",
+            generated_at=NOW.isoformat().replace("+00:00", "Z"),
+            valid_until=None,
+            currency_code=None,
+            minor_digits=None,
+            inventory_refreshed_at=NOW.isoformat().replace("+00:00", "Z"),
+            badge_refreshed_at=NOW.isoformat().replace("+00:00", "Z"),
+            player_xp=0,
+            player_level=0,
+            scope="inventory_normal_badges",
+            games=[],
+            plans=[],
         )
 
     async def refresh_gems(
@@ -1104,6 +1162,229 @@ def test_level_up_gateway_type_error_is_isolated_without_retry() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.json()["status"] == "unavailable"
     assert len(gateway.level_up_calls) == 1
+    assert gateway.inventory_calls == 0
+
+
+def _valid_badge_planning_options() -> dict[str, object]:
+    return {
+        "mode": "target",
+        "target_level": 2,
+        "budget_minor": 500,
+        "excluded_app_ids": [],
+        "protections": [],
+    }
+
+
+def _valid_badge_planning_payload() -> dict[str, object]:
+    payload = _valid_level_up_payload()
+    payload["options"] = _valid_badge_planning_options()
+    return payload
+
+
+def _badge_planning_payload_with(**updates: object) -> dict[str, object]:
+    payload = _valid_badge_planning_payload()
+    payload.update(updates)
+    return payload
+
+
+def _badge_options_with(**updates: object) -> dict[str, object]:
+    options = _valid_badge_planning_options()
+    options.update(updates)
+    return options
+
+
+def test_badge_planning_requires_session_and_matching_expected_account() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        unauthenticated = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_badge_planning_payload(),
+        )
+        _authenticate(client, settings)
+        mismatched = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": "76561198000000001"},
+            json=_valid_badge_planning_payload(),
+        )
+
+    assert unauthenticated.status_code == 401
+    assert mismatched.status_code == 401
+    assert unauthenticated.headers["cache-control"] == "no-store"
+    assert mismatched.headers["cache-control"] == "no-store"
+    assert gateway.badge_planning_calls == []
+    assert gateway.inventory_calls == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _valid_level_up_payload(),
+        _badge_planning_payload_with(
+            options=_badge_options_with(mode="target", target_level=None)
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(mode="target", target_level=100_001)
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(mode="target", budget_minor=None)
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(mode="budget", target_level=2)
+        ),
+        _badge_planning_payload_with(options=_badge_options_with(budget_minor=-1)),
+        _badge_planning_payload_with(
+            options=_badge_options_with(budget_minor=1_000_000_001)
+        ),
+        _badge_planning_payload_with(options=_badge_options_with(mode="cheapest")),
+        _badge_planning_payload_with(
+            options=_badge_options_with(
+                protections=[
+                    {
+                        "market_hash_name": "440-Test Card (Trading Card)",
+                        "keep_quantity": 2,
+                        "never_sell": False,
+                    },
+                    {
+                        "market_hash_name": "440-Test Card (Trading Card)",
+                        "keep_quantity": 1,
+                        "never_sell": True,
+                    },
+                ]
+            )
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(
+                protections=[
+                    {
+                        "market_hash_name": "999-Unknown Card (Trading Card)",
+                        "keep_quantity": 1,
+                        "never_sell": False,
+                    }
+                ]
+            )
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(
+                protections=[
+                    {
+                        "market_hash_name": "440-Test Card (Trading Card)",
+                        "keep_quantity": 3,
+                        "never_sell": False,
+                    }
+                ]
+            )
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(excluded_app_ids=["440", "440"])
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(excluded_app_ids=["999"])
+        ),
+        _badge_planning_payload_with(
+            options=_badge_options_with(excluded_app_ids=["0"])
+        ),
+    ],
+)
+def test_badge_planning_rejects_invalid_snapshot_contract(
+    payload: dict[str, object],
+) -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=payload,
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Badge-planning request is invalid."}
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.badge_planning_calls == []
+    assert gateway.inventory_calls == 0
+
+
+def test_badge_planning_rejects_oversize_and_duplicate_json_members() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        too_large = client.post(
+            "/api/auth/badge-planning",
+            headers={
+                "Content-Type": "application/json",
+                "X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID,
+            },
+            content=" " * (2 * 1024 * 1024 + 1),
+        )
+        duplicate = client.post(
+            "/api/auth/badge-planning",
+            headers={
+                "Content-Type": "application/json",
+                "X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID,
+            },
+            content='{"player_xp":0,"player_xp":0,'
+            + json.dumps(_valid_badge_planning_payload())[1:],
+        )
+
+    assert too_large.status_code == 413
+    assert duplicate.status_code == 422
+    assert too_large.headers["cache-control"] == "no-store"
+    assert duplicate.headers["cache-control"] == "no-store"
+    assert gateway.badge_planning_calls == []
+    assert gateway.inventory_calls == 0
+
+
+def test_badge_planning_gateway_failure_is_isolated_without_inventory_fetch() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(badge_planning_error=RuntimeError("planner unavailable"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_badge_planning_payload(),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["reason"]
+    assert body["valid_until"] is None
+    assert body["plans"] == []
+    assert len(gateway.badge_planning_calls) == 1
     assert gateway.inventory_calls == 0
 
 

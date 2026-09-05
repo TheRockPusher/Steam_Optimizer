@@ -96,7 +96,7 @@ The current connection, inventory, and read-only recommendation stage provides:
 - Canonical names and independent game, rarity, and card-border metadata for every Steam Community
   item class, with gem eligibility derived from Steam's validated conversion action rather than
   inferred from the class.
-- A responsive two-tab interface with **Inventory** selected by default and a **Level-up** page.
+- A responsive workspace with **Badges** selected by default, **Plan**, and **Inventory** tabs.
   Inventory starts with quantity-aware highest-buy and lowest-sell totals, reports independent
   quote coverage for each side, and keeps sortable, paginated item data, booster details, optional
   game grouping, selectable gem cash valuation, and the worth-more-as-gems filter together.
@@ -106,14 +106,31 @@ The current connection, inventory, and read-only recommendation stage provides:
   remain an explicit unavailable badge state and do not prevent profile, inventory-cache, or
   inventory loading. The snapshot remains in React memory and is not written to IndexedDB,
   `localStorage`, cookies, or a server-side user cache.
-- The **Level-up** page shows current total XP and level immediately, accepts a target level, and
-  calculates the exact XP threshold delta plus the number of 100-XP badge crafts required. Its
-  fee-aware card-sale optimizer remains read-only and does not request anything until the user
-  opens this page. It requires a public inventory and an eligible ownership timestamp; otherwise
-  it shows the existing recovery or **Refresh inventory** state.
-  The optimizer panel's JavaScript loads on first activation and stays mounted across tab switches.
-  A failed module download offers an explicit reload without removing inventory or the calculator.
-- On optimizer activation, `LevelUpOptimizationPanel` reuses already-loaded inventory items, game
+- **Badges** groups normal trading cards by game, showing complete owned sets, the exact cost of
+  the next craft when prices are usable, missing cards, maxed badges, reservations, and unavailable
+  set information. Search, filters, and 50-game pagination keep large inventories manageable.
+- **Plan** turns a target Steam level or a wallet spending ceiling into repeated normal-badge
+  crafts, up to level five per game. It compares the exact cheapest policy within the submitted
+  inventory scope with clearly labeled fewest-purchase and preserve-owned-card heuristics.
+  Plans show XP, projected level, remaining shortfall, purchased copies, owned cards consumed,
+  exact spending, remaining budget, and manual Steam links. Every purchase consumes the shared
+  quoted stock across repeated crafts; a missing price is never a zero-price purchase.
+- Set **Keep quantity** on an owned card to reserve copies from crafting and advanced sale-funded
+  swaps; **Never sell** prohibits sales but still permits crafting. Exclude whole games from both
+  workflows. These preferences and goal inputs remain in React memory for the current account and
+  tab session only; they are not saved across reloads or sessions.
+- The authenticated `POST /api/auth/badge-planning` endpoint reuses the loaded inventory and badge
+  snapshots plus the server's scoped price cache. It never fetches inventory or badges or stores
+  user inputs. Missing or stale market data still permits zero-spend crafts when complete set
+  composition is known and inventory/badges are fresh. Unknown composition remains unavailable.
+- Nonzero budgets require a confirmed currency and minor-unit scale; a change resets the budget
+  to zero. Sale proceeds never fund this wallet-budget planner. Expired snapshots and unapplied
+  goal changes disable actionable links until refreshed or applied.
+- **Advanced: sale-funded swaps** remains a separate, explicitly opened workflow below the
+  workspace. Its lazy-loaded optimizer sells one card to fund missing cards; the independent
+  target calculator in that panel does not drive swap selection. Module-load failures offer a
+  local reload without removing the inventory or badge planner.
+- On advanced swap activation, `LevelUpOptimizationPanel` reuses already-loaded inventory items, game
   metadata, badges, and boosters. It joins every normal-card AppID to its inventory game name and
   card-set size and to the in-memory session badge snapshot in linear maps, including games that
   have no sellable source card. The bounded request includes `inventory_refreshed_at`,
@@ -121,8 +138,8 @@ The current connection, inventory, and read-only recommendation stage provides:
   hashes and quantities. `sellable_quantity` follows `marketable`; `tradable` is unrelated to
   Steam Market eligibility. The endpoint never calls the inventory or badge providers, never
   resolves booster/card-set metadata, never logs holdings, or stores the submitted snapshot.
-- Planning reads the current cached catalog generation synchronously and never waits for SteamApis'
-  bulk catalog download. A missing or stale generation queues one shared background refresh. While
+- Advanced swap planning reads the cached catalog synchronously without waiting for SteamApis'
+  bulk download. A missing or stale generation queues one shared background refresh. While
   that task runs, the panel shows **Loading current market prices** and retries every five seconds;
   a true unavailable state is shown only when the refresh cannot be started or prices remain
   unusable after it finishes.
@@ -357,8 +374,8 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   browser or persisted in caches. Each authenticated call to the session endpoint, including a
   reload or explicit recheck, reads one bounded SteamApis badges response for the signed SteamID64
   and returns validated current XP and level, `checked_at`, and bounded normal badge levels.
-  Opening the Level-up optimizer reuses that in-memory session badge snapshot and does not contact
-  the badge provider during planning. Foil, non-game, and unrelated records never become optimizer
+  Both badge planning and advanced sale-funded swaps reuse the in-memory session badge snapshot
+  without contacting the badge provider during planning. Foil, non-game, and unrelated records never become optimizer
   inputs.
 - Provider caveat: SteamApis response availability, fields, pagination, price snapshots, and
   top-of-book depth are provider/data-source facts rather than Valve guarantees. Price coverage is
@@ -395,7 +412,7 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 ### Privacy and Steam Data Policy
 
 This section is Steam Optimizer's published privacy policy. It applies to the deployed service and
-was last updated on 2026-08-30.
+was last updated on 2026-09-05.
 
 - Data handling and privacy policy: the browser redirects to Steam for login, and the backend
   receives the verified SteamID64. The signed, HTTP-only session cookie contains that identifier
@@ -414,15 +431,16 @@ was last updated on 2026-08-30.
   records, and invalid schema data is removed. Transient `unavailable` responses are not persisted
   and do not overwrite a prior successful record. Inventory is not persisted server-side, in
   cookies, or in `localStorage`.
-- Level-up snapshot and plan handling: opening the manually activated tab reuses the already-loaded
-  inventory items and game metadata plus the in-memory session badge snapshot. It aggregates every
-  normal-card game, not only sellable source games, and submits a bounded transient request
-  containing `inventory_refreshed_at`, `badge_refreshed_at`, validated player XP/level, game names,
-  card-set sizes, badge levels, and exact market hashes and quantities to the authenticated
-  `POST /api/auth/level-up` endpoint. The frontend joins these maps linearly; `sellable_quantity`
-  follows `marketable`, not `tradable`. The request is used only for that calculation: it is not
-  logged, linked to a persistent server row, or stored by the backend, and the endpoint never calls
-  the inventory or badge provider or resolves booster/card-set metadata. The returned advisory plan
+- Badge-planning and level-up snapshot handling: the default Badges workspace reuses the loaded
+  inventory and in-memory badge snapshot, submitting a bounded transient request to authenticated
+  `POST /api/auth/badge-planning` with a matching `X-Expected-Steam-ID` header. It contains snapshot
+  timestamps, validated player XP/level, game names, set sizes, badge levels, exact card hashes and
+  quantities, the wallet budget or target level, kept quantities, never-sell flags, and exclusions.
+  Opening advanced sale-funded swaps sends the reduced snapshot to `POST /api/auth/level-up`;
+  `sellable_quantity` follows `marketable`, not `tradable`. Both requests are used only for their
+  calculation: they are not logged, linked to a persistent server row, or stored by the backend.
+  Neither endpoint calls the inventory or badge provider or resolves booster/card-set metadata.
+  The returned advisory plan
   is held in React memory only while the account and snapshot remain unchanged; it is never written
   to IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
   inventory refresh, and unmount discard it. Quote expiry retains the rows only in React memory as
@@ -430,8 +448,8 @@ was last updated on 2026-08-30.
 - Badge-state handling: the authenticated session check makes one bounded server-only SteamApis v2
   `/v2/steam/users/{steamid}/badges` request for the signed SteamID64. It validates player XP,
   player level, and bounded normal badge levels, then stamps the validated snapshot with
-  server-generated `checked_at`. The Level-up request carries that value as `badge_refreshed_at`;
-  the optimizer reuses the in-memory snapshot and performs no badge-provider call during planning.
+  server-generated `checked_at`. Both planning requests carry it as `badge_refreshed_at`, reusing
+  the in-memory snapshot without a badge-provider call during planning.
   Foil, non-game, and syntactically valid records outside the normal-card catalog are ignored. The
   SteamApis API key and raw badge response remain server-side and are not persisted.
 - Market-price retention and provider freshness: market prices are a global AppID 753 generation,

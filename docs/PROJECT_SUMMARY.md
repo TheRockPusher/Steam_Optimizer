@@ -3,9 +3,9 @@
 ## Product direction
 
 Steam Optimizer is an open-source, read-only Steam Community inventory and badge optimizer. The
-shipped product inspects a public inventory, calculates one deterministic badge-completion
-comparison, and helps a user decide what to do next. It is not an account operator or marketplace
-automation tool.
+shipped product inspects a public inventory, shows craftability and completion costs, and plans
+normal-badge crafts against a target level or wallet budget. A separate sale-funded swap adviser
+remains available. It is not an account operator or marketplace automation tool.
 
 The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an application-owned
 signed session, concurrent profile and badge-progress session checks, and server-only SteamApis v2
@@ -24,24 +24,69 @@ card-border metadata, and values any item carrying Steam's validated gem-convers
 cache and refresh identity uses the exact application ID, numeric item type, and border color from
 that action. For each identified trading-card game, it also looks up the canonical booster market
 item and reports its provider-denominated order-book values plus Steam's fixed three-card
-booster-pack size. The React interface has two top-level pages: **Inventory** and **Level-up**.
-Inventory is selected by default and starts with quantity-aware highest-buy and lowest-sell
-top-quote estimates plus per-side item-type coverage. Each owned copy is marked at the current top
-quote; order-book depth is not included. The existing item browser and booster details follow.
+booster-pack size. The React interface has three top-level tabs: **Badges** (default), **Plan**,
+and **Inventory**. Badges and Plan share one mounted, lazily loaded workspace, preserving drafts and
+protections across tab switches. Inventory retains quantity-aware highest-buy and lowest-sell
+top-quote estimates, per-side coverage, the paginated item browser, grouping, and booster/gem tools.
+Each owned copy is marked at the current top quote; inventory totals do not include order-book depth.
 
-The **Level-up** page shows current total XP and level from the latest in-memory session badge
-snapshot. The authenticated session check performs one bounded badge-provider read when it runs; the
-optimizer reuses that snapshot without contacting the badge provider during planning. A bounded
-target-level input derives the exact Steam XP threshold delta and rounds the result up to whole
-100-XP badge crafts. The existing swap optimizer remains manual-activation and read-only: it reuses
-the current browser inventory record and its loaded game metadata, sends one bounded request to
-`POST /api/auth/level-up` with the signed session and matching `x-expected-steam-id` header, and
-returns a complete advisory plan or an explicit no-opportunity or unavailable state. The endpoint
-does not fetch inventory or badges, never resolves booster/card-set metadata, and does not store the
-submitted snapshot.
-The optimizer panel's JavaScript is loaded on first activation and its mounted instance is retained
-across tab switches. Module-download failures are contained locally with an explicit reload action;
-the already-loaded inventory and local target-level calculator remain usable.
+The workspace displays current XP and level from the latest in-memory session badge snapshot.
+Planning reuses this snapshot without contacting the badge provider. Badges presents ready crafts,
+cheapest next crafts, closest sets, maxed/reserved/excluded games, and explicit unavailable states.
+The dashboard searches and filters games, renders at most 50 game rows per page, and expands one
+game's card controls at a time. Plan accepts a target level or wallet budget and compares three
+read-only policies with manual purchase and badge-page links.
+
+The existing one-card sale optimizer is lazy-loaded only after opening **Advanced: sale-funded
+swaps**. It sends a separate request to `POST /api/auth/level-up`; its local XP calculator does not
+change swap selection. Reserved copies and never-sell flags reduce the source pool, while game
+exclusions apply to both workflows. Failed module downloads stay local to the affected workspace.
+
+### Goal and budget planning contract
+
+`POST /api/auth/badge-planning` requires the signed session and matching `X-Expected-Steam-ID`.
+It accepts the existing bounded ownership/game/badge snapshot plus `options`:
+
+- `mode`: `target` or `budget`; `target_level` is required only in target mode.
+- `budget_minor`: nonnegative integer Steam Wallet spending ceiling, never projected sale proceeds.
+- `protections`: unique owned card hashes with `keep_quantity` and `never_sell`.
+- `excluded_app_ids`: unique game IDs from the submitted inventory.
+
+The endpoint rejects oversized/duplicate-member JSON, unknown or duplicate protection targets,
+reserves exceeding ownership, inconsistent badge XP/levels, and mismatched account identities.
+Responses use `Cache-Control: no-store`. Inputs and plans are not logged or persisted, and the
+endpoint makes no inventory, badge, or booster metadata provider calls. Price generation refreshes
+use the existing shared asynchronous cache refresh, never a request-blocking catalog download.
+
+The pure `badge_planner.plan_badges` domain returns every submitted game, including unpriceable
+and unknown games, plus three independent policy plans. Scope is normal badges for games already
+represented in this inventory, not the whole Steam catalog. Foil, event, community, and other
+non-normal badges are excluded. A craft yields 100 XP and cannot exceed normal badge level five.
+Craftability is computed only for verified full composition, either from a complete catalog set or
+from all distinct owned cards matching a known set size. Missing composition never becomes a craft.
+
+Kept quantities reserve copies from consumption. Never-sell alone still permits crafting.
+The cheapest policy merges each game's nondecreasing marginal craft-cost sequence: owned copies
+are used before purchases, and purchased copies consume cumulative top-ask depth. It exactly
+minimizes spending to reach the target, or maximizes craft XP under the budget, within this fixed
+scope and price snapshot. Fewest-purchases and preserve-owned-cards are explicitly labeled
+heuristics, not global optima. Each alternative starts from the same inventory and budget; they
+are mutually exclusive alternatives, not additive recommendations.
+
+Plans disclose craft/XP counts, projected level, shortfall, owned-card use, purchase copies,
+per-game purchases, spend, and remaining budget. Prices are exact buyer totals in configured
+integer minor units, never floating-point estimates or double-charged fees. Every needed purchase
+requires positive fresh price and quoted depth. Missing/stale prices disable purchases but do not
+suppress verified fully owned zero-spend crafts. A partial catalog retains only groups whose
+card identities match a known complete set size. Maxed badges have no next-craft cost or shortfall.
+
+Inventory and badge freshness gate all actions. Quote expiry disables links; focus, tab activation,
+and refreshed snapshots update freshness. Changed requests and account boundaries discard late
+responses. Editing target/budget disables plan links until Apply. Nonzero budgets require a server-
+confirmed currency/scale, bound to that request; a currency change resets the budget to zero.
+Catalog-refresh responses trigger bounded automatic retries and retain explicit manual refresh.
+Preferences, drafts, and responses live only in account-scoped React memory, never IndexedDB,
+localStorage, cookies, or server-side user storage. Reload, logout, and account changes discard them.
 
 ## Safety and identity boundary
 
@@ -94,11 +139,11 @@ public. SteamApis omits currency metadata from its bulk feed. The inventory UI p
 decimals and labels them USD under the application's denomination, not a currency field attested by
 the feed. The optimizer separately requires a complete, verified money contract before returning a plan.
 
-### Level-up recommendation boundary
+### Advanced sale-funded recommendation boundary
 
-The **Level-up** page is manually activated beside **Inventory**, which remains selected by
-default. Its swap optimizer is available only for a public inventory with a fresh ownership
-timestamp. On activation, the frontend reuses already-loaded inventory items, game metadata,
+The swap adviser is explicitly opened below the badge workspace, independently of the default
+Badges tab and wallet-budget planner. It requires a public inventory and fresh ownership/badges.
+On activation, the frontend reuses already-loaded inventory items and game metadata,
 badges, and boosters. It joins every normal-card AppID to the inventory game name and card-set size
 and to the in-memory session badge snapshot in linear maps. All normal-card games are included,
 including games with no sellable source card:
@@ -327,16 +372,17 @@ remain compatible.
 
 ## Deliberately deferred
 
-The deterministic optimizer and its read-only advisory endpoint are part of the current stage.
-The following follow-on scope is planned later, not missing pieces of that implementation:
+The dashboard, goal/budget planner, and separate sale-funded optimizer are implemented.
+The following remain outside their contracts:
 
 - Marketplace, purchase, sale, trade, or any other transaction automation.
 - A persisted transaction checklist, saved plans, or automatic repricing after source sales.
-- Multiple source cards in one plan, more than five destination badges, or additional levels of one
-  game badge in the same recommendation.
-- Selling multiple copies of one source card, leftover-portfolio optimization, or a claim of
-  global maximum XP.
-- User-entered wallet balance, cash budget, raw XP target, locks, preferences, or exclusions.
+- Multiple source sales or multiple copies sold in one recommendation. The advanced swap adviser
+  still limits destinations to five single crafts; the wallet-budget planner supports repeated
+  crafts and more destination games without financing them through sales.
+- Leftover-portfolio optimization, unrestricted whole-Steam-catalog optimization, or a claim of
+  global maximum XP beyond the scoped snapshot.
+- Raw XP targets, automatic wallet-balance discovery, or cross-session preference persistence.
 - Patient listings, buy orders, order-book walking, fill-probability models, taxes, regional
   pricing, market holds, or account-specific restrictions.
 - Foil, seasonal/event, sale, or non-game badges; booster drops; random craft rewards; coupons;

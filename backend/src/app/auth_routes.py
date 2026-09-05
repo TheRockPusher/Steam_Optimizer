@@ -5,7 +5,7 @@ import hmac
 import json
 import re
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -27,6 +27,11 @@ from pydantic import (
     model_validator,
 )
 
+from app.badge_planner import (
+    BadgePlanningOptions,
+    BadgePlanningResponse,
+    plan_badges,
+)
 from app.booster_pricing import (
     BoosterResolution,
     BoosterScanResult,
@@ -87,6 +92,14 @@ _LEVEL_UP_GAME_APP_ID_ERROR = "game AppID is invalid"
 _LEVEL_UP_PLAYER_LEVEL_ERROR = "player XP and level disagree"
 _LEVEL_UP_DUPLICATE_GAME_ERROR = "game IDs must be unique"
 _LEVEL_UP_GAME_CARD_MATCH_ERROR = "game IDs must match normal-card AppIDs"
+_BADGE_PLANNING_BODY_TOO_LARGE_MESSAGE = "Badge-planning request body is too large."
+_BADGE_PLANNING_INVALID_JSON_MESSAGE = "Badge-planning request body is invalid JSON."
+_BADGE_PLANNING_INVALID_REQUEST_MESSAGE = "Badge-planning request is invalid."
+_BADGE_PLANNING_DUPLICATE_PROTECTION_ERROR = "protection hashes must be unique"
+_BADGE_PLANNING_UNKNOWN_PROTECTION_ERROR = "protections must reference owned cards"
+_BADGE_PLANNING_PROTECTION_QUANTITY_ERROR = "keep quantity exceeds owned quantity"
+_BADGE_PLANNING_DUPLICATE_EXCLUSION_ERROR = "excluded game IDs must be unique"
+_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR = "exclusions must reference requested games"
 
 Clock = Callable[[], datetime]
 
@@ -283,6 +296,39 @@ class LevelUpRequest(BaseModel):
         return self
 
 
+class BadgePlanningRequest(LevelUpRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    options: BadgePlanningOptions
+
+    @model_validator(mode="after")
+    def validate_badge_planning_options(self) -> BadgePlanningRequest:
+        game_app_ids = {int(game.app_id) for game in self.games}
+        excluded_app_ids = self.options.excluded_app_ids
+        if len(set(excluded_app_ids)) != len(excluded_app_ids):
+            raise ValueError(_BADGE_PLANNING_DUPLICATE_EXCLUSION_ERROR)
+        for raw_app_id in excluded_app_ids:
+            try:
+                app_id = int(raw_app_id)
+            except TypeError, ValueError:
+                raise ValueError(_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR) from None
+            if app_id not in game_app_ids:
+                raise ValueError(_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR)
+        known_holdings = {card.market_hash_name: card for card in self.cards}
+        seen_protections: set[str] = set()
+        for protection in self.options.protections:
+            market_hash_name = protection.market_hash_name
+            if market_hash_name in seen_protections:
+                raise ValueError(_BADGE_PLANNING_DUPLICATE_PROTECTION_ERROR)
+            seen_protections.add(market_hash_name)
+            holding = known_holdings.get(market_hash_name)
+            if holding is None:
+                raise ValueError(_BADGE_PLANNING_UNKNOWN_PROTECTION_ERROR)
+            if protection.keep_quantity > holding.owned_quantity:
+                raise ValueError(_BADGE_PLANNING_PROTECTION_QUANTITY_ERROR)
+        return self
+
+
 class GemRefreshResponse(BaseModel):
     values: list[GemRefreshValue]
     pending_group_count: int = Field(ge=0)
@@ -475,15 +521,7 @@ def _level_up_unavailable_response(
     inventory_refreshed_at: str,
     reason: str,
 ) -> LevelUpOptimizationResponse:
-    try:
-        text = (
-            inventory_refreshed_at[:-1] + "+00:00"
-            if inventory_refreshed_at.endswith("Z")
-            else inventory_refreshed_at
-        )
-        inventory_time = datetime.fromisoformat(text).astimezone(UTC)
-    except TypeError, ValueError, AttributeError, OverflowError:
-        inventory_time = now
+    inventory_time = _parse_utc_timestamp(inventory_refreshed_at, now)
     contract = None
     with suppress(AttributeError, TypeError, ValueError):
         contract = settings.level_up_money_contract
@@ -499,6 +537,81 @@ def _level_up_unavailable_response(
         publisher_fee_bps=getattr(contract, "publisher_fee_bps", None),
         min_fee_minor=getattr(contract, "min_fee_minor", None),
         taxes_included=False if contract is not None else None,
+    )
+
+
+def _parse_utc_timestamp(value: str, default: datetime) -> datetime:
+    """Parse one bounded request timestamp, falling back to ``default``."""
+
+    try:
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(text).astimezone(UTC)
+    except TypeError, ValueError, AttributeError, OverflowError:
+        return default
+
+
+def _level_up_snapshot_inputs(
+    payload: LevelUpRequest,
+) -> tuple[tuple[Holding, ...], dict[int, tuple[str, int | None]], BadgeState]:
+    """Build the bounded optimizer snapshot shared by both planning routes."""
+
+    holdings = tuple(
+        Holding(
+            market_hash_name=card.market_hash_name,
+            owned_quantity=card.owned_quantity,
+            sellable_quantity=card.sellable_quantity,
+        )
+        for card in payload.cards
+    )
+    game_metadata = {
+        int(game.app_id): (game.game_name, game.card_set_size) for game in payload.games
+    }
+    badge_state = BadgeState(
+        player_xp=payload.player_xp,
+        player_level=payload.player_level,
+        normal_badge_levels={
+            int(game.app_id): game.badge_level for game in payload.games
+        },
+    )
+    return holdings, game_metadata, badge_state
+
+
+def _badge_planning_unavailable_response(
+    settings: Settings,
+    payload: BadgePlanningRequest,
+    *,
+    holdings: Sequence[Holding],
+    game_metadata: Mapping[int, tuple[str, int | None]],
+    badge_state: BadgeState,
+    now: datetime,
+    reason: str,
+) -> BadgePlanningResponse:
+    """Rebuild one pure-planner response after a gateway-side failure.
+
+    Submitted holdings and game rows are retained so the dashboard keeps
+    every game visible; only quote-backed planning data is dropped.
+    """
+
+    contract = None
+    with suppress(AttributeError, TypeError, ValueError):
+        contract = settings.level_up_money_contract
+    return plan_badges(
+        catalog=None,
+        holdings=holdings,
+        game_metadata=game_metadata,
+        badges=badge_state,
+        inventory_refreshed_at=_parse_utc_timestamp(
+            payload.inventory_refreshed_at,
+            now,
+        ),
+        badge_refreshed_at=_parse_utc_timestamp(
+            payload.badge_refreshed_at,
+            now,
+        ),
+        now=now,
+        fee_contract=contract,
+        options=payload.options,
+        availability_reason=reason,
     )
 
 
@@ -759,32 +872,7 @@ def create_auth_router(
                 headers={"Cache-Control": "no-store"},
             ) from error
         try:
-            holdings = tuple(
-                Holding(
-                    market_hash_name=card.market_hash_name,
-                    owned_quantity=card.owned_quantity,
-                    sellable_quantity=card.sellable_quantity,
-                )
-                for card in payload.cards
-            )
-        except (TypeError, ValueError, OptimizerInputError) as error:
-            raise HTTPException(
-                status_code=422,
-                detail=_LEVEL_UP_INVALID_REQUEST_MESSAGE,
-                headers={"Cache-Control": "no-store"},
-            ) from error
-        try:
-            game_metadata = {
-                int(game.app_id): (game.game_name, game.card_set_size)
-                for game in payload.games
-            }
-            badge_state = BadgeState(
-                player_xp=payload.player_xp,
-                player_level=payload.player_level,
-                normal_badge_levels={
-                    int(game.app_id): game.badge_level for game in payload.games
-                },
-            )
+            holdings, game_metadata, badge_state = _level_up_snapshot_inputs(payload)
         except (TypeError, ValueError, OptimizerInputError) as error:
             raise HTTPException(
                 status_code=422,
@@ -819,6 +907,103 @@ def create_auth_router(
             content=result.to_dict(),
             headers={"Cache-Control": "no-store"},
         )
+
+    @router.post(
+        "/api/auth/badge-planning",
+        response_model=BadgePlanningResponse,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def auth_badge_planning(
+        request: Request,
+        response: Response,
+    ) -> BadgePlanningResponse:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            steam_id = _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        if request.headers.get("x-expected-steam-id") != steam_id:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            raw_payload = await _read_level_up_json(request)
+        except _RequestBodyTooLargeError as error:
+            raise HTTPException(
+                status_code=413,
+                detail=_BADGE_PLANNING_BODY_TOO_LARGE_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_BADGE_PLANNING_INVALID_JSON_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            payload = BadgePlanningRequest.model_validate(raw_payload)
+        except (TypeError, ValidationError, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_BADGE_PLANNING_INVALID_REQUEST_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            holdings, game_metadata, badge_state = _level_up_snapshot_inputs(payload)
+        except (TypeError, ValueError, OptimizerInputError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_BADGE_PLANNING_INVALID_REQUEST_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        try:
+            result = await steam_gateway.check_badge_planning(
+                holdings,
+                game_metadata,
+                badge_state,
+                inventory_refreshed_at=payload.inventory_refreshed_at,
+                badge_refreshed_at=payload.badge_refreshed_at,
+                options=payload.options,
+            )
+        except Exception:  # noqa: BLE001 - planning failures are isolated
+            result = _badge_planning_unavailable_response(
+                settings,
+                payload,
+                holdings=holdings,
+                game_metadata=game_metadata,
+                badge_state=badge_state,
+                now=current_time(),
+                reason="badge_data_unavailable",
+            )
+        if not isinstance(result, BadgePlanningResponse):
+            result = _badge_planning_unavailable_response(
+                settings,
+                payload,
+                holdings=holdings,
+                game_metadata=game_metadata,
+                badge_state=badge_state,
+                now=current_time(),
+                reason="badge_data_unavailable",
+            )
+        return result
 
     @router.post(
         "/api/auth/gems",

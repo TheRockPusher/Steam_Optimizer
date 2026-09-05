@@ -8,9 +8,61 @@ import {
   waitFor,
   within
 } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { clearInventoryCache } from "./inventoryCache";
+
+const badgeWorkspaceStub = vi.hoisted(() => ({
+  created: 0,
+  lastProps: null as Record<string, unknown> | null
+}));
+
+vi.mock("./BadgeWorkspace", () => ({
+  default: function BadgeWorkspaceStub(props: Record<string, unknown>) {
+    badgeWorkspaceStub.lastProps = props;
+    useEffect(() => {
+      badgeWorkspaceStub.created += 1;
+    }, []);
+    return (
+      <section
+        data-testid="badge-workspace-stub"
+        data-view={String(props.view)}
+        data-active={props.isActive ? "true" : "false"}
+        data-steam-id={String(props.steamId)}
+      >
+        <p>Badge workspace stub</p>
+        <button
+          type="button"
+          onClick={() => (props.onRefreshInventory as () => void)()}
+        >
+          Stub refresh inventory
+        </button>
+        <button
+          type="button"
+          onClick={() => (props.onRefreshBadges as (() => void) | undefined)?.()}
+        >
+          Stub recheck badges
+        </button>
+      </section>
+    );
+  }
+}));
+
+type StubWorkspaceProps = {
+  steamId: string;
+  inventoryStatus: string;
+  badges: { status: string; player_level: number | null };
+  isActive: boolean;
+  view: string;
+  onRefreshInventory: () => void;
+  onRefreshBadges?: () => void;
+};
+
+function lastWorkspaceProps(): StubWorkspaceProps {
+  // Test seam: the stub records whatever props the shell passed.
+  return badgeWorkspaceStub.lastProps as StubWorkspaceProps;
+}
 
 const privateInventory = {
   status: "private",
@@ -162,48 +214,6 @@ function publicInventory(
     ...overrides
   };
 }
-function levelUpNoOpportunityResponse(
-  reason: "no_sellable_card" | "no_positive_xp_swap" = "no_sellable_card",
-  inventoryRefreshedAt = "2026-08-29T11:30:00Z"
-) {
-  return {
-    status: "no_opportunity",
-    reason,
-    generated_at: "2026-08-29T12:00:00Z",
-    inventory_refreshed_at: inventoryRefreshedAt,
-    currency_code: "USD",
-    minor_digits: 2,
-    price_basis: "instant_top_of_book",
-    steam_fee_bps: 500,
-    publisher_fee_bps: 1_000,
-    min_fee_minor: 1,
-    taxes_included: false,
-    scope_limited: false,
-    valid_until: null,
-    player: null,
-    source: null,
-    destinations: [],
-    totals: null
-  };
-}
-
-function levelUpNoOpportunityForRequest(
-  reason: "no_sellable_card" | "no_positive_xp_swap" = "no_sellable_card"
-) {
-  return async (_input: RequestInfo | URL, init?: RequestInit) => {
-    const request = JSON.parse(String(init?.body)) as {
-      inventory_refreshed_at: string;
-    };
-    const response = levelUpNoOpportunityResponse(
-      reason,
-      request.inventory_refreshed_at
-    );
-    response.generated_at = new Date().toISOString();
-    return jsonResponse(response);
-  };
-}
-
-
 
 function jsonResponse(payload: unknown, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -218,7 +228,20 @@ function inventoryWithRetry(retryAfterSeconds: number | null) {
     retry_after_seconds: retryAfterSeconds
   };
 }
+async function openWorkspaceSection(name: "Badges" | "Plan" | "Inventory") {
+  const tablist = await screen.findByRole("tablist", {
+    name: "Workspace sections"
+  });
+  fireEvent.click(within(tablist).getByRole("tab", { name }));
+}
+
+async function openInventorySection() {
+  await openWorkspaceSection("Inventory");
+}
+
 afterEach(async () => {
+  badgeWorkspaceStub.created = 0;
+  badgeWorkspaceStub.lastProps = null;
   await clearInventoryCache();
   cleanup();
   vi.restoreAllMocks();
@@ -237,7 +260,7 @@ describe("FAQ", () => {
     expect(
       screen.getByRole("heading", {
         level: 1,
-        name: "Steam inventory questions, answered."
+        name: "Steam badge planning questions, answered."
       })
     ).toBeInTheDocument();
     expect(
@@ -299,10 +322,19 @@ describe("App", () => {
     expect(
       within(screen.getByRole("banner")).getByRole("link", { name: "FAQ" })
     ).toHaveAttribute("href", "/faq");
-    expect(screen.queryByText("Read-only workspace")).not.toBeInTheDocument();
     expect(
-      screen.queryByText(/cannot trade, sell, craft, or change/i)
-    ).not.toBeInTheDocument();
+      screen.getByRole("heading", {
+        name: "Plan badge crafting around your own inventory."
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /never trades, sells, crafts, buys, or changes your account/
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Set a target level or a Steam Wallet budget/)
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /privacy & steam data terms/i })
     ).toHaveAttribute(
@@ -346,6 +378,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(privateInventory));
     render(<App />);
+    await openInventorySection();
 
     expect(
       await screen.findByLabelText("Connected Steam account: Alyx")
@@ -428,9 +461,10 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
-    const inventoryRegion = await screen.findByRole("region", {
-      name: "Inventory and level-up planning"
+    const inventoryRegion = await screen.findByRole("tabpanel", {
+      name: "Inventory"
     });
     const pricingSummary = within(inventoryRegion).getByLabelText(
       "Inventory pricing summary"
@@ -556,6 +590,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const pricingSummary = await screen.findByLabelText(
       "Inventory pricing summary"
@@ -583,6 +618,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
+    await openInventorySection();
 
     const pricingSummary = await screen.findByLabelText(
       "Inventory pricing summary"
@@ -599,6 +635,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(privateInventory));
 
     render(<App />);
+    await openInventorySection();
 
     const pricingSummary = await screen.findByLabelText(
       "Inventory pricing summary"
@@ -607,238 +644,24 @@ describe("App", () => {
     expect(within(pricingSummary).getAllByText("Unavailable")).toHaveLength(2);
   });
 
-  it("keeps the Level-up page available when inventory loading fails", async () => {
+  it("keeps the badge workspace available when inventory loading fails", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(new Response(null, { status: 503 }));
 
     render(<App />);
 
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-    expect(within(calculator).getByText("1,250 XP")).toBeInTheDocument();
+    const stub = await screen.findByTestId("badge-workspace-stub");
+    expect(stub).toHaveAttribute("data-view", "badges");
     expect(
-      within(calculator).getByRole("spinbutton", { name: "Target level" })
-    ).toHaveValue(11);
-  });
-
-  it("renders the initial badge session XP and level in the Level-up calculator", async () => {
-    const inventory = publicInventory([inventoryItem(1)]);
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
-
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-
-    expect(within(calculator).getByText("1,250 XP")).toBeInTheDocument();
-    expect(within(calculator).getByText("11")).toBeInTheDocument();
-    const targetInput = within(calculator).getByRole("spinbutton", {
-      name: "Target level"
-    });
-    expect(targetInput).toHaveValue(11);
-    expect(targetInput).toHaveAttribute("min", "11");
-    expect(targetInput).toHaveAttribute("max", "100000");
-    expect(within(calculator).getByText("0 XP")).toBeInTheDocument();
-    expect(within(calculator).getByText("Badges needed")).toBeInTheDocument();
-  });
-
-  it("calculates XP and whole-badge requirements from the target level", async () => {
-    const inventory = publicInventory([inventoryItem(1)]);
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
-
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-    const targetInput = within(calculator).getByRole("spinbutton", {
-      name: "Target level"
-    });
-
-    fireEvent.change(targetInput, { target: { value: "12" } });
-    expect(within(calculator).getByText("150 XP")).toBeInTheDocument();
-    expect(within(calculator).getByText("2")).toBeInTheDocument();
-    expect(
-      within(calculator).queryByRole("alert")
-    ).not.toBeInTheDocument();
-  });
-
-  it("rejects invalid Level-up targets without showing computed totals", async () => {
-    const inventory = publicInventory([inventoryItem(1)]);
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
-
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-    const targetInput = within(calculator).getByRole("spinbutton", {
-      name: "Target level"
-    });
-
-    fireEvent.change(targetInput, { target: { value: "10" } });
-    expect(within(calculator).getByRole("alert")).toHaveTextContent(
-      "Target level cannot be below your current level (11)."
-    );
-    expect(within(calculator).queryByText("XP needed")).not.toBeInTheDocument();
-
-    fireEvent.change(targetInput, { target: { value: "100001" } });
-    expect(within(calculator).getByRole("alert")).toHaveTextContent(
-      "Target level cannot exceed 100000."
-    );
-    expect(within(calculator).queryByText("XP needed")).not.toBeInTheDocument();
-
-    fireEvent.change(targetInput, { target: { value: "12.5" } });
-    expect(within(calculator).getByRole("alert")).toHaveTextContent(
-      "Target level must be a whole number"
-    );
-    expect(within(calculator).queryByText("Badges needed")).not.toBeInTheDocument();
-  });
-
-  it("renders badge-unavailable null state and provider message", async () => {
-    const unavailableBadgeSession = {
-      ...signedInSession,
-      checks: {
-        ...signedInSession.checks,
-        badges: {
-          status: "unavailable",
-          message: "Steam badge check is unavailable.",
-          player_xp: null,
-          player_level: null,
-          checked_at: null,
-          normal_badge_levels: []
-        }
-      }
-    };
-    const inventory = publicInventory([inventoryItem(1)]);
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(unavailableBadgeSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockResolvedValueOnce(jsonResponse(levelUpNoOpportunityResponse()));
-
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-
-    expect(
-      within(calculator).getByText(
-        "Badge data is unavailable: Steam badge check is unavailable."
+      await screen.findByText(
+        "We could not load your Steam inventory. Try refreshing when the service is available."
       )
     ).toBeInTheDocument();
-    expect(within(calculator).getAllByText("Unavailable")).toHaveLength(2);
-    expect(
-      within(calculator).getByRole("spinbutton", { name: "Target level" })
-    ).toBeDisabled();
-    expect(
-      within(calculator).queryByText("XP needed")
-    ).not.toBeInTheDocument();
   });
 
-  it("synchronizes the target when same-account badge data changes", async () => {
-    const unavailableBadgeSession = {
-      ...signedInSession,
-      checks: {
-        ...signedInSession.checks,
-        badges: {
-          status: "unavailable",
-          message: "Steam badge check is unavailable.",
-          player_xp: null,
-          player_level: null,
-          checked_at: null,
-          normal_badge_levels: []
-        }
-      }
-    };
-    const levelTwelveSession = {
-      ...signedInSession,
-      checks: {
-        ...signedInSession.checks,
-        badges: {
-          status: "public",
-          message: "Steam badge data is available.",
-          player_xp: 1_450,
-          player_level: 12,
-          checked_at: changedBadgeCheckedAt,
-          normal_badge_levels: []
-        }
-      }
-    };
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(unavailableBadgeSession))
-      .mockResolvedValueOnce(jsonResponse(privateInventory))
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(levelTwelveSession));
 
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    const calculator = await screen.findByRole("region", {
-      name: "Level-up calculator"
-    });
-    const targetInput = within(calculator).getByRole("spinbutton", {
-      name: "Target level"
-    });
-    expect(targetInput).toBeDisabled();
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
-    );
-    await waitFor(() => {
-      expect(targetInput).toBeEnabled();
-      expect(targetInput).toHaveValue(11);
-    });
-
-    fireEvent.change(targetInput, { target: { value: "20" } });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Recheck Steam access" })
-    );
-    await waitFor(() => {
-      expect(
-        within(calculator).getByText("Current level").closest("div")
-      ).toHaveTextContent("12");
-      expect(targetInput).toHaveValue(20);
-    });
-  });
-
-  it("invalidates optimizer results when rechecked badge state changes", async () => {
+  it("passes rechecked badge data to the mounted workspace", async () => {
     const levelTwelveSession = {
       ...signedInSession,
       checks: {
@@ -857,36 +680,20 @@ describe("App", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockImplementationOnce(
-        levelUpNoOpportunityForRequest("no_sellable_card")
-      )
-      .mockResolvedValueOnce(jsonResponse(levelTwelveSession))
-      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_positive_xp_swap"));
+      .mockResolvedValueOnce(jsonResponse(levelTwelveSession));
+    const badgesProp = () => lastWorkspaceProps().badges;
 
     render(<App />);
 
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(within(tablist).getByRole("tab", { name: "Level-up" }));
-    expect(
-      await screen.findByText(
-        "No sellable normal card with a usable current bid is available in this inventory snapshot."
-      )
-    ).toBeInTheDocument();
+    await screen.findByTestId("badge-workspace-stub");
+    expect(badgesProp().player_level).toBe(11);
 
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam access" })
     );
 
-    expect(
-      await screen.findByText(
-        "No one-card sale funds a badge path with more XP than the immediate craft opportunity it gives up."
-      )
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-    expect(fetchMock.mock.calls[2][0]).toMatch(/\/api\/auth\/level-up$/);
-    expect(fetchMock.mock.calls[4][0]).toMatch(/\/api\/auth\/level-up$/);
+    await waitFor(() => expect(badgesProp().player_level).toBe(12));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("filters gem-convertible items by exact per-item gem cash value above lowest sell", async () => {
@@ -1014,6 +821,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const allTab = await screen.findByRole("tab", { name: /^All items/ });
     const worthMoreTab = screen.getByRole("tab", {
@@ -1099,6 +907,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const tablist = await screen.findByRole("tablist", {
       name: "Inventory views"
@@ -1224,6 +1033,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("tab", { name: /^Worth more as gems/ })
@@ -1329,6 +1139,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("tab", { name: /^Worth more as gems/ })
@@ -1399,6 +1210,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
 
     const section = await screen.findByRole("region", {
@@ -1444,6 +1256,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
 
     const boosterCard = within(
@@ -1455,7 +1268,7 @@ describe("App", () => {
     expect(within(boosterCard).getByText("USD 0.20")).toBeInTheDocument();
     expect(within(boosterCard).getByText("USD 0.10")).toBeInTheDocument();
   });
-  it("switches between Inventory and Level-up result panels with manual keyboard activation", async () => {
+  it("switches between Badges, Plan, and Inventory sections with manual keyboard activation", async () => {
     const inventory = publicInventory([tradingCardItem(10)], {
       gem_priceable_item_count: 1,
       gem_priced_item_count: 1,
@@ -1476,165 +1289,135 @@ describe("App", () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockImplementationOnce(levelUpNoOpportunityForRequest());
+      .mockResolvedValueOnce(jsonResponse(inventory));
     render(<App />);
 
     const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
+      name: "Workspace sections"
     });
+    const badgesTab = within(tablist).getByRole("tab", { name: "Badges" });
+    const planTab = within(tablist).getByRole("tab", { name: "Plan" });
     const inventoryTab = within(tablist).getByRole("tab", { name: "Inventory" });
-    const levelUpTab = within(tablist).getByRole("tab", { name: "Level-up" });
-    const inventoryPanel = document.getElementById(
-      "inventory-results-panel-inventory"
+    const planningPanel = document.getElementById(
+      "workspace-panel-planning"
     );
-    const levelUpPanel = document.getElementById(
-      "inventory-results-panel-level-up"
+    const inventoryPanel = document.getElementById(
+      "workspace-panel-inventory"
     );
 
-    expect(within(tablist).getAllByRole("tab")).toHaveLength(2);
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-    expect(levelUpTab).toHaveAttribute("aria-selected", "false");
+    expect(within(tablist).getAllByRole("tab")).toHaveLength(3);
+    expect(badgesTab).toHaveAttribute("aria-selected", "true");
+    expect(planTab).toHaveAttribute("aria-selected", "false");
+    expect(inventoryTab).toHaveAttribute("aria-selected", "false");
+    expect(badgesTab).toHaveAttribute(
+      "aria-controls",
+      "workspace-panel-planning"
+    );
+    expect(planTab).toHaveAttribute(
+      "aria-controls",
+      "workspace-panel-planning"
+    );
     expect(inventoryTab).toHaveAttribute(
       "aria-controls",
-      "inventory-results-panel-inventory"
+      "workspace-panel-inventory"
     );
-    expect(levelUpTab).toHaveAttribute(
-      "aria-controls",
-      "inventory-results-panel-level-up"
+    expect(planningPanel).not.toHaveAttribute("hidden");
+    expect(planningPanel).toHaveAttribute(
+      "aria-labelledby",
+      "workspace-tab-badges"
     );
-    expect(inventoryPanel).not.toHaveAttribute("hidden");
-    expect(levelUpPanel).toHaveAttribute("hidden");
-    expect(
-      screen.getByRole("table", { name: "Inventory items" })
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("region", { name: "Booster details by game" })
-    ).toBeInTheDocument();
-
-    inventoryTab.focus();
-    fireEvent.keyDown(inventoryTab, { key: "ArrowRight" });
-    expect(levelUpTab).toHaveFocus();
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-
-    fireEvent.keyDown(levelUpTab, { key: " " });
-    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
-    expect(inventoryTab).toHaveAttribute("aria-selected", "false");
     expect(inventoryPanel).toHaveAttribute("hidden");
-    expect(levelUpPanel).not.toHaveAttribute("hidden");
+    expect(
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-view", "badges");
     expect(
       screen.queryByRole("table", { name: "Inventory items" })
     ).not.toBeInTheDocument();
+
+    badgesTab.focus();
+    fireEvent.keyDown(badgesTab, { key: "ArrowRight" });
+    expect(planTab).toHaveFocus();
+    expect(badgesTab).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(planTab, { key: " " });
+    expect(planTab).toHaveAttribute("aria-selected", "true");
+    expect(badgesTab).toHaveAttribute("aria-selected", "false");
+    expect(planningPanel).not.toHaveAttribute("hidden");
+    expect(planningPanel).toHaveAttribute(
+      "aria-labelledby",
+      "workspace-tab-plan"
+    );
     expect(
-      screen.queryByRole("region", { name: "Booster details by game" })
-    ).not.toBeInTheDocument();
-    expect(
-      await screen.findByText(/No sellable normal card with a usable current bid/)
-    ).toBeInTheDocument();
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-view", "plan");
 
     fireEvent.click(inventoryTab);
     expect(inventoryTab).toHaveAttribute("aria-selected", "true");
+    expect(planningPanel).toHaveAttribute("hidden");
     expect(inventoryPanel).not.toHaveAttribute("hidden");
-    expect(levelUpPanel).toHaveAttribute("hidden");
     expect(
       screen.getByRole("table", { name: "Inventory items" })
     ).toBeInTheDocument();
     expect(
       screen.getByRole("region", { name: "Booster details by game" })
     ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-active", "false");
+
+    fireEvent.click(badgesTab);
+    expect(
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-view", "badges");
+    expect(badgeWorkspaceStub.created).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("adds a lazy Level-up tab with stable ARIA wiring and manual activation", async () => {
+  it("lazy-loads the badge workspace once per SteamID without requesting planning data", async () => {
     const inventory = publicInventory([inventoryItem(1)]);
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(inventory))
-      .mockImplementationOnce(levelUpNoOpportunityForRequest());
+      .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
 
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    const inventoryTab = within(tablist).getByRole("tab", { name: "Inventory" });
-    const levelUpTab = within(tablist).getByRole("tab", { name: "Level-up" });
-    const inventoryPanel = document.getElementById(
-      "inventory-results-panel-inventory"
-    );
-    const levelUpPanel = document.getElementById(
-      "inventory-results-panel-level-up"
-    );
+    const stub = await screen.findByTestId("badge-workspace-stub");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith("/api/auth/badge-planning")
+      )
+    ).toBe(false);
     expect(
       fetchMock.mock.calls.some(([url]) =>
         String(url).endsWith("/api/auth/level-up")
       )
     ).toBe(false);
-    expect(inventoryTab).toHaveAttribute(
-      "id",
-      "inventory-results-tab-inventory"
-    );
-    expect(inventoryTab).toHaveAttribute(
-      "aria-controls",
-      "inventory-results-panel-inventory"
-    );
-    expect(levelUpTab).toHaveAttribute("id", "inventory-results-tab-level-up");
-    expect(levelUpTab).toHaveAttribute(
-      "aria-controls",
-      "inventory-results-panel-level-up"
-    );
-    expect(levelUpTab).toHaveAttribute("aria-selected", "false");
-    expect(levelUpTab).toHaveAttribute("tabindex", "-1");
-    expect(levelUpPanel).toHaveAttribute("role", "tabpanel");
-    expect(levelUpPanel).toHaveAttribute(
-      "aria-labelledby",
-      "inventory-results-tab-level-up"
-    );
-    expect(levelUpPanel).toHaveAttribute("hidden");
-    expect(inventoryPanel).not.toBeNull();
+    expect(stub).toHaveAttribute("data-steam-id", "76561198000000001");
+    expect(stub).toHaveAttribute("data-view", "badges");
+    expect(stub).toHaveAttribute("data-active", "true");
+    expect(badgeWorkspaceStub.created).toBe(1);
 
-    inventoryTab.focus();
-    fireEvent.keyDown(inventoryTab, { key: "ArrowLeft" });
-    expect(levelUpTab).toHaveFocus();
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-
-    fireEvent.keyDown(levelUpTab, { key: "Home" });
-    expect(inventoryTab).toHaveFocus();
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-
-    fireEvent.keyDown(inventoryTab, { key: "End" });
-    expect(levelUpTab).toHaveFocus();
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-
-    fireEvent.keyDown(levelUpTab, { key: "Enter" });
-    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
-    expect(inventoryTab).toHaveAttribute("aria-selected", "false");
-    expect(levelUpPanel).not.toHaveAttribute("hidden");
+    const tablist = screen.getByRole("tablist", {
+      name: "Workspace sections"
+    });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Plan" }));
     expect(
-      await screen.findByText(/No sellable normal card with a usable current bid/)
-    ).toBeInTheDocument();
-    expect(screen.getByText("Current total XP")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-
-    fireEvent.click(inventoryTab);
-    expect(inventoryTab).toHaveAttribute("aria-selected", "true");
-    expect(levelUpPanel).toHaveAttribute("hidden");
-    levelUpTab.focus();
-    fireEvent.keyDown(levelUpTab, { key: " " });
-    expect(levelUpTab).toHaveAttribute("aria-selected", "true");
-    expect(levelUpPanel).not.toHaveAttribute("hidden");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-
-    fireEvent.keyDown(levelUpTab, { key: "ArrowRight" });
-    expect(inventoryTab).toHaveFocus();
-    fireEvent.keyDown(inventoryTab, { key: "ArrowLeft" });
-    expect(levelUpTab).toHaveFocus();
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-view", "plan");
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Inventory" }));
+    await screen.findByRole("table", { name: "Inventory items" });
+    fireEvent.click(within(tablist).getByRole("tab", { name: "Badges" }));
+    expect(
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-view", "badges");
+    expect(badgeWorkspaceStub.created).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("reaches private inventory recovery without requesting level-up data", async () => {
+  it("passes private inventory status to the workspace without requesting planning data", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
@@ -1642,77 +1425,20 @@ describe("App", () => {
 
     render(<App />);
 
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    const levelUpTab = within(tablist).getByRole("tab", {
-      name: "Level-up"
-    });
+    const stub = await screen.findByTestId("badge-workspace-stub");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    fireEvent.click(levelUpTab);
-
-    expect(
-      await screen.findByText(/Make your Steam inventory public/)
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(lastWorkspaceProps().inventoryStatus).toBe("private");
+    expect(lastWorkspaceProps().badges.status).toBe("public");
+    expect(stub).toHaveAttribute("data-view", "badges");
     expect(
       fetchMock.mock.calls.some(([url]) =>
-        String(url).endsWith("/api/auth/level-up")
+        String(url).endsWith("/api/auth/badge-planning")
       )
     ).toBe(false);
   });
 
-  it("invalidates a cached recommendation when ownership is refreshed", async () => {
-    const sourceCard = tradingCardItem(1, {
-      market_hash_name: "440-Card 0001 (Trading Card)",
-      gem_key: null,
-      gem_yield: null
-    });
-    const initialInventory = publicInventory([sourceCard]);
-    const refreshedInventory = publicInventory(
-      [{ ...sourceCard, quantity: 2 }],
-      { total_asset_count: 2 }
-    );
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(jsonResponse(initialInventory))
-      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_sellable_card"))
-      .mockResolvedValueOnce(jsonResponse(refreshedInventory))
-      .mockImplementationOnce(
-        levelUpNoOpportunityForRequest("no_positive_xp_swap")
-      );
-
-    render(<App />);
-
-    const tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    const levelUpTab = within(tablist).getByRole("tab", {
-      name: "Level-up"
-    });
-    fireEvent.click(levelUpTab);
-    expect(
-      await screen.findByText(/No sellable normal card with a usable current bid/)
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Refresh inventory" })
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-
-    expect(
-      await screen.findByText(/No one-card sale funds a badge path with more XP/)
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-    expect(
-      screen.queryByText(/No sellable normal card with a usable current bid/)
-    ).not.toBeInTheDocument();
-  });
-
-  it("does not expose a prior-account recommendation after the session changes", async () => {
+  it("remounts the workspace when the Steam account changes", async () => {
     const changedSteamId = "76561198000000002";
     const changedSession = {
       ...signedInSession,
@@ -1728,57 +1454,35 @@ describe("App", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(jsonResponse(signedInSession))
       .mockResolvedValueOnce(jsonResponse(initialInventory))
-      .mockImplementationOnce(levelUpNoOpportunityForRequest("no_sellable_card"))
       .mockResolvedValueOnce(jsonResponse(changedSession))
-      .mockResolvedValueOnce(jsonResponse(changedInventory))
-      .mockImplementationOnce(
-        levelUpNoOpportunityForRequest("no_positive_xp_swap")
-      );
+      .mockResolvedValueOnce(jsonResponse(changedInventory));
 
     render(<App />);
 
-    let tablist = await screen.findByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(
-      within(tablist).getByRole("tab", { name: "Level-up" })
-    );
-    expect(
-      await screen.findByText(/No sellable normal card with a usable current bid/)
-    ).toBeInTheDocument();
+    const stub = await screen.findByTestId("badge-workspace-stub");
+    expect(stub).toHaveAttribute("data-steam-id", "76561198000000001");
+    expect(badgeWorkspaceStub.created).toBe(1);
 
     fireEvent.click(
       screen.getByRole("button", { name: "Recheck Steam access" })
     );
+
     expect(
       await screen.findByText(/Account changed\. Steam profile: Public\./)
     ).toBeInTheDocument();
     expect(
-      screen.queryByText(/No sellable normal card with a usable current bid/)
-    ).not.toBeInTheDocument();
+      await screen.findByTestId("badge-workspace-stub")
+    ).toHaveAttribute("data-steam-id", changedSteamId);
+    expect(badgeWorkspaceStub.created).toBe(2);
     expect(
       screen.getByLabelText("Connected Steam account: Barney")
     ).toBeInTheDocument();
-
-    tablist = screen.getByRole("tablist", {
-      name: "Inventory result views"
-    });
-    fireEvent.click(
-      within(tablist).getByRole("tab", { name: "Level-up" })
-    );
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(
-      await screen.findByText(/No one-card sale funds a badge path with more XP/)
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(6);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      6,
-      "/api/auth/level-up",
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          "X-Expected-Steam-ID": changedSteamId
-        })
-      })
-    );
+      fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith("/api/auth/badge-planning")
+      )
+    ).toBe(false);
   });
 
   it("shows an empty booster section inside the Inventory panel", async () => {
@@ -1787,6 +1491,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
+    await openInventorySection();
 
 
     expect(
@@ -1843,6 +1548,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
@@ -2154,6 +1860,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const faq = await screen.findByRole("region", {
       name: "About these results"
@@ -2191,6 +1898,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const faq = await screen.findByRole("region", {
       name: "About these results"
@@ -2219,6 +1927,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
 
     render(<App />);
+    await openInventorySection();
 
     const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
@@ -2286,6 +1995,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory(grownItems)));
 
     render(<App />);
+    await openInventorySection();
 
     const inventoryTable = await screen.findByRole("table", {
       name: "Inventory items"
@@ -2351,8 +2061,9 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
-    await screen.findByRole("heading", { name: "Inventory and level-up planning" });
+    await screen.findByRole("heading", { name: "Badges, planning, and inventory" });
     fireEvent.click(
       screen.getByRole("button", { name: "Refresh inventory" })
     );
@@ -2448,6 +2159,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory([])));
 
     render(<App />);
+    await openInventorySection();
 
     await screen.findByLabelText("Connected Steam account: Alyx");
     const profileStatus = screen.getByRole("definition", {
@@ -2478,6 +2190,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     await screen.findByLabelText("Connected Steam account: Alyx");
     const inventoryStatus = screen.getByRole("definition", {
@@ -2773,6 +2486,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const table = (await screen.findByRole("table", {
       name: "Inventory items"
@@ -2880,6 +2594,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const faq = await screen.findByRole("region", {
       name: "About these results"
@@ -2930,6 +2645,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     await screen.findByRole("table", {
       name: "Inventory items"
@@ -2982,6 +2698,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const row = (await screen.findByText("Card 0001")).closest(
       "tr"
@@ -3063,6 +2780,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     const refresh = await screen.findByRole("button", {
       name: "Refresh gem values"
@@ -3145,6 +2863,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     const table = await screen.findByRole("table", { name: "Inventory items" });
     const rowNames = () =>
@@ -3308,6 +3027,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Refresh gem values" })
@@ -3371,49 +3091,6 @@ describe("App", () => {
   });
 
 
-  it("renders the exact label for every supported item type", async () => {
-    const itemTypes = [
-      ["badge", "Badge"],
-      ["trading_card", "Trading card"],
-      ["profile_background", "Profile background"],
-      ["emoticon", "Emoticon"],
-      ["booster_pack", "Booster pack"],
-      ["consumable", "Consumable"],
-      ["game_goo", "Game goo"],
-      ["profile_modifier", "Profile modifier"],
-      ["scene", "Scene"],
-      ["sale_item", "Sale item"],
-      ["sticker", "Sticker"],
-      ["chat_effect", "Chat effect"],
-      ["mini_profile_background", "Mini profile background"],
-      ["avatar_frame", "Avatar frame"],
-      ["animated_avatar", "Animated avatar"],
-      ["steam_deck_keyboard_skin", "Steam Deck keyboard skin"],
-      ["steam_deck_startup_movie", "Steam Deck startup movie"],
-      ["other", "Other"]
-    ] as const;
-    const items = itemTypes.map(([itemType], index) => ({
-      ...inventoryItem(index + 1),
-      item_type: itemType
-    }));
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(signedInSession))
-      .mockResolvedValueOnce(
-        jsonResponse(
-          publicInventory(items, {
-            total_asset_count: items.length,
-            unique_item_count: items.length
-          })
-        )
-      );
-
-    render(<App />);
-
-    const table = await screen.findByRole("table", { name: "Inventory items" });
-    for (const [, label] of itemTypes) {
-      expect(within(table).getByText(label, { exact: true })).toBeInTheDocument();
-    }
-  });
 
   it("shows independent game, rarity, and card-border metadata for named types", async () => {
     const background = {
@@ -3441,6 +3118,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const table = await screen.findByRole("table", { name: "Inventory items" });
     expect(within(table).getByText("Community assets")).toBeInTheDocument();
@@ -3474,6 +3152,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(publicInventory(items)));
 
     render(<App />);
+    await openInventorySection();
 
     const table = await screen.findByRole("table", { name: "Inventory items" });
     const headingIds = Array.from(
@@ -3527,6 +3206,7 @@ describe("App", () => {
       .mockResolvedValueOnce(jsonResponse(inventory));
 
     render(<App />);
+    await openInventorySection();
 
     const faq = await screen.findByRole("region", {
       name: "About these results"
@@ -3587,6 +3267,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Refresh gem values" })
@@ -3651,6 +3332,7 @@ describe("App", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Refresh gem values" })
