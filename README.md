@@ -3,12 +3,12 @@ Community inventory adviser for Steam users, written in
 [TypeScript](https://www.typescriptlang.org/) and [Python](https://www.python.org/) and
 released under the [GNU AGPL v3.0](LICENSE).
 
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-informational)](https://docs.python.org/3.12/)
-[![TypeScript 5.9](https://img.shields.io/badge/TypeScript-5.9-informational)](https://www.typescriptlang.org/docs/)
-[![React 19.2](https://img.shields.io/badge/React-19.2-informational)](https://react.dev/)
-[![FastAPI 0.115](https://img.shields.io/badge/FastAPI-0.115-informational)](https://fastapi.tiangolo.com/)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-informational)](https://docs.python.org/3.14/)
+[![TypeScript 5.9.3](https://img.shields.io/badge/TypeScript-5.9.3-informational)](https://www.typescriptlang.org/docs/)
+[![React 19.2.8](https://img.shields.io/badge/React-19.2.8-informational)](https://react.dev/)
+[![FastAPI 0.141.1](https://img.shields.io/badge/FastAPI-0.141.1-informational)](https://fastapi.tiangolo.com/)
 
-First released in 2026; current release: 0.1.1 (2026-08-27).
+First released in 2026; current release: 0.10.2 (2026-09-01).
 [TheRockPusher](https://github.com/TheRockPusher) maintains it to make Steam inventory and
 badge decisions transparent without automating account actions.
 
@@ -16,7 +16,7 @@ badge decisions transparent without automating account actions.
 
 Prerequisites for a fresh Linux, macOS, or Windows development environment:
 
-- [uv](https://docs.astral.sh/uv/)
+- Python 3.14, installed automatically by [uv](https://docs.astral.sh/uv/).
 - [Node.js](https://nodejs.org/) `^22.13` or `>=24`
 - [pnpm](https://pnpm.io/installation) 10
 - Optional: a server-only [Steam Web API key](https://steamcommunity.com/dev/apikey) for a
@@ -58,6 +58,10 @@ GET http://localhost:8000/api/health
 Full product boundaries and deferred work are in
 [`docs/PROJECT_SUMMARY.md`](docs/PROJECT_SUMMARY.md).
 
+The production Caddy server gives content-hashed assets a one-year immutable cache lifetime,
+revalidates HTML, and returns 404 for missing assets instead of the application's HTML. Authenticated
+API responses remain `no-store`; static asset caching does not cache inventory or recommendation data.
+
 ## Current Stage
 
 The current connection, inventory, and read-only recommendation stage provides:
@@ -85,6 +89,8 @@ The current connection, inventory, and read-only recommendation stage provides:
 - A global normalized AppID 753 market-price generation persisted in a separate server-side SQLite
   cache. It is fresh for 24 hours for inventory display, refreshes lazily, has no scheduled refresh
   job, and keeps the last valid generation as a stale display fallback when refresh fails.
+  File-backed price caches use SQLite write-ahead logging (WAL), allowing reads of the committed
+  generation during a streamed refresh. Cancellation rolls back the unfinished generation.
 - Current cached AppID 753 prices are joined to marketable inventory items with explicit
   `complete`, `partial`, or `unavailable` price coverage.
 - Canonical names and independent game, rarity, and card-border metadata for every Steam Community
@@ -105,6 +111,8 @@ The current connection, inventory, and read-only recommendation stage provides:
   fee-aware card-sale optimizer remains read-only and does not request anything until the user
   opens this page. It requires a public inventory and an eligible ownership timestamp; otherwise
   it shows the existing recovery or **Refresh inventory** state.
+  The optimizer panel's JavaScript loads on first activation and stays mounted across tab switches.
+  A failed module download offers an explicit reload without removing inventory or the calculator.
 - On optimizer activation, `LevelUpOptimizationPanel` reuses already-loaded inventory items, game
   metadata, badges, and boosters. It joins every normal-card AppID to its inventory game name and
   card-set size and to the in-memory session badge snapshot in linear maps, including games that
@@ -119,8 +127,8 @@ The current connection, inventory, and read-only recommendation stage provides:
   a true unavailable state is shown only when the refresh cannot be started or prices remain
   unusable after it finishes.
 - The optimizer validates the submitted game IDs against normal-card hashes and reads the price
-  catalog only for those AppIDs through the `(generation, normal_card_app_id)` index; unrelated
-  catalog groups are not loaded. It evaluates every held sellable normal card as a one-copy
+  catalog only for those AppIDs through the `(generation, normal_card_app_id, market_hash_name)` index;
+  unrelated catalog groups are not loaded. It evaluates every held sellable normal card as a one-copy
   source candidate, including cards from maxed badges, while destinations remain below normal
   badge level five. Foil, non-game, unrelated event, and collection records are excluded. The
   validated session badge snapshot remains the sole badge-state input for the recommendation.
@@ -361,8 +369,8 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
   retain a stale 24-hour generation after a failed lazy refresh; the optimizer independently
   rejects stale generations and quotes beyond its configured age limits.
 - Money and recommendation caveat: SteamApis omits currency metadata from its bulk feed, so
-  ordinary order-book values remain exact provider-denominated decimals and display without a
-  currency symbol. The optimizer is enabled only by a complete, verified `LEVEL_UP_*` contract
+  inventory values retain exact decimals and are labeled USD under the application's denomination,
+  not a currency field attested by the feed. The optimizer requires a complete, verified `LEVEL_UP_*` contract
   with an uppercase currency code, integer minor digits, the exact `buyer_total` basis, fee rates,
   per-item minimum, and freshness windows. It converts prices exactly to integer minor units,
   calculates each fee per item, and inverts the sale quote to an exact seller receipt. Missing-card
@@ -439,9 +447,9 @@ was last updated on 2026-08-30.
   when some but not all priceable rows are priced, and `unavailable` when zero priceable rows are
   priced or no usable provider generation exists. Null prices remain visible as such.
 - Currency and recommendation caveats: SteamApis omits currency metadata from its bulk feed.
-  Ordinary order-book values are preserved exactly as provider-denominated decimals and displayed
-  without a currency symbol. The optimizer displays money only after the complete verified
-  `LEVEL_UP_*` contract supplies the currency code, minor digits, exact `buyer_total` basis, fee
+  Inventory values retain exact decimals and are labeled USD under the application's denomination,
+  not a currency field attested by the feed. The optimizer displays money only after the complete
+  verified `LEVEL_UP_*` contract supplies the currency code, minor digits, exact `buyer_total` basis, fee
   rates, per-item minimum, and freshness windows. It converts values exactly to integer minor
   units, calculates fees per item, and uses the exact seller receipt as the purchase budget. Any
   gross comparison is derived with `calculate_item_fees(required_receipt, contract)`, never by

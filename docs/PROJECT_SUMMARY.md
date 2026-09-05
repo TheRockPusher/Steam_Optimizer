@@ -39,6 +39,9 @@ the current browser inventory record and its loaded game metadata, sends one bou
 returns a complete advisory plan or an explicit no-opportunity or unavailable state. The endpoint
 does not fetch inventory or badges, never resolves booster/card-set metadata, and does not store the
 submitted snapshot.
+The optimizer panel's JavaScript is loaded on first activation and its mounted instance is retained
+across tab switches. Module-download failures are contained locally with an explicit reload action;
+the already-loaded inventory and local target-level calculator remain usable.
 
 ## Safety and identity boundary
 
@@ -80,12 +83,16 @@ declared item count equals the number of completely parsed item rows. Missing or
 completeness metadata aborts the refresh and preserves the prior generation. The bulk feed is
 streamed and discarded after normalization rather than materialized or retained. Raw feed data,
 API keys, and redirect URLs are not persisted.
+File-backed price caches use write-ahead logging (WAL): reads retain the last committed generation
+during a refresh, and cancellation rolls back only the unfinished generation. Stream parsing yields
+cooperatively between bounded segments. Cache operations stay on the event-loop thread; keep one
+backend worker because refresh coordination and provider rate limiting are process-local.
 
 The bulk feed is filtered and joined to marketable inventory items, so some items may have no
 current price and the result can be `partial` or `unavailable` even when the inventory itself is
-public. SteamApis omits currency metadata from its bulk feed. Ordinary order-book values are
-preserved exactly as provider-denominated decimals and displayed without a currency symbol; they
-are not money until the provider contract has been verified and configured.
+public. SteamApis omits currency metadata from its bulk feed. The inventory UI preserves exact
+decimals and labels them USD under the application's denomination, not a currency field attested by
+the feed. The optimizer separately requires a complete, verified money contract before returning a plan.
 
 ### Level-up recommendation boundary
 
@@ -132,7 +139,7 @@ state until the user refreshes.
 
 For that request, the backend validates that the `games` IDs exactly match AppIDs parsed from normal
 card hashes and reads the current price-catalog generation only for those submitted AppIDs through
-the `(generation, normal_card_app_id)` index. It never waits for the global SteamApis bulk download:
+the `(generation, normal_card_app_id, market_hash_name)` index. It never waits for the bulk download:
 a missing or stale generation queues one shared background refresh. While that task runs, the
 frontend shows a loading state and retries every five seconds; it shows an unavailable state only
 when the refresh cannot start or its completed generation remains unusable. Unrelated catalog groups
