@@ -11,7 +11,11 @@ import {
   buildSteamMarketListingUrl,
   buildSteamProfileGamecardsUrl,
   formatMinorUnits,
+  isLevelUpOptimizationRequest,
   isLevelUpOptimizationResponse,
+  isNormalCardMarketHashName,
+  normalCardAppId,
+  normalCardName,
   requestLevelUpOptimization,
   type LevelUpOptimizationResponse,
   type LevelUpReadyResponse
@@ -170,6 +174,7 @@ const inventoryItems = [
     marketable: true,
     tradable: true,
     item_type: "trading_card",
+    card_border: "normal",
     game_app_id: "440",
     game_name: "Team Fortress 2",
     icon_url: "https://community.cloudflare.steamstatic.com/economy/image/source-0"
@@ -179,14 +184,16 @@ const inventoryItems = [
     quantity: 1,
     marketable: true,
     tradable: false,
-    item_type: "trading_card"
+    item_type: "trading_card",
+    card_border: "normal"
   },
   {
     market_hash_name: "440-Source 1 (Trading Card)",
     quantity: 1,
     marketable: false,
     tradable: true,
-    item_type: "trading_card"
+    item_type: "trading_card",
+    card_border: "normal"
   },
   {
     market_hash_name: "570-Owned 0 (Trading Card)",
@@ -194,6 +201,7 @@ const inventoryItems = [
     marketable: false,
     tradable: true,
     item_type: "trading_card",
+    card_border: "normal",
     game_app_id: "570",
     game_name: "Dota 2"
   },
@@ -203,6 +211,7 @@ const inventoryItems = [
     marketable: false,
     tradable: true,
     item_type: "trading_card",
+    card_border: "normal",
     game_app_id: "570",
     game_name: "Dota 2"
   },
@@ -212,6 +221,7 @@ const inventoryItems = [
     marketable: false,
     tradable: true,
     item_type: "trading_card",
+    card_border: "normal",
     game_app_id: "570",
     game_name: "Dota 2"
   },
@@ -220,14 +230,128 @@ const inventoryItems = [
     quantity: 1,
     marketable: true,
     tradable: true,
-    item_type: "trading_card"
+    item_type: "trading_card",
+    card_border: "foil",
+    game_app_id: "440",
+    game_name: "Team Fortress 2"
   },
   {
     market_hash_name: "440-Background (Profile Background)",
     quantity: 2,
     marketable: true,
     tradable: true,
-    item_type: "profile_background"
+    item_type: "profile_background",
+    card_border: null,
+    game_app_id: "440",
+    game_name: "Team Fortress 2"
+  }
+];
+
+/**
+ * Real Half-Life 2 inventory snapshot: canonical unsuffixed market hashes plus
+ * foils and backgrounds that look like cards on syntax alone. Only explicit
+ * item_type/card_border metadata separates them.
+ */
+const halfLife2InventoryItems = [
+  {
+    market_hash_name: "220-Gordon Freeman",
+    quantity: 2,
+    marketable: true,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Respite",
+    quantity: 1,
+    marketable: true,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Alyx Vance",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Crowbar",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Gravity Gun",
+    quantity: 1,
+    marketable: false,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Gordon Freeman (Foil Trading Card)",
+    quantity: 3,
+    marketable: true,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "foil",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Respite (Trading Card)",
+    quantity: 4,
+    marketable: true,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "foil",
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Testchamber Sign (Profile Background)",
+    quantity: 1,
+    marketable: true,
+    tradable: true,
+    item_type: "profile_background",
+    card_border: null,
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "220-Background (Trading Card)",
+    quantity: 2,
+    marketable: true,
+    tradable: true,
+    item_type: "profile_background",
+    card_border: null,
+    game_app_id: "220",
+    game_name: "Half-Life 2"
+  },
+  {
+    market_hash_name: "440-Source 0 (Trading Card)",
+    quantity: 1,
+    marketable: true,
+    tradable: true,
+    item_type: "trading_card",
+    card_border: "normal",
+    game_app_id: "440",
+    game_name: "Team Fortress 2"
   }
 ];
 
@@ -315,6 +439,7 @@ describe("normal-card ownership snapshots", () => {
           marketable: false,
           tradable: false,
           item_type: "trading_card",
+          card_border: "normal",
           game_app_id: "730",
           game_name: "Counter-Strike 2"
         }
@@ -400,6 +525,38 @@ describe("normal-card ownership snapshots", () => {
         inventoryRefreshedAt
       )
     ).toThrow("Inventory game metadata is unavailable.");
+  });
+  it("classifies unsuffixed Half-Life 2 cards by metadata and rejects suffix-looking foils and backgrounds", () => {
+    expect(aggregateNormalCardOwnership(halfLife2InventoryItems)).toEqual([
+      { market_hash_name: "220-Alyx Vance", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Crowbar", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Gordon Freeman", owned_quantity: 2, sellable_quantity: 2 },
+      { market_hash_name: "220-Gravity Gun", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Respite", owned_quantity: 1, sellable_quantity: 1 },
+      { market_hash_name: "440-Source 0 (Trading Card)", owned_quantity: 1, sellable_quantity: 1 }
+    ]);
+    const request = buildLevelUpOptimizationRequest(
+      halfLife2InventoryItems,
+      [
+        { game_app_id: "220", game_name: "Half-Life 2", card_set_size: 5 },
+        { game_app_id: "440", game_name: "Team Fortress 2", card_set_size: 5 }
+      ],
+      { ...badges, normal_badge_levels: [{ app_id: 220, level: 1 }] },
+      inventoryRefreshedAt
+    );
+    expect(request.games).toEqual([
+      { app_id: "220", game_name: "Half-Life 2", card_set_size: 5, badge_level: 1 },
+      { app_id: "440", game_name: "Team Fortress 2", card_set_size: 5, badge_level: 0 }
+    ]);
+    expect(request.cards).toEqual([
+      { market_hash_name: "220-Alyx Vance", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Crowbar", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Gordon Freeman", owned_quantity: 2, sellable_quantity: 2 },
+      { market_hash_name: "220-Gravity Gun", owned_quantity: 1, sellable_quantity: 0 },
+      { market_hash_name: "220-Respite", owned_quantity: 1, sellable_quantity: 1 },
+      { market_hash_name: "440-Source 0 (Trading Card)", owned_quantity: 1, sellable_quantity: 1 }
+    ]);
+    expect(isLevelUpOptimizationRequest(request)).toBe(true);
   });
 });
 
@@ -651,6 +808,74 @@ describe("request and safe navigation helpers", () => {
       "The level-up optimization service returned an invalid response."
     );
   });
+  it("parses unsuffixed and suffixed canonical hashes without classifying by syntax", () => {
+    expect(isNormalCardMarketHashName("220-Gordon Freeman")).toBe(true);
+    expect(isNormalCardMarketHashName("220-Gordon Freeman (Trading Card)")).toBe(true);
+    expect(isNormalCardMarketHashName("440-Card (Foil Trading Card)")).toBe(true);
+    expect(isNormalCardMarketHashName("440-")).toBe(false);
+    expect(isNormalCardMarketHashName("440- (Trading Card)")).toBe(false);
+    expect(isNormalCardMarketHashName("0440-Card")).toBe(false);
+    expect(normalCardAppId("220-Gordon Freeman")).toBe("220");
+    expect(normalCardAppId("220-Gordon Freeman (Trading Card)")).toBe("220");
+    expect(normalCardName("220-Gordon Freeman")).toBe("Gordon Freeman");
+    expect(normalCardName("440-Source 0 (Trading Card)")).toBe("Source 0");
+    expect(normalCardName("not-a-card")).toBeNull();
+  });
+
+  it("accepts a ready plan referencing unsuffixed hashes for the submitted snapshot", async () => {
+    const request = buildLevelUpOptimizationRequest(
+      halfLife2InventoryItems,
+      [
+        { game_app_id: "220", game_name: "Half-Life 2", card_set_size: 5 },
+        { game_app_id: "440", game_name: "Team Fortress 2", card_set_size: 5 }
+      ],
+      badges,
+      inventoryRefreshedAt
+    );
+    const response = readyResponse();
+    response.source = {
+      app_id: "220",
+      game_name: "Half-Life 2",
+      badge_level: 0,
+      set_size: 5,
+      rows: [{
+        market_hash_name: "220-Gordon Freeman",
+        card_name: "Gordon Freeman",
+        quantity: 1 as const,
+        buyer_total: 15,
+        steam_fee: 1,
+        publisher_fee: 1,
+        seller_receipt: 13,
+        top_bid_quantity: 2,
+        quote_timestamp: "2026-08-29T11:59:00Z"
+      }]
+    };
+    response.destinations = [{
+      app_id: "440",
+      game_name: "Team Fortress 2",
+      badge_level_before: 0,
+      badge_level_after: 1,
+      set_size: 5,
+      owned_card_count: 1,
+      rows: [
+        { ...buyRow("440", 0), buyer_total: 3 },
+        { ...buyRow("440", 1), buyer_total: 3 },
+        { ...buyRow("440", 2), buyer_total: 3 },
+        { ...buyRow("440", 3), buyer_total: 3 }
+      ],
+      missing_cards_total: 12,
+      craft_xp: 100
+    }];
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    await expect(
+      requestLevelUpOptimization(steamId, request)
+    ).resolves.toEqual(response);
+  });
 
   it("uses fixed Steam origins and encodes path segments", () => {
     expect(buildSteamMarketListingUrl("440-A/B?C (Trading Card)")).toBe(
@@ -658,6 +883,10 @@ describe("request and safe navigation helpers", () => {
     );
     expect(buildSteamMarketListingUrl("440-Literal%20Name (Trading Card)")).toBe(
       "https://steamcommunity.com/market/listings/753/440-Literal%2520Name%20(Trading%20Card)"
+    );
+    // Unsuffixed hashes keep their real market hash in the URL.
+    expect(buildSteamMarketListingUrl("220-Gordon Freeman")).toBe(
+      "https://steamcommunity.com/market/listings/753/220-Gordon%20Freeman"
     );
     expect(buildSteamProfileGamecardsUrl(steamId, "440")).toBe(
       `https://steamcommunity.com/profiles/${steamId}/gamecards/440/`

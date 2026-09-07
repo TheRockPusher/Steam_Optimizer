@@ -565,6 +565,7 @@ def test_live_provider_market_buckets_resolve_exact_gem_values() -> None:
                     descriptions=descriptions,
                 ),
             ),
+            card_sets_response(),
             price_redirect(),
         ],
         stream_response=price_stream(
@@ -764,6 +765,36 @@ def price_redirect() -> FakeResponse:
             )
         },
     )
+
+
+def card_sets_payload(
+    names_by_app: Mapping[int | str, Sequence[str]],
+) -> dict[str, object]:
+    """Build one authoritative normal-card composition payload."""
+    sets = [
+        {
+            "appid": app_id,
+            "game": f"Game {app_id}",
+            "normal": {
+                "count": len(names),
+                "names": list(names),
+            },
+        }
+        for app_id, names in names_by_app.items()
+    ]
+    return {"data": {"games": len(sets), "cards": 0, "foils": 0, "sets": sets}}
+
+
+def card_sets_response(
+    *names: str,
+    app_id: int | str = 440,
+    status_code: int = 200,
+    payload: object = None,
+) -> FakeResponse:
+    """One bounded composition feed response for the refresh lifecycle."""
+    if payload is None:
+        payload = card_sets_payload({app_id: list(names)} if names else {})
+    return FakeResponse(status_code, payload)
 
 
 def price_stream(
@@ -993,6 +1024,7 @@ def test_inventory_aggregation_sort_icons_and_partial_prices() -> None:
     client = FakeHTTPClient(
         [
             inventory_response,
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={
@@ -1052,7 +1084,10 @@ def test_inventory_items_sort_class_ids_by_string_order() -> None:
 
 def test_bulk_redirect_rejects_non_https_without_streaming() -> None:
     client = FakeHTTPClient(
-        [FakeResponse(302, headers={"Location": "http://cdn.example/items.json"})]
+        [
+            card_sets_response(),
+            FakeResponse(302, headers={"Location": "http://cdn.example/items.json"}),
+        ]
     )
     lookup = run(
         SteamGateway(settings(), http_client=client).steamapis.fetch_prices(
@@ -1098,7 +1133,9 @@ def test_provider_amount_is_exact_fixed_point_and_bounded(
 def test_bulk_redirect_rejects_unverified_origins_and_ports(
     location: str,
 ) -> None:
-    client = FakeHTTPClient([FakeResponse(302, headers={"Location": location})])
+    client = FakeHTTPClient(
+        [card_sets_response(), FakeResponse(302, headers={"Location": location})]
+    )
     lookup = run(
         SteamGateway(settings(), http_client=client).steamapis.fetch_prices(
             frozenset({"Name"})
@@ -1111,7 +1148,7 @@ def test_bulk_redirect_rejects_unverified_origins_and_ports(
 def test_bulk_redirect_accepts_verified_r2_suffix_on_default_https_port() -> None:
     location = f"https://prices{STEAMAPIS_BULK_HOST_SUFFIX}/items.json"
     client = FakeHTTPClient(
-        [FakeResponse(302, headers={"Location": location})],
+        [card_sets_response(), FakeResponse(302, headers={"Location": location})],
         stream_response=FakeResponse(200, chunks=[b'{"items":[]}']),
     )
     lookup = run(
@@ -1272,6 +1309,7 @@ def test_price_coverage_is_per_row_and_nonmarketable_rows_stay_unpriced() -> Non
                     descriptions=descriptions,
                 ),
             ),
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={
@@ -1318,6 +1356,7 @@ def test_inventory_includes_booster_price_and_card_count() -> None:
                     ],
                 ),
             ),
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={
@@ -1377,6 +1416,7 @@ def test_truncated_bulk_json_preserves_public_inventory() -> None:
                     ],
                 ),
             ),
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={
@@ -1399,6 +1439,7 @@ def test_truncated_bulk_json_preserves_public_inventory() -> None:
 def test_price_join_checks_case_sensitive_unquoted_name() -> None:
     client = FakeHTTPClient(
         [
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={"Location": "https://prices.r2.cloudflarestorage.com/list"},
@@ -1419,16 +1460,16 @@ def test_price_join_checks_case_sensitive_unquoted_name() -> None:
     )
     assert lookup.status == "complete"
     assert lookup.prices["Encoded Name"].lowest_sell == "0.25"
-    assert client.get_calls[0]["headers"] == {
+    assert client.get_calls[1]["headers"] == {
         "x-api-key": "server-only-key",
         "User-Agent": "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)",
     }
-    assert client.get_calls[0]["follow_redirects"] is False
+    assert client.get_calls[1]["follow_redirects"] is False
 
 
 def test_price_stream_decodes_percent_literal_exactly_once() -> None:
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(
             200,
             chunks=[
@@ -1529,6 +1570,24 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
                     ],
                 ),
             ),
+            card_sets_response(
+                payload=card_sets_payload(
+                    {
+                        440: [
+                            f"Source Card {index} (Trading Card)"
+                            for index in range(1, 6)
+                        ],
+                        10: [
+                            f"Destination 10 Card {index} (Trading Card)"
+                            for index in range(1, 6)
+                        ],
+                        20: [
+                            f"Destination 20 Card {index} (Trading Card)"
+                            for index in range(1, 6)
+                        ],
+                    }
+                ),
+            ),
             price_redirect(),
         ]
     )
@@ -1583,7 +1642,9 @@ def test_live_literal_percent_keeps_prices_and_level_up_available(
 
 
 def test_price_cache_fresh_hit_avoids_second_provider_refresh() -> None:
-    client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    client = FakeHTTPClient(
+        [card_sets_response(), price_redirect()], stream_response=price_stream()
+    )
     steamapis = SteamApisClient(settings(), http_client=client)
 
     first = run(steamapis.fetch_prices(frozenset({"Name"})))
@@ -1591,14 +1652,19 @@ def test_price_cache_fresh_hit_avoids_second_provider_refresh() -> None:
 
     assert first.status == second.status == "complete"
     assert second.prices["Name"].lowest_sell == "0.20"
-    assert len(client.get_calls) == 1
+    assert len(client.get_calls) == 2
     assert len(client.stream_calls) == 1
 
 
 def test_price_cache_expiry_triggers_one_new_full_refresh(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
-        [price_redirect(), price_redirect()],
+        [
+            card_sets_response(),
+            price_redirect(),
+            card_sets_response(),
+            price_redirect(),
+        ],
         stream_response=price_stream(),
     )
     steamapis = SteamApisClient(
@@ -1614,7 +1680,7 @@ def test_price_cache_expiry_triggers_one_new_full_refresh(tmp_path: Path) -> Non
     refreshed = run(steamapis.fetch_prices(frozenset({"Name"})))
 
     assert refreshed.status == "complete"
-    assert len(client.get_calls) == 2
+    assert len(client.get_calls) == 4
     assert len(client.stream_calls) == 2
 
 
@@ -1650,7 +1716,9 @@ def test_price_cache_concurrent_stale_readers_coalesce_refresh(
         return {}, set(), steam_gateway._PriceStreamSummary(753, 1, 1)
 
     monkeypatch.setattr(steam_gateway, "_stream_prices", blocked_stream_with_price)
-    client = FakeHTTPClient([price_redirect()], stream_response=FakeResponse(200))
+    client = FakeHTTPClient(
+        [card_sets_response(), price_redirect()], stream_response=FakeResponse(200)
+    )
     steamapis = SteamApisClient(settings(), http_client=client)
 
     async def exercise() -> tuple[
@@ -1666,13 +1734,15 @@ def test_price_cache_concurrent_stale_readers_coalesce_refresh(
 
     first, second = run(exercise())
     assert first.status == second.status == "complete"
-    assert len(client.get_calls) == 1
+    assert len(client.get_calls) == 2
     assert len(client.stream_calls) == 1
 
 
 def test_price_cache_survives_client_restart(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
-    first_client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    first_client = FakeHTTPClient(
+        [card_sets_response(), price_redirect()], stream_response=price_stream()
+    )
     first = SteamApisClient(
         settings(steamapis_price_cache_path=str(cache_path)),
         http_client=first_client,
@@ -1699,7 +1769,7 @@ def test_price_cache_is_read_without_an_api_key_after_restart(
     first = SteamApisClient(
         settings(steamapis_price_cache_path=str(cache_path)),
         http_client=FakeHTTPClient(
-            [price_redirect()],
+            [card_sets_response(), price_redirect()],
             stream_response=price_stream(),
         ),
     )
@@ -1723,7 +1793,7 @@ def test_price_cache_is_read_without_an_api_key_after_restart(
 def test_price_cache_uses_stale_generation_when_refresh_fails(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
-        [price_redirect(), OSError("provider unavailable")],
+        [card_sets_response(), price_redirect(), OSError("provider unavailable")],
         stream_response=price_stream(),
     )
     steamapis = SteamApisClient(
@@ -1740,13 +1810,14 @@ def test_price_cache_uses_stale_generation_when_refresh_fails(tmp_path: Path) ->
     assert stale.status == "complete"
     assert stale.used_stale_cache is True
     assert stale.prices["Name"].lowest_sell == "0.20"
-    assert len(client.get_calls) == 2
+    assert len(client.get_calls) == 3
 
 
 def test_inventory_discloses_stale_price_fallback(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
         [
+            card_sets_response(),
             price_redirect(),
             FakeResponse(
                 200,
@@ -1791,6 +1862,7 @@ def test_inventory_discloses_stale_auxiliary_market_context(
     sack_name = "753-Sack of Gems"
     client = FakeHTTPClient(
         [
+            card_sets_response(),
             price_redirect(),
             FakeResponse(
                 200,
@@ -1840,21 +1912,22 @@ def test_price_cache_failed_refresh_backoff_prevents_stampede(
 ) -> None:
     now = 1_000.0
     monkeypatch.setattr(steamapis_price_cache.time, "time", lambda: now)
-    client = FakeHTTPClient([OSError("provider unavailable")])
+    client = FakeHTTPClient([card_sets_response(), OSError("provider unavailable")])
     steamapis = SteamApisClient(settings(), http_client=client)
 
     first = run(steamapis.fetch_prices(frozenset({"Name"})))
     second = run(steamapis.fetch_prices(frozenset({"Name"})))
     assert first.status == second.status == "unavailable"
-    assert len(client.get_calls) == 1
+    assert len(client.get_calls) == 2
 
     now += steamapis_price_cache.PRICE_REFRESH_RETRY_BASE_SECONDS + 1
+    client.responses.append(card_sets_response())
     client.responses.append(price_redirect())
     client.stream_response = price_stream()
     third = run(steamapis.fetch_prices(frozenset({"Name"})))
 
     assert third.status == "complete"
-    assert len(client.get_calls) == 2
+    assert len(client.get_calls) == 4
 
 
 def test_price_cache_malformed_refresh_keeps_previous_generation(
@@ -1862,7 +1935,12 @@ def test_price_cache_malformed_refresh_keeps_previous_generation(
 ) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
-        [price_redirect(), price_redirect()],
+        [
+            card_sets_response(),
+            price_redirect(),
+            card_sets_response(),
+            price_redirect(),
+        ],
         stream_response=price_stream(),
     )
     steamapis = SteamApisClient(
@@ -1903,7 +1981,12 @@ def test_price_cache_empty_json_refresh_keeps_previous_generation(
 ) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
-        [price_redirect(), price_redirect()],
+        [
+            card_sets_response(),
+            price_redirect(),
+            card_sets_response(),
+            price_redirect(),
+        ],
         stream_response=price_stream(),
     )
     steamapis = SteamApisClient(
@@ -1935,7 +2018,12 @@ def test_price_cache_cancelled_refresh_keeps_previous_generation(
 ) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
-        [price_redirect(), price_redirect()],
+        [
+            card_sets_response(),
+            price_redirect(),
+            card_sets_response(),
+            price_redirect(),
+        ],
         stream_response=price_stream(),
     )
     steamapis = SteamApisClient(
@@ -1994,13 +2082,14 @@ def test_price_cache_cancelled_refresh_keeps_previous_generation(
         )
 
         monkeypatch.setattr(steam_gateway, "_stream_prices", original_stream_prices)
+        client.responses.append(card_sets_response())
         client.responses.append(price_redirect())
         client.stream_response = price_stream()
         refreshed = await steamapis.fetch_prices(frozenset({"Name"}))
 
         assert refreshed.status == "complete"
         assert refreshed.prices["Name"].lowest_sell == "0.20"
-        assert len(client.get_calls) == 3
+        assert len(client.get_calls) == 6
         assert SteamApisPriceCache(cache_path).read().generation == 2
 
     run(exercise())
@@ -2023,7 +2112,7 @@ def test_bulk_refresh_yields_event_loop_and_cancels_mid_stream(
         + "]}"
     ).encode()
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
     steamapis = SteamApisClient(
@@ -2056,7 +2145,9 @@ def test_bulk_refresh_yields_event_loop_and_cancels_mid_stream(
 def test_price_cache_recovers_corrupt_database(tmp_path: Path) -> None:
     cache_path = tmp_path / "prices.sqlite3"
     cache_path.write_bytes(b"not a sqlite database")
-    client = FakeHTTPClient([price_redirect()], stream_response=price_stream())
+    client = FakeHTTPClient(
+        [card_sets_response(), price_redirect()], stream_response=price_stream()
+    )
     steamapis = SteamApisClient(
         settings(steamapis_price_cache_path=str(cache_path)),
         http_client=client,
@@ -2074,10 +2165,17 @@ def test_unrequested_price_numbers_are_bounded_during_full_feed_cache(
     cache_path = tmp_path / "prices.sqlite3"
     client = FakeHTTPClient(
         [
+            card_sets_response(
+                "Unrequested (Trading Card)",
+                "Filler A",
+                "Filler B",
+                "Filler C",
+                "Filler D",
+            ),
             FakeResponse(
                 302,
                 headers={"Location": "https://prices.r2.cloudflarestorage.com/list"},
-            )
+            ),
         ],
         stream_response=FakeResponse(
             200,
@@ -2103,7 +2201,11 @@ def test_unrequested_price_numbers_are_bounded_during_full_feed_cache(
     cached = cache.read(("440-Unrequested (Trading Card)", "Requested"))
     assert cached.has_generation is True
     assert set(cached.prices) == {"Requested"}
-    unrequested = cache.read_catalog(app_ids=[440]).groups[440][0]
+    unrequested = next(
+        entry
+        for entry in cache.read_catalog(app_ids=[440]).groups[440]
+        if entry.market_hash_name == "440-Unrequested (Trading Card)"
+    )
     assert unrequested.market_hash_name == "440-Unrequested (Trading Card)"
     assert unrequested.highest_buy is None
     assert unrequested.lowest_sell is None
@@ -2177,10 +2279,17 @@ def test_bulk_stream_decoded_byte_limit_is_enforced(
     monkeypatch.setattr(steam_gateway, "MAX_PRICE_STREAM_BYTES", 8)
     client = FakeHTTPClient(
         [
+            card_sets_response(
+                "Unrequested (Trading Card)",
+                "Filler A",
+                "Filler B",
+                "Filler C",
+                "Filler D",
+            ),
             FakeResponse(
                 302,
                 headers={"Location": "https://prices.r2.cloudflarestorage.com/list"},
-            )
+            ),
         ],
         stream_response=FakeResponse(200, chunks=[b'{"items":[]}']),
     )
@@ -2194,7 +2303,7 @@ def test_bulk_stream_decoded_byte_limit_is_enforced(
 
 def test_declared_partial_bulk_generation_is_not_committed() -> None:
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(
             200,
             chunks=[
@@ -2240,7 +2349,7 @@ def test_invalid_or_duplicate_bulk_item_aborts_complete_generation(
         ],
     }
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(
             200,
             chunks=[json.dumps(payload).encode()],
@@ -2261,7 +2370,7 @@ def test_duplicate_top_level_items_member_aborts_complete_generation() -> None:
         b'"items":[{"marketHashName":"Second Row"}]}'
     )
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
     steamapis = SteamApisClient(settings(), http_client=client)
@@ -2279,7 +2388,7 @@ def test_bulk_stream_rejects_duplicate_semantic_price_aliases() -> None:
         b'{"highestBuy":"0.25","highest_buy":"0.50"}}]}'
     )
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
     steamapis = SteamApisClient(settings(), http_client=client)
@@ -2298,10 +2407,17 @@ def test_bulk_stream_nesting_limit_is_enforced(
     nested = b"[" * 5 + b"]" * 5
     client = FakeHTTPClient(
         [
+            card_sets_response(
+                "Unrequested (Trading Card)",
+                "Filler A",
+                "Filler B",
+                "Filler C",
+                "Filler D",
+            ),
             FakeResponse(
                 302,
                 headers={"Location": "https://prices.r2.cloudflarestorage.com/list"},
-            )
+            ),
         ],
         stream_response=FakeResponse(200, chunks=[nested]),
     )
@@ -2426,19 +2542,21 @@ def test_bulk_stream_semaphore_limits_concurrent_streams(
     monkeypatch.setattr(steam_gateway, "_stream_prices", blocked_stream)
     first_client = FakeHTTPClient(
         [
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={"Location": "https://first.r2.cloudflarestorage.com/list"},
-            )
+            ),
         ],
         stream_response=FakeResponse(200),
     )
     second_client = FakeHTTPClient(
         [
+            card_sets_response(),
             FakeResponse(
                 302,
                 headers={"Location": "https://second.r2.cloudflarestorage.com/list"},
-            )
+            ),
         ],
         stream_response=FakeResponse(200),
     )
@@ -2510,7 +2628,7 @@ def test_price_depth_sums_only_units_at_exact_top_prices() -> None:
         '{"price":"0.21","quantity":99},{"price":"0.20","quantity":"1"}]}}]}'
     ).encode()
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
 
@@ -2537,7 +2655,7 @@ def test_price_depth_rejects_scalar_that_is_not_book_extreme() -> None:
         '{"price":"0.20","quantity":1}]}}]}'
     ).encode()
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
 
@@ -2562,7 +2680,7 @@ def test_malformed_price_depth_becomes_null_without_losing_price() -> None:
         '"sellOrdersTop10":[[],{"price":"0.20","quantity":1}]}}]}'
     ).encode()
     client = FakeHTTPClient(
-        [price_redirect()],
+        [card_sets_response(), price_redirect()],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
 
@@ -2595,7 +2713,16 @@ def test_price_cache_catalog_normalizes_card_metadata_and_is_bounded(
         + '","orderBook":{"highestBuy":"0.11","lowestSell":"0.21"}}]}'
     ).encode()
     client = FakeHTTPClient(
-        [price_redirect()],
+        [
+            card_sets_response(
+                "Test Card (Trading Card)",
+                "Filler A",
+                "Filler B",
+                "Filler C",
+                "Filler D",
+            ),
+            price_redirect(),
+        ],
         stream_response=FakeResponse(200, chunks=[payload]),
     )
     steamapis = SteamApisClient(
@@ -2604,17 +2731,26 @@ def test_price_cache_catalog_normalizes_card_metadata_and_is_bounded(
     )
 
     run(steamapis.fetch_prices(frozenset({card_name})))
-    catalog = steamapis.read_price_catalog(max_rows=1)
+    catalog = steamapis.read_price_catalog(max_rows=10)
 
     assert catalog.generation == 1
     assert catalog.fresh is True
-    assert catalog.row_count == 1
+    assert catalog.row_count == 5
     assert catalog.truncated is False
     assert set(catalog.groups) == {440}
-    card = catalog.groups[440][0]
+    # Only the composed member with a feed row carries quotes; the four
+    # remaining authoritative members survive as unpriced rows.
+    card = catalog.groups[440][-1]
     assert card.market_hash_name == card_name
     assert card.normal_card_app_id == 440
-    assert card.normal_card_name == "Test Card"
+    assert card.normal_card_name == "Test Card (Trading Card)"
+    assert [entry.market_hash_name for entry in catalog.groups[440][:-1]] == [
+        "440-Filler A",
+        "440-Filler B",
+        "440-Filler C",
+        "440-Filler D",
+    ]
+    assert all(entry.lowest_sell is None for entry in catalog.groups[440][:-1])
 
 
 @pytest.mark.parametrize("read_only", [False, True])
@@ -2627,6 +2763,7 @@ def test_price_cache_reopens_legacy_index_shape_without_losing_generation(
     cache_path = tmp_path / "prices.sqlite3"
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
+    refresh.seed_normal_cards({440: ["Card (Trading Card)"]})
     refresh.add(
         "440-Card (Trading Card)",
         "0.10",
@@ -2681,7 +2818,16 @@ def test_price_cache_catalog_retains_normal_card_without_quotes(
     steamapis = SteamApisClient(
         settings(steamapis_price_cache_path=str(cache_path)),
         http_client=FakeHTTPClient(
-            [price_redirect()],
+            [
+                card_sets_response(
+                    "Unquoted Card (Trading Card)",
+                    "Filler A",
+                    "Filler B",
+                    "Filler C",
+                    "Filler D",
+                ),
+                price_redirect(),
+            ],
             stream_response=FakeResponse(200, chunks=[payload]),
         ),
     )
@@ -2690,9 +2836,10 @@ def test_price_cache_catalog_retains_normal_card_without_quotes(
     catalog = steamapis.read_price_catalog(max_rows=10)
 
     assert catalog.optimizer_complete is True
-    assert catalog.row_count == 1
-    card = catalog.groups[440][0]
-    assert card.market_hash_name == card_name
+    assert catalog.row_count == 5
+    card = next(
+        entry for entry in catalog.groups[440] if entry.market_hash_name == card_name
+    )
     assert card.highest_buy is None
     assert card.lowest_sell is None
 
@@ -2703,6 +2850,9 @@ def test_price_cache_catalog_filters_unrelated_app_ids(
     cache_path = tmp_path / "prices.sqlite3"
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(
+        {app_id: ["Card (Trading Card)"] for app_id in (10, 440, 999)}
+    )
     quote_time = "2026-08-26T12:00:00Z"
     for app_id in (10, 440, 999):
         refresh.add(
@@ -2750,6 +2900,15 @@ def test_price_cache_catalog_truncation_reports_overflow_rows(
     cache_path = tmp_path / "prices.sqlite3"
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(
+        {
+            440: [
+                "Alpha (Trading Card)",
+                "Beta (Trading Card)",
+            ],
+            999: ["Gamma (Trading Card)"],
+        }
+    )
     quote_time = "2026-08-26T12:00:00Z"
     for name in (
         "440-Alpha (Trading Card)",
@@ -3430,6 +3589,9 @@ def test_level_up_invalid_catalog_group_is_excluded(
     market_hash_names = [
         f"440-Oversized Set Card {index} (Trading Card)" for index in range(16)
     ]
+    refresh.seed_normal_cards(
+        {440: [f"Oversized Set Card {index} (Trading Card)" for index in range(16)]}
+    )
     for market_hash_name in market_hash_names:
         refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
     refresh.commit(now=time.time(), optimizer_complete=True)
@@ -3523,6 +3685,9 @@ def test_level_up_uses_supplied_badges_without_redundant_provider_calls(
     price_cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
     refresh = price_cache.begin_refresh()
     source_hashes = [f"440-Source Card {index} (Trading Card)" for index in range(1, 6)]
+    refresh.seed_normal_cards(
+        {440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)]}
+    )
     for market_hash_name in source_hashes:
         refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
     refresh.commit(now=time.time(), optimizer_complete=True)
@@ -3596,6 +3761,23 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
     unaffordable_hashes = [
         f"30-Unaffordable Card {index} (Trading Card)" for index in range(1, 6)
     ]
+    refresh.seed_normal_cards(
+        {
+            440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
+            50: [f"Unqualified Source {index} (Trading Card)" for index in range(1, 6)],
+            10: [
+                f"Destination 10 Card {index} (Trading Card)" for index in range(1, 6)
+            ],
+            20: [
+                f"Destination 20 Card {index} (Trading Card)" for index in range(1, 6)
+            ],
+            40: [
+                f"Unqualified Destination {index} (Trading Card)"
+                for index in range(1, 6)
+            ],
+            30: [f"Unaffordable Card {index} (Trading Card)" for index in range(1, 6)],
+        }
+    )
     for market_hash_name in source_hashes:
         refresh.add(market_hash_name, "10.00", "1.00", quote_time.isoformat(), 1, 1)
     for market_hash_name in unqualified_source_hashes:
@@ -3713,6 +3895,12 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
     destination_hashes = [
         f"20-Destination Card {index} (Trading Card)" for index in range(1, 6)
     ]
+    refresh.seed_normal_cards(
+        {
+            440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
+            20: [f"Destination Card {index} (Trading Card)" for index in range(1, 6)],
+        }
+    )
     for index, market_hash_name in enumerate(source_hashes, start=1):
         refresh.add(
             market_hash_name,
@@ -3870,6 +4058,9 @@ def test_badge_planning_reaches_pure_planner_for_known_sets_without_provider_cal
     market_hash_names = [
         f"440-Alpha Card {index} (Trading Card)" for index in range(1, 6)
     ]
+    refresh.seed_normal_cards(
+        {440: [f"Alpha Card {index} (Trading Card)" for index in range(1, 6)]}
+    )
     for market_hash_name in market_hash_names:
         refresh.add(market_hash_name, "0.10", "0.25", quote_time.isoformat(), 1, 5)
     refresh.commit(now=time.time(), optimizer_complete=True)
@@ -3943,6 +4134,12 @@ def test_owned_crafts_survive_unusable_prices_and_partial_metadata(
     if catalog_state != "missing":
         quote_time = now - timedelta(seconds=1200 if catalog_state == "stale" else 0)
         refresh = cache.begin_refresh()
+        refresh.seed_normal_cards(
+            {
+                app_id: [f"Card {number} (Trading Card)" for number in range(5)]
+                for app_id in (440, 550)
+            }
+        )
         for app_id in (440, 550):
             for number in range(5):
                 refresh.add(
@@ -4000,6 +4197,143 @@ def test_owned_crafts_survive_unusable_prices_and_partial_metadata(
     assert client.stream_calls == []
 
 
+def test_unsuffixed_real_names_complete_set_and_exclude_background_foil(
+    tmp_path: Path,
+) -> None:
+    """Authoritative composition repairs the Half-Life 2 identity bug.
+
+    Real unsuffixed market hashes (``220-Respite``, ``220-Gordon Freeman``)
+    were dropped by the legacy ``" (Trading Card)"`` suffix filter.  The
+    shared catalog must carry the full normal set from the composition feed,
+    exclude the same-app background and foil, keep members without price
+    rows, and plan a purchase from unsuffixed holdings with fresh quotes.
+    """
+
+    configured = settings(
+        gem_price_cache_path=str(tmp_path / "gems.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1_000,
+        level_up_min_fee_minor=1,
+        level_up_max_quote_age_seconds=900,
+        level_up_max_inventory_age_seconds=3_600,
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+    )
+    normal_names = [
+        "G",
+        "Gordon & Alyx (Trading Card)",
+        "Respite",
+        "Gordon Freeman",
+        "Alyx Vance",
+        "City 17 Metrocop",
+        "Trouble Underground",
+        "Bring the fight to them",
+    ]
+    ambiguous_names = ["A", "B", "C", "D", "E", "E"]
+    quote_time = datetime.now(UTC)
+
+    def price_row(
+        name: str, highest_buy: float, lowest_sell: float
+    ) -> dict[str, object]:
+        return {
+            "marketHashName": name,
+            "orderBook": {
+                "highestBuy": highest_buy,
+                "lowestSell": lowest_sell,
+                "buyOrdersTop10": [{"price": highest_buy, "quantity": 5}],
+                "sellOrdersTop10": [{"price": lowest_sell, "quantity": 5}],
+            },
+            "updatedAt": int(quote_time.timestamp() * 1_000),
+        }
+
+    rows = [
+        *(price_row(f"220-{name}", 0.03, 0.05) for name in normal_names[:7]),
+        price_row("220-Half-Life 2 Background", 0.01, 0.02),
+        price_row("220-Respite (Foil)", 1.0, 2.0),
+        *(
+            price_row(f"441-{name}", 0.03, 0.05)
+            for name in sorted(set(ambiguous_names))
+        ),
+    ]
+    client = FakeHTTPClient(
+        [
+            card_sets_response(
+                payload=card_sets_payload({220: normal_names, 441: ambiguous_names})
+            ),
+            price_redirect(),
+        ],
+        stream_response=FakeResponse(
+            200,
+            chunks=[
+                json.dumps(
+                    {
+                        "metadata": {"appId": 753, "itemCount": len(rows)},
+                        "items": rows,
+                    },
+                    separators=(",", ":"),
+                ).encode()
+            ],
+        ),
+    )
+    gateway = SteamGateway(
+        configured,
+        http_client=client,
+        gem_pricing=NoopGemPricing(),  # type: ignore[arg-type]
+    )
+    # Prime the generation: check_badge_planning only schedules the refresh.
+    run(gateway.steamapis.fetch_prices(frozenset({"220-Respite"})))
+    plan_time = datetime.now(UTC)
+    result = run(
+        gateway.check_badge_planning(
+            tuple(
+                steam_gateway.Holding(f"220-{name}", 1, 1) for name in normal_names[6:]
+            ),
+            {220: ("Half-Life 2", 8)},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=plan_time,
+            badge_refreshed_at=plan_time,
+            now=plan_time,
+            options=BadgePlanningOptions(mode="budget", budget_minor=10_000),
+        )
+    )
+
+    catalog = gateway.steamapis.read_price_catalog()
+    assert catalog.optimizer_complete is True
+    members = {card.market_hash_name for card in catalog.groups[220]}
+    assert members == {f"220-{name}" for name in normal_names}
+    assert 441 not in catalog.groups
+    assert "220-Half-Life 2 Background" not in members
+    assert "220-Respite (Foil)" not in members
+    unpriced = next(
+        card
+        for card in catalog.groups[220]
+        if card.market_hash_name == "220-Bring the fight to them"
+    )
+    assert unpriced.lowest_sell is None
+    prices = gateway.steamapis.price_cache.read(
+        ("220-Half-Life 2 Background", "220-Respite (Foil)")
+    )
+    assert set(prices.prices) == {
+        "220-Half-Life 2 Background",
+        "220-Respite (Foil)",
+    }
+    game = next(game for game in result.games if game.app_id == "220")
+    assert game.status == "incomplete"
+    assert game.missing_count == 6
+    assert game.completion_cost_minor == 30
+    cheapest = result.plans[0]
+    assert (cheapest.status, cheapest.reason) == ("ready", "xp_maximized")
+    assert cheapest.craft_count == 1
+    assert cheapest.spend_minor == 30
+    assert cheapest.purchase_count == 6
+    purchases = cheapest.steps[0].purchases
+    assert sorted(purchase.market_hash_name for purchase in purchases) == sorted(
+        f"220-{name}" for name in normal_names[:6]
+    )
+
+
 def test_duplicate_feed_hash_aborts_generation_without_cross_row_merge(
     tmp_path: Path,
 ) -> None:
@@ -4047,12 +4381,14 @@ def test_price_cache_keeps_committed_catalog_readable_during_large_refresh(
     cache = SteamApisPriceCache(tmp_path / "prices.sqlite3")
     name = "440-Card (Trading Card)"
     original = cache.begin_refresh()
+    original.seed_normal_cards({440: ["Card (Trading Card)"]})
     original.add(name, "0.10", "0.20", None)
     original.commit(optimizer_complete=True)
     before = cache.read_catalog(app_ids=[440])
 
     replacement = cache.begin_refresh()
     try:
+        replacement.seed_normal_cards({440: ["Card (Trading Card)"]})
         replacement.add(name, "0.11", "0.21", None)
         # Exceed SQLite's default page cache while the streamed transaction is open.
         for index in range(50_000):

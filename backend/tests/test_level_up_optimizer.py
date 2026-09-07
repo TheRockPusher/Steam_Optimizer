@@ -99,7 +99,7 @@ def card(
 ) -> CatalogCard:
     name = f"Card {number}"
     return CatalogCard(
-        market_hash_name=f"{app_id}-{name} (Trading Card)",
+        market_hash_name=f"{app_id}-{name}",
         app_id=app_id,
         card_name=name,
         highest_buy=buy,
@@ -245,21 +245,43 @@ def test_projection_reaching_maximum_level_keeps_next_threshold() -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "440-Foil (Trading Card)",
-        "440-Booster Pack",
-        "440-Card",
         "0-Card (Trading Card)",
-        "440- (Trading Card)",
+        "-Card (Trading Card)",
+        "440-",
+        "",
     ],
 )
-def test_strict_normal_card_hash_rejects_non_cards(value: str) -> None:
+def test_card_hash_syntax_rejects_malformed_appid_name(value: str) -> None:
     with pytest.raises(OptimizerInputError):
         CatalogCard(value, 440, "Card")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "440-Respite",
+        "440-Gordon Freeman",
+        "440-Booster Pack",
+        "440-Foil (Trading Card)",
+        "440- (Trading Card)",
+    ],
+)
+def test_card_hash_syntax_accepts_any_appid_name(value: str) -> None:
+    # Parsing is pure ``appid-name`` syntax: it never proves item class, so
+    # unsuffixed card names and non-card names are equally valid syntax.
+    parsed = optimizer.parse_normal_card_hash(value)
+    assert parsed is not None
+    assert parsed[0] == 440
+
+
+def test_unsuffixed_canonical_hash_is_accepted_without_decoding() -> None:
+    value = CatalogCard("440-Gordon%20Freeman", 440, "Gordon%20Freeman")
+    assert value.market_hash_name == "440-Gordon%20Freeman"
+
+
 def test_canonical_hash_parser_does_not_decode_input() -> None:
-    value = CatalogCard("440-Card%20One (Trading Card)", 440, "Card%20One")
-    assert value.market_hash_name == "440-Card%20One (Trading Card)"
+    value = CatalogCard("440-Card%20One", 440, "Card%20One")
+    assert value.market_hash_name == "440-Card%20One"
 
 
 def test_malformed_or_incomplete_sets_fail_closed() -> None:

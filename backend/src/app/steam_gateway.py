@@ -54,6 +54,8 @@ from app.gem_pricing import (
 from app.json_parsing import reject_duplicate_object_keys
 from app.level_up_optimizer import (
     MAX_APP_ID,
+    MAX_CARD_NAME_LENGTH,
+    MAX_CATALOG_SETS,
     MAX_GAME_NAME_LENGTH,
     MAX_NORMAL_SET_SIZE,
     MAX_QUOTE_QUANTITY,
@@ -70,6 +72,7 @@ from app.level_up_optimizer import (
     parse_normal_card_hash,
 )
 from app.steamapis_price_cache import (
+    MAX_NORMAL_CARD_CATALOG_ROWS,
     CachedPrice,
     NormalCardCatalogRead,
     PriceCacheRead,
@@ -89,6 +92,7 @@ STEAMAPIS_INVENTORY_ENDPOINT = (
     f"{STEAMAPIS_BASE_URL}/v2/steam/users/{{steam_id}}/inventory/753/6"
 )
 STEAMAPIS_ITEMS_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/items/753/list"
+STEAMAPIS_CARDS_ENDPOINT = f"{STEAMAPIS_BASE_URL}/market/items/cards"
 STEAM_ICON_BASE_URL = "https://community.cloudflare.steamstatic.com/economy/image/"
 STEAM_OPTIMIZER_USER_AGENT = (
     "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
@@ -129,6 +133,12 @@ MAX_NORMAL_BADGE_LEVEL_ROWS = 10_000
 MAX_BADGE_JSON_TOKENS = 1_000_000
 MAX_BADGE_PREFLIGHT_CHARGE = 32 * 1024 * 1024
 MAX_LEVEL_UP_CATALOG_ROWS = 250_000
+# The authoritative composition feed is bounded: the response buffer fails
+# closed, the game count stays inside the catalog's set bound, and one game's
+# card-name list must match a plannable normal set size.  Out-of-domain sets
+# (events, partial sets) are skipped whole so they can never appear as a
+# partial catalog set.
+MAX_CARD_SET_RESPONSE_BYTES = 64 * 1024 * 1024
 _BADGE_JSON_CONTAINER_START_EVENTS = frozenset({"start_map", "start_array"})
 _BADGE_JSON_CONTAINER_END_EVENTS = frozenset({"end_map", "end_array"})
 _BADGE_JSON_SCALAR_EVENTS = frozenset(
@@ -1003,6 +1013,90 @@ def _parse_badges_payload(payload: object) -> BadgeState:
         )
     except (OptimizerInputError, TypeError, ValueError, ArithmeticError) as error:
         raise InvalidSteamApisPayloadError from error
+
+
+def _card_set_app_id(value: object) -> int | None:
+    """Return the bounded AppID of one authoritative card set, if valid."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        app_id = value
+    elif isinstance(value, str) and _ASCII_DIGITS.fullmatch(value):
+        app_id = int(value)
+    else:
+        return None
+    return app_id if 0 < app_id <= MAX_APP_ID else None
+
+
+def _parse_card_sets_payload(
+    payload: object,
+) -> dict[int, tuple[str, ...]] | None:
+    """Parse the authoritative normal-card composition feed.
+
+    This feed is the only source of normal-card membership: its literal card
+    names (with or without Steam's legacy ``" (Trading Card)"`` suffix, never
+    percent-decoded) become the exact ``appid-name`` catalog hashes.  Only
+    plannable set sizes (5-15 names) become membership; out-of-domain sets
+    (events, partial sets) are skipped whole, so a broken game can never
+    appear as a partial catalog set.  A payload without a usable
+    ``data.sets`` list is rejected so a refresh never falls back to
+    name-suffix inference.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    raw_sets = data.get("sets")
+    if not isinstance(raw_sets, list) or len(raw_sets) > MAX_CATALOG_SETS:
+        return None
+    sets: dict[int, tuple[str, ...]] = {}
+    seen_app_ids: set[int] = set()
+    total_names = 0
+    for raw_set in raw_sets:
+        if not isinstance(raw_set, Mapping):
+            continue
+        app_id = _card_set_app_id(raw_set.get("appid"))
+        if app_id is None:
+            continue
+        if app_id in seen_app_ids:
+            return None
+        seen_app_ids.add(app_id)
+        normal = raw_set.get("normal")
+        if not isinstance(normal, Mapping):
+            continue
+        count = normal.get("count")
+        names = normal.get("names")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not isinstance(names, list)
+            or len(names) != count
+            or not MIN_NORMAL_SET_SIZE <= count <= MAX_NORMAL_SET_SIZE
+        ):
+            continue
+        cleaned: list[str] = []
+        for raw_name in names:
+            if (
+                not isinstance(raw_name, str)
+                or not raw_name
+                or len(raw_name) > MAX_CARD_NAME_LENGTH
+                or "\x00" in raw_name
+            ):
+                break
+            cleaned.append(raw_name)
+        if len(cleaned) != len(names):
+            continue
+        if len(set(cleaned)) != count:
+            continue
+        unique_names = tuple(cleaned)
+        if total_names + len(unique_names) > MAX_NORMAL_CARD_CATALOG_ROWS:
+            return None
+        total_names += len(unique_names)
+        sets[app_id] = unique_names
+    return sets
 
 
 def _normalize_level_up_game_metadata(
@@ -2682,6 +2776,40 @@ class SteamApisClient:
                 return True
             return await self._refresh_prices_uncached()
 
+    async def _fetch_normal_card_sets(
+        self,
+        api_key: str,
+    ) -> dict[int, tuple[str, ...]]:
+        """Fetch the authoritative normal-card composition feed.
+
+        This provider route authenticates with the ``api_key`` query
+        parameter only; the ``x-api-key`` header is rejected.  The key stays
+        out of logs: every failure raises a bounded payload error instead of
+        a message that embeds the request URL.
+        """
+
+        headers = {"User-Agent": STEAM_OPTIMIZER_USER_AGENT}
+        response = await self.http_client.get(
+            STEAMAPIS_CARDS_ENDPOINT,
+            params={"api_key": api_key},
+            headers=headers,
+            follow_redirects=False,
+        )
+        if not 200 <= response.status_code < 300 or not _response_content_length_within(
+            response, MAX_CARD_SET_RESPONSE_BYTES
+        ):
+            raise InvalidSteamApisPayloadError
+        try:
+            payload = response.json()
+        except _PRICE_STREAM_JSON_ERRORS as error:
+            raise InvalidSteamApisPayloadError from error
+        except (TypeError, ValueError) as error:
+            raise InvalidSteamApisPayloadError from error
+        parsed = _parse_card_sets_payload(payload)
+        if parsed is None:
+            raise InvalidSteamApisPayloadError
+        return parsed
+
     async def _refresh_prices_uncached(self) -> bool:
         headers = self._api_headers()
         api_key = self._api_key
@@ -2689,6 +2817,7 @@ class SteamApisClient:
             return False
         refresh: SteamApisPriceRefresh | None = None
         try:
+            card_sets = await self._fetch_normal_card_sets(api_key)
             response = await self.http_client.get(
                 STEAMAPIS_ITEMS_ENDPOINT,
                 headers=headers,
@@ -2708,6 +2837,7 @@ class SteamApisClient:
                 _validate_bulk_response(cdn_response)
                 refresh_session = self.price_cache.begin_refresh()
                 refresh = refresh_session
+                refresh_session.seed_normal_cards(card_sets)
                 _, _, stream_summary = await _stream_prices(
                     cdn_response,
                     frozenset(),

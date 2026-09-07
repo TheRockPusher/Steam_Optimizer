@@ -1,6 +1,17 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+
+## Unreleased
+
+### Bug Fixes
+- Classify normal inventory cards by Steam item type and card border instead of requiring
+  a ` (Trading Card)` market-name suffix.
+- Build badge-set membership from the authoritative normal-card catalog, retaining unpriced
+  members and excluding foil, background, and ambiguous-set entries. Rebuild the old price-cache
+  generation on upgrade.
+- Report unusable purchase quotes as unavailable data instead of a misleading no-opportunity plan.
+
 ## v1.0.0
 
 

@@ -175,12 +175,17 @@ including games with no sellable source card:
 The client sends that complete snapshot once to `POST /api/auth/level-up` with the signed session
 and matching `x-expected-steam-id` header. `sellable_quantity` follows `marketable`; `tradable` is
 unrelated to Steam Market eligibility. The endpoint never calls `check_inventory`, never contacts
-the badge or inventory providers during planning, never resolves booster/card-set metadata, never
-logs holdings, and never stores the submitted snapshot. The recommendation plan remains in React
+the badge or inventory providers during planning, and never synchronously resolves booster/card-set
+metadata. It never logs holdings or stores the submitted snapshot. The recommendation plan remains in React
 memory only while the account and snapshot are unchanged. It is never written to IndexedDB,
 `localStorage`, cookies, or a server-side user cache. Logout, account changes, inventory refresh,
 and unmount invalidate it; quote expiry downgrades any retained rows to an expired, non-actionable
 state until the user refreshes.
+
+Normal-card ownership is selected using the inventory's `item_type="trading_card"` and
+`card_border="normal"` metadata. Market hashes are literal `appid-name` identities: many real cards,
+including `220-Gordon Freeman`, have no ` (Trading Card)` suffix. The hash grammar alone does not
+classify an item; foils and backgrounds can have the same grammar.
 
 For that request, the backend validates that the `games` IDs exactly match AppIDs parsed from normal
 card hashes and reads the current price-catalog generation only for those submitted AppIDs through
@@ -190,6 +195,11 @@ frontend shows a loading state and retries every five seconds; it shows an unava
 when the refresh cannot start or its completed generation remains unusable. Unrelated catalog groups
 are not loaded. Complete named catalog sets are built from the request's game names and filtered
 groups; an optional `card_set_size` only cross-checks the group length.
+The shared refresh obtains membership from SteamApis' [normal-card sets endpoint](https://docs.steamapis.com/raw/v1/market/cards.md)
+and joins those exact names to the v2 bulk quote feed. Only supported, unambiguous 5–15-card sets
+enter the catalog. A missing quote retains the member as unpriced rather than shortening the set.
+Normal membership is persisted explicitly; schema version 4 invalidates the old suffix-derived
+generation and rebuilds it on the next refresh.
 Missing, invalid, or set-size-mismatched groups are excluded from candidacy; if none remain, the
 result is `no_sellable_card`. Every held sellable normal card is
 evaluated as a one-copy source candidate, including cards from maxed badges; destinations must
@@ -197,6 +207,11 @@ remain below normal badge level five. Foil and non-game records are ignored, as 
 valid records outside the normal badge shape, including unrelated event and collection badges. A
 recognized normal record with missing or non-integer level metadata fails closed. The in-memory
 session badge snapshot is the sole badge-state input for this calculation.
+
+For badge target/budget planning, a zero-craft result caused entirely by unusable purchase quotes
+returns `unavailable`, not `no_opportunity`. Expired quote timestamps remain stale even if the local
+catalog was downloaded recently. Fully owned crafts and genuinely budget-blocked plans retain
+their factual outcomes; quote freshness limits are unchanged.
 
 The endpoint returns exactly one of these read-only states:
 
