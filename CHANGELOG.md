@@ -1,21 +1,20 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v1.0.0
 
-## Unreleased
+
+### Documentation
+- Update changelog for v0.12.0
+
 
 ### Features
-- Add a game-level craftability dashboard with completion costs, missing cards, and protected copies.
-- Plan repeated normal-badge crafts for a target level or wallet budget, comparing cheapest,
-  fewest-purchase, and preserve-owned-card policies with cumulative quote-depth limits.
-- Organize the responsive workspace into Badges, Plan, and Inventory; retain advanced sale-funded
-  swaps as a separate manual workflow.
+- Add badge dashboard and goal-based planning
 
-### Safety
-- Preserve verified zero-spend crafts when market quotes are unavailable, without treating
-  missing prices or unknown set composition as actionable.
-- Bind spending budgets to the confirmed currency, invalidate stale requests, and refresh action
-  eligibility after inventory and badge updates.
+
+### Maintenance
+- Integrate upstream exchange alternatives
+- Prepare release v1.0.0
 
 ## v0.12.0
 
