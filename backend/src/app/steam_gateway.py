@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.badge_planner import BadgePlanningOptions, plan_badges
 from app.booster_pricing import (
     BoosterPricingService,
     BoosterResolution,
@@ -77,6 +78,7 @@ from app.steamapis_price_cache import (
 )
 
 if TYPE_CHECKING:
+    from app.badge_planner import BadgePlanningResponse
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
     from app.market_fees import MarketFeeContract
     from app.settings import Settings
@@ -429,6 +431,20 @@ class SteamGatewayProtocol(Protocol):
         now: datetime | str | int | None = None,
     ) -> LevelUpOptimizationResponse:
         """Calculate a read-only recommendation without external metadata I/O."""
+        ...
+
+    async def check_badge_planning(
+        self,
+        holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
+        inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
+        options: BadgePlanningOptions,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> BadgePlanningResponse:
+        """Calculate a read-only badge plan without external metadata I/O."""
         ...
 
     async def refresh_gems(
@@ -1141,6 +1157,95 @@ def _level_up_response(
         min_fee_minor=min_fee_minor,
         taxes_included=taxes_included,
     )
+
+
+def _badge_planning_catalog(
+    steamapis: SteamApisClient,
+    catalog_read: NormalCardCatalogRead,
+    normalized_metadata: Mapping[int, tuple[str, int | None]],
+    *,
+    current: datetime,
+    quote_limit: int,
+) -> tuple[ResolvedCatalog | None, str | None]:
+    """Resolve the planner catalog plus one missing-data reason, if any.
+
+    Stale or partial generations stay readable for ownership display; the
+    fresh-quote constraints for purchases are enforced by the pure planner.
+    """
+
+    generated_at: datetime | None = None
+    availability_reason: str | None = None
+    if catalog_read.generation > 0 and catalog_read.refreshed_at is not None:
+        try:
+            generated_at = datetime.fromtimestamp(catalog_read.refreshed_at, UTC)
+        except OverflowError, OSError, ValueError, TypeError:
+            generated_at = None
+    if (
+        catalog_read.generation <= 0
+        or catalog_read.refreshed_at is None
+        or catalog_read.truncated
+        or not catalog_read.optimizer_complete
+    ):
+        refresh_state = steamapis.schedule_price_catalog_refresh(
+            max_age_seconds=quote_limit
+        )
+        availability_reason = (
+            "price_generation_unavailable"
+            if refresh_state == "unavailable"
+            else "price_generation_refreshing"
+        )
+    else:
+        if generated_at is None or current < generated_at:
+            availability_reason = "price_generation_unavailable"
+        elif current - generated_at >= timedelta(seconds=quote_limit):
+            refresh_state = steamapis.schedule_price_catalog_refresh(
+                max_age_seconds=quote_limit
+            )
+            availability_reason = (
+                "price_generation_stale"
+                if refresh_state == "unavailable"
+                else "price_generation_refreshing"
+            )
+    if generated_at is None:
+        return None, availability_reason
+    groups = _catalog_groups(catalog_read)
+    catalog_sets: list[CatalogSet] = []
+    for app_id in sorted(normalized_metadata):
+        cards = groups.get(app_id)
+        if (
+            cards is None
+            or not MIN_NORMAL_SET_SIZE <= len(cards) <= MAX_NORMAL_SET_SIZE
+        ):
+            continue
+        game_name, requested_set_size = normalized_metadata[app_id]
+        if (catalog_read.truncated or not catalog_read.optimizer_complete) and (
+            requested_set_size is None
+        ):
+            continue
+        if requested_set_size is not None and requested_set_size != len(cards):
+            continue
+        try:
+            catalog_sets.append(
+                CatalogSet(
+                    app_id=app_id,
+                    game_name=game_name,
+                    cards=cards,
+                    set_size=requested_set_size,
+                )
+            )
+        except OptimizerInputError, TypeError, ValueError, ArithmeticError:
+            continue
+    if not catalog_sets:
+        return None, availability_reason
+    try:
+        catalog = ResolvedCatalog(
+            generation=catalog_read.generation,
+            generated_at=generated_at,
+            sets=tuple(catalog_sets),
+        )
+    except OptimizerInputError, TypeError, ValueError, ArithmeticError:
+        return None, availability_reason
+    return catalog, availability_reason
 
 
 def _validated_bulk_redirect(response: HTTPResponse, api_key: str) -> str:
@@ -3142,6 +3247,102 @@ class SteamGateway:
                 inventory_time=inventory_time,
                 contract=contract,
             )
+
+    async def check_badge_planning(
+        self,
+        holdings: Sequence[Holding],
+        game_metadata: Mapping[int, tuple[str, int | None]],
+        badge_state: BadgeState,
+        inventory_refreshed_at: datetime | str | int,
+        badge_refreshed_at: datetime | str | int,
+        options: BadgePlanningOptions,
+        *,
+        now: datetime | str | int | None = None,
+    ) -> BadgePlanningResponse:
+        """Return one read-only badge plan from caller-owned snapshots.
+
+        Ownership stays readable when the price catalog is partial, stale, or
+        missing; the pure planner enforces purchase-side quote freshness.
+        """
+
+        current = _level_up_timestamp(now) if now is not None else datetime.now(UTC)
+        if current is None:
+            current = datetime.now(UTC)
+        inventory_time = _level_up_timestamp(inventory_refreshed_at)
+        badge_time = _level_up_timestamp(badge_refreshed_at)
+        availability_reason: str | None = None
+        if inventory_time is None:
+            availability_reason = "inventory_snapshot_too_old"
+            inventory_time = current
+        if badge_time is None:
+            availability_reason = availability_reason or "badge_data_unavailable"
+            badge_time = current
+        try:
+            contract = self.settings.level_up_money_contract
+        except AttributeError, TypeError, ValueError, ArithmeticError:
+            contract = None
+        quote_limit = LEVEL_UP_PRICE_MAX_AGE_SECONDS
+        if contract is not None:
+            contract_quote_limit = getattr(contract, "max_quote_age_seconds", None)
+            if (
+                isinstance(contract_quote_limit, bool)
+                or not isinstance(contract_quote_limit, int)
+                or contract_quote_limit <= 0
+            ):
+                # Fresh-quote constraints cannot be enforced without a limit.
+                contract = None
+            else:
+                quote_limit = contract_quote_limit
+        if not isinstance(options, BadgePlanningOptions):
+            raise OptimizerInputError(
+                "input_invalid", "badge planning options are required"
+            )
+        if not isinstance(badge_state, BadgeState):
+            raise OptimizerInputError(
+                "badge_data_unavailable", "validated badge state is required"
+            )
+        normalized_metadata = _normalize_level_up_game_metadata(game_metadata)
+        if normalized_metadata is None:
+            raise OptimizerInputError("input_invalid", "game metadata is invalid")
+        requested_app_ids = tuple(sorted(normalized_metadata))
+        catalog: ResolvedCatalog | None = None
+        if availability_reason is None and requested_app_ids:
+            try:
+                catalog_read = self.steamapis.read_price_catalog(
+                    max_rows=MAX_LEVEL_UP_CATALOG_ROWS,
+                    app_ids=requested_app_ids,
+                )
+            except (
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                ArithmeticError,
+                RuntimeError,
+                sqlite3.Error,
+            ):
+                catalog_read = NormalCardCatalogRead(0, None, {})
+            if now is None:
+                current = datetime.now(UTC)
+            catalog, availability_reason = _badge_planning_catalog(
+                self.steamapis,
+                catalog_read,
+                normalized_metadata,
+                current=current,
+                quote_limit=quote_limit,
+            )
+        return plan_badges(
+            catalog=catalog,
+            holdings=holdings,
+            game_metadata=normalized_metadata,
+            badges=badge_state,
+            inventory_refreshed_at=inventory_time,
+            badge_refreshed_at=badge_time,
+            now=current,
+            fee_contract=contract,
+            options=options,
+            availability_reason=availability_reason,
+        )
 
     async def refresh_gems(
         self,

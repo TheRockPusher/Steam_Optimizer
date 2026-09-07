@@ -1,23 +1,25 @@
 :root {
   color-scheme: dark;
-  font-family: "Avenir Next", "Trebuchet MS", "Gill Sans", sans-serif;
+  font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial,
+    sans-serif;
   color: var(--color-ink);
   background: var(--color-canvas);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 
-  --font-display: Georgia, "Times New Roman", serif;
-  --color-canvas: #08131e;
-  --color-surface: #101f2d;
-  --color-surface-strong: #172a3b;
-  --color-ink: #f4f8fb;
-  --color-ink-soft: #aab9c7;
-  --color-ink-faint: #8799a9;
-  --color-line: #4c6d85;
-  --color-line-soft: #344d61;
-  --color-accent: #66c0f4;
-  --color-accent-strong: #66c0f4;
-  --color-accent-soft: #17344a;
+  --font-display: "Segoe UI", system-ui, -apple-system, "Helvetica Neue",
+    Arial, sans-serif;
+  --color-canvas: #0a1624;
+  --color-surface: #102339;
+  --color-surface-strong: #16304c;
+  --color-ink: #f2f7fa;
+  --color-ink-soft: #a8bccb;
+  --color-ink-faint: #86a0b3;
+  --color-line: #3d6478;
+  --color-line-soft: #2a4a5e;
+  --color-accent: #3fc1b0;
+  --color-accent-strong: #63d8c8;
+  --color-accent-soft: #0e3b3a;
   --color-public: #7bdca7;
   --color-public-soft: #15362f;
   --color-private: #f0bd82;
@@ -26,7 +28,7 @@
   --color-unavailable-soft: #28333e;
   --color-error: #ffaca4;
   --color-error-soft: #3d2226;
-  --color-focus: #9bdcff;
+  --color-focus: #7ce8d5;
   --color-on-accent: #07131d;
 
   --space-1: 0.25rem;
@@ -107,4 +109,15 @@ a:focus-visible {
 ::selection {
   color: var(--color-on-accent);
   background: var(--color-accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

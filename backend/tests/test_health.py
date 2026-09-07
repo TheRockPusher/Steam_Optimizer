@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app.badge_planner import BadgePlanningResponse
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import GemKey, GemScanResult
 from app.level_up_optimizer import LevelUpOptimizationResponse
@@ -66,6 +67,40 @@ class LifecycleGateway:
             reason="badge_data_unavailable",
             generated_at=datetime.now(UTC),
             inventory_refreshed_at=datetime.now(UTC),
+        )
+
+    async def check_badge_planning(
+        self,
+        holdings: object,
+        game_metadata: object,
+        badge_state: object,
+        inventory_refreshed_at: object,
+        badge_refreshed_at: object,
+        options: object,
+        *,
+        now: object = None,
+    ) -> BadgePlanningResponse:
+        del holdings
+        del game_metadata
+        del badge_state
+        del inventory_refreshed_at
+        del badge_refreshed_at
+        del options
+        del now
+        return BadgePlanningResponse(
+            status="unavailable",
+            reason="badge_data_unavailable",
+            generated_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            valid_until=None,
+            currency_code=None,
+            minor_digits=None,
+            inventory_refreshed_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            badge_refreshed_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            player_xp=0,
+            player_level=0,
+            scope="inventory_normal_badges",
+            games=[],
+            plans=[],
         )
 
     async def refresh_gems(

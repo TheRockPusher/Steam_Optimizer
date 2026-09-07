@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 import app.steam_gateway as steam_gateway
 import app.steamapis_price_cache as steamapis_price_cache
+from app.badge_planner import BadgePlanningOptions, BadgePlanningResponse
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import (
     GemKey,
@@ -3847,6 +3848,156 @@ def test_level_up_reports_catalog_refresh_state_without_awaiting_it(
     assert result.status == "unavailable"
     assert result.reason == expected_reason
     assert strict_cache.scheduled_ages == [quote_age_seconds]
+
+
+def test_badge_planning_reaches_pure_planner_for_known_sets_without_provider_calls(
+    tmp_path: Path,
+) -> None:
+    quote_time = datetime.now(UTC)
+    configured = settings(
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1000,
+        level_up_min_fee_minor=1,
+        level_up_max_quote_age_seconds=900,
+        level_up_max_inventory_age_seconds=3600,
+    )
+    price_cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    refresh = price_cache.begin_refresh()
+    market_hash_names = [
+        f"440-Alpha Card {index} (Trading Card)" for index in range(1, 6)
+    ]
+    for market_hash_name in market_hash_names:
+        refresh.add(market_hash_name, "0.10", "0.25", quote_time.isoformat(), 1, 5)
+    refresh.commit(now=time.time(), optimizer_complete=True)
+    now = datetime.now(UTC)
+
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(
+        configured,
+        http_client=client,
+        price_cache=price_cache,
+        booster_pricing=ExplodingLevelUpProviders(),  # type: ignore[arg-type]
+    )
+    holdings = tuple(
+        steam_gateway.Holding(
+            market_hash_name=market_hash_name,
+            owned_quantity=1,
+            sellable_quantity=1,
+        )
+        for market_hash_name in market_hash_names
+    )
+    options = BadgePlanningOptions(
+        mode="target",
+        target_level=2,
+        budget_minor=500,
+        excluded_app_ids=[],
+        protections=[],
+    )
+
+    result = run(
+        gateway.check_badge_planning(
+            holdings,
+            {440: ("Alpha Game", 5)},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            options=options,
+            now=now,
+        )
+    )
+
+    assert isinstance(result, BadgePlanningResponse)
+    assert result.status == "ready", (result.status, result.reason)
+    assert result.reason == "ready"
+    assert result.currency_code == "USD"
+    assert result.minor_digits == 2
+    assert result.scope == "inventory_normal_badges"
+    assert result.valid_until is not None
+    assert any(plan.purchase_count > 0 for plan in result.plans)
+    assert client.get_calls == []
+    assert client.stream_calls == []
+
+
+@pytest.mark.parametrize("catalog_state", ["missing", "stale", "partial"])
+def test_owned_crafts_survive_unusable_prices_and_partial_metadata(
+    tmp_path: Path,
+    catalog_state: str,
+) -> None:
+    now = datetime.now(UTC)
+    configured = settings(
+        steamapi_key="",
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1000,
+        level_up_min_fee_minor=1,
+    )
+    cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    hashes = [f"440-Card {number} (Trading Card)" for number in range(5)]
+    if catalog_state != "missing":
+        quote_time = now - timedelta(seconds=1200 if catalog_state == "stale" else 0)
+        refresh = cache.begin_refresh()
+        for app_id in (440, 550):
+            for number in range(5):
+                refresh.add(
+                    f"{app_id}-Card {number} (Trading Card)",
+                    "0.03",
+                    "0.05",
+                    quote_time.isoformat(),
+                    10,
+                    10,
+                )
+        refresh.commit(
+            now=quote_time.timestamp(),
+            optimizer_complete=catalog_state != "partial",
+        )
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(configured, http_client=client, price_cache=cache)
+    result = run(
+        gateway.check_badge_planning(
+            (
+                *(steam_gateway.Holding(name, 1, 0) for name in hashes),
+                steam_gateway.Holding("550-Card 0 (Trading Card)", 1, 0),
+                steam_gateway.Holding("730-Unknown (Trading Card)", 1, 0),
+            ),
+            {
+                440: ("Owned set", 5),
+                550: ("Incomplete set", 5),
+                730: ("Unknown game", None),
+            },
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            now=now,
+            options=BadgePlanningOptions(mode="budget", budget_minor=500),
+        )
+    )
+    assert result.status == "ready"
+    assert [(plan.craft_count, plan.spend_minor) for plan in result.plans] == [
+        (1, 0),
+        (1, 0),
+        (1, 0),
+    ]
+    games = {game.app_id: game for game in result.games}
+    assert games["440"].craftable_count == 1
+    assert games["440"].completion_cost_minor == 0
+    assert games["550"].missing_count == 4
+    assert games["730"].status == "unavailable"
+    if catalog_state != "missing":
+        assert {card.market_hash_name for card in games["550"].cards} == {
+            f"550-Card {number} (Trading Card)" for number in range(5)
+        }
+    assert all(
+        card.buy_price_minor is None for game in result.games for card in game.cards
+    )
+    assert client.get_calls == []
+    assert client.stream_calls == []
 
 
 def test_duplicate_feed_hash_aborts_generation_without_cross_row_merge(

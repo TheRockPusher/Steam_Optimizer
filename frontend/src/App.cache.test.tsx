@@ -1,15 +1,37 @@
 import "@testing-library/jest-dom/vitest";
 import {
   act,
-  cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
   within
 } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
+
+const badgeWorkspaceStub = vi.hoisted(() => ({
+  created: 0
+}));
+
+vi.mock("./BadgeWorkspace", () => ({
+  default: function BadgeWorkspaceStub(props: Record<string, unknown>) {
+    useEffect(() => {
+      badgeWorkspaceStub.created += 1;
+    }, []);
+    return (
+      <section
+        data-testid="badge-workspace-stub"
+        data-view={String(props.view)}
+        data-active={props.isActive ? "true" : "false"}
+        data-steam-id={String(props.steamId)}
+      >
+        <p>Badge workspace stub</p>
+      </section>
+    );
+  }
+}));
 
 const cacheMocks = vi.hoisted(() => ({
   clearInventoryCache: vi.fn().mockResolvedValue(undefined),
@@ -149,6 +171,13 @@ function jsonResponse(payload: unknown, status = 200) {
   });
 }
 
+async function openInventorySection() {
+  const tablist = await screen.findByRole("tablist", {
+    name: "Workspace sections"
+  });
+  fireEvent.click(within(tablist).getByRole("tab", { name: "Inventory" }));
+}
+
 function cacheRecord(inventory: unknown) {
   return {
     schema_version: 6,
@@ -169,7 +198,7 @@ function resetCacheMocks() {
 }
 
 afterEach(() => {
-  cleanup();
+  badgeWorkspaceStub.created = 0;
   vi.restoreAllMocks();
   resetCacheMocks();
 });
@@ -443,6 +472,7 @@ describe("App inventory cache orchestration", () => {
       .mockResolvedValueOnce(jsonResponse(unavailableInventory));
 
     render(<App />);
+    await openInventorySection();
 
     expect(await screen.findByText("Card 0001")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
@@ -480,6 +510,7 @@ describe("App inventory cache orchestration", () => {
       );
 
     render(<App />);
+    await openInventorySection();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Refresh gem values" })
