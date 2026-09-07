@@ -74,7 +74,16 @@ function responseFor(request = baseRequest, currency: string | null = "USD"): Ba
 function props(overrides: Partial<BadgeWorkspaceProps> = {}): BadgeWorkspaceProps {
   return {
     steamId: STEAM_ID, inventoryStatus: "public",
-    items: hashes.map((market_hash_name) => ({ market_hash_name, quantity: 2, marketable: true, tradable: true })),
+    items: hashes.map((market_hash_name) => ({
+      market_hash_name,
+      quantity: 2,
+      marketable: true,
+      tradable: true,
+      item_type: "trading_card",
+      card_border: "normal",
+      game_app_id: "10",
+      game_name: "Orbital Quest"
+    })),
     boosters: [{ game_app_id: "10", game_name: "Orbital Quest", card_set_size: 5 }],
     badges: { status: "public", message: "Public", player_xp: 1250, player_level: 11, checked_at: NOW, normal_badge_levels: [] },
     inventoryRefreshedAt: NOW, isInventoryLoading: false, isActive: true, view: "badges",
@@ -148,9 +157,9 @@ describe("planning safety boundaries", () => {
 
   it("subtracts reservations once across split holdings even with never-sell", () => {
     const items = [
-      { market_hash_name: hashes[0], quantity: 2, marketable: false, tradable: false },
-      { market_hash_name: hashes[0], quantity: 3, marketable: true, tradable: true },
-      { market_hash_name: hashes[1], quantity: 1, marketable: true, tradable: true }
+      { market_hash_name: hashes[0], quantity: 2, marketable: false, tradable: false, item_type: "trading_card", card_border: "normal", game_app_id: "10", game_name: "Orbital Quest" },
+      { market_hash_name: hashes[0], quantity: 3, marketable: true, tradable: true, item_type: "trading_card", card_border: "normal", game_app_id: "10", game_name: "Orbital Quest" },
+      { market_hash_name: hashes[1], quantity: 1, marketable: true, tradable: true, item_type: "trading_card", card_border: "normal", game_app_id: "10", game_name: "Orbital Quest" }
     ];
     const reduced = buildSaleSwapItems(items, new Map([[hashes[0], { market_hash_name: hashes[0], keep_quantity: 3, never_sell: true }]]), new Set());
     expect(aggregateNormalCardOwnership(reduced)).toEqual([

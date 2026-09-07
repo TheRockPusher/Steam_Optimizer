@@ -19,7 +19,8 @@ import {
   isInventorySnapshotFresh,
   isLevelUpIsoTimestamp,
   levelUpSnapshotKey,
-  LEVEL_UP_INVENTORY_MAX_AGE_MS
+  LEVEL_UP_INVENTORY_MAX_AGE_MS,
+  normalCardName
 } from "./levelUpOptimization";
 import type {
   LevelUpBadgeSnapshot,
@@ -95,7 +96,6 @@ export const BADGE_WORKSPACE_ID = "badge-workspace";
 const BADGE_PLANNING_RETRY_MS = 5_000;
 /** Keeps the mounted dashboard DOM bounded for very large inventories. */
 const DASHBOARD_PAGE_SIZE = 50;
-const CARD_NAME_PATTERN = /^([1-9][0-9]*)-(.+) \(Trading Card\)$/;
 
 type BadgeWorkspaceState =
   | { kind: "idle"; key: string | null }
@@ -185,8 +185,7 @@ function reasonCopy(reason: string): string {
 }
 
 function cardDisplayName(marketHashName: string): string {
-  const match = CARD_NAME_PATTERN.exec(marketHashName);
-  return match === null ? marketHashName : match[2];
+  return normalCardName(marketHashName) ?? marketHashName;
 }
 
 function compareAppIds(left: string, right: string): number {

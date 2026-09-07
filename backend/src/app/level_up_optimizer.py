@@ -47,8 +47,10 @@ MAX_PLAYER_LEVEL = 100_000
 MAX_CATALOG_SETS = 50_000
 MAX_CATALOG_CARDS = 250_000
 
-# The grouping grammar is intentionally ASCII for the AppID and exact suffix.
-_NORMAL_CARD_RE = re.compile(r"^([1-9][0-9]*)-(.+) \(Trading Card\)$")
+# The grouping grammar is intentionally ASCII for the AppID; the card name is
+# the exact canonical remainder.  Names may or may not carry Steam's legacy
+# " (Trading Card)" suffix: the grammar is syntax, never proof of item class.
+_NORMAL_CARD_RE = re.compile(r"^([1-9][0-9]*)-(.+)$")
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 
 
@@ -658,12 +660,15 @@ class XPProjection:
 
 
 def parse_normal_card_hash(value: object) -> tuple[int, str] | None:
-    """Parse a canonical strict normal-card market hash.
+    """Parse the canonical ``appid-name`` market-hash syntax.
 
+    Any ``appid-name`` string is accepted with or without Steam's legacy
+    ``" (Trading Card)"`` suffix: parsing is pure syntax and never proves the
+    item is a normal card.  Eligibility is decided by provider metadata
+    (``item_type``/``card_border``) or by the authoritative catalog sets.
     Provider percent-encoding is decoded once at the provider/cache boundary.
     This domain parser deliberately never decodes its input again.
     """
-
     if not isinstance(value, str) or not value or len(value) > MAX_HASH_LENGTH:
         return None
     match = _NORMAL_CARD_RE.fullmatch(value)

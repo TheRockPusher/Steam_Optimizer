@@ -20,7 +20,14 @@ export const LEVEL_UP_INVENTORY_MAX_AGE_MS = 60 * 60 * 1000;
 const MAX_BADGE_APP_ID = 2_147_483_647;
 const MAX_EXCHANGE_ALTERNATIVES = 10;
 
-const NORMAL_CARD_HASH_PATTERN = /^([1-9][0-9]*)-(.+) \(Trading Card\)$/;
+/**
+ * Canonical normal-card market-hash grammar: `appid-name`, optionally with the
+ * literal ` (Trading Card)` suffix. Parsing is syntax only; it never proves
+ * that an inventory item is a normal card — classification uses explicit
+ * item_type/card_border metadata.
+ */
+const NORMAL_CARD_HASH_PATTERN = /^([1-9][0-9]*)-(.+)$/;
+const NORMAL_CARD_NAME_SUFFIX = " (Trading Card)";
 const POSITIVE_DECIMAL_ID_PATTERN = /^[1-9][0-9]*$/;
 const ISO_TIMESTAMP_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/;
@@ -31,8 +38,13 @@ export type LevelUpInventoryItem = {
   quantity: number;
   marketable: boolean;
   tradable: boolean;
-  /** Existing inventory responses carry this discriminator. */
-  item_type?: string;
+  /**
+   * Inventory metadata required to classify items safely. A normal card is
+   * exactly item_type "trading_card" with card_border "normal"; hash syntax
+   * alone never classifies an item.
+   */
+  item_type: string;
+  card_border: string | null;
   icon_url?: string | null;
   game_app_id?: string | null;
   game_name?: string | null;
@@ -314,6 +326,29 @@ function isPositiveDecimalId(value: unknown, maxLength: number): value is string
   );
 }
 
+type NormalCardHashParts = { appId: string; cardName: string };
+
+/**
+ * Parses the canonical normal-card grammar syntactically. A trailing
+ * ` (Trading Card)` suffix is stripped once; the remaining card name must be
+ * non-empty. Syntax alone is never proof of item class.
+ */
+function parseNormalCardHash(value: string): NormalCardHashParts | null {
+  const match = NORMAL_CARD_HASH_PATTERN.exec(value);
+  if (match === null) {
+    return null;
+  }
+  const appId = match[1];
+  let cardName = match[2];
+  if (cardName.endsWith(NORMAL_CARD_NAME_SUFFIX)) {
+    cardName = cardName.slice(0, -NORMAL_CARD_NAME_SUFFIX.length);
+  }
+  if (cardName.length === 0 || appId.length > MAX_APP_ID_LENGTH) {
+    return null;
+  }
+  return { appId, cardName };
+}
+
 export function isNormalCardMarketHashName(value: unknown): value is string {
   if (
     typeof value !== "string" ||
@@ -322,17 +357,18 @@ export function isNormalCardMarketHashName(value: unknown): value is string {
   ) {
     return false;
   }
-  const match = NORMAL_CARD_HASH_PATTERN.exec(value);
-  return (
-    match !== null &&
-    match[1].length <= MAX_APP_ID_LENGTH &&
-    match[2].length > 0
-  );
+  return parseNormalCardHash(value) !== null;
 }
 
 export function normalCardAppId(value: string): string | null {
-  const match = NORMAL_CARD_HASH_PATTERN.exec(value);
-  return match !== null && match[1].length <= MAX_APP_ID_LENGTH ? match[1] : null;
+  const parts = parseNormalCardHash(value);
+  return parts === null ? null : parts.appId;
+}
+
+/** Card-name portion of a canonical normal-card market hash. */
+export function normalCardName(value: string): string | null {
+  const parts = parseNormalCardHash(value);
+  return parts === null ? null : parts.cardName;
 }
 
 function isIsoTimestamp(value: unknown): value is string {
@@ -1064,11 +1100,12 @@ function isSnapshotItem(
   value: LevelUpInventoryItem
 ): value is LevelUpInventoryItem & { market_hash_name: string } {
   return (
+    value.item_type === "trading_card" &&
+    value.card_border === "normal" &&
     isNormalCardMarketHashName(value.market_hash_name) &&
     isSafeInteger(value.quantity, 1, MAX_CARD_QUANTITY) &&
     typeof value.marketable === "boolean" &&
-    typeof value.tradable === "boolean" &&
-    (value.item_type === undefined || value.item_type === "trading_card")
+    typeof value.tradable === "boolean"
   );
 }
 

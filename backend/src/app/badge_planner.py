@@ -35,6 +35,12 @@ Data-freshness problems never raise: they produce ``status="unavailable"``
 responses with a stable reason and no plans, while the dashboard rows stay
 visible.  Per-quote staleness is handled per card: an unusable ask simply
 cannot be purchased and is reported as ``null`` pricing, never as zero.
+When every purchase-only candidate's next craft is blocked by unusable
+quote data and no owned-only craft or budget-blocked route exists, the
+response becomes ``status="unavailable"`` with ``price_generation_stale``
+(stale per-item timestamps, even when the generation looks current) or
+``quote_depth_unavailable`` (no usable ask data) instead of a misleading
+``no_opportunity``.
 """
 
 from __future__ import annotations
@@ -100,6 +106,8 @@ PlanStrategy = Literal["cheapest", "fewest_purchases", "preserve_cards"]
 PlanStatus = Literal["ready", "partial", "no_opportunity"]
 PlanningStatus = Literal["ready", "unavailable"]
 Composition = Literal["full", "size_only", "unknown"]
+_QuoteState = Literal["valid", "stale", "missing"]
+
 
 _APP_ID_TEXT_RE = re.compile(r"^[1-9][0-9]*\Z")
 _OPTIONS_INVALID = "options_invalid"
@@ -335,6 +343,7 @@ class _CardStock:
     buy_price_minor: int | None
     buy_quantity: int | None
     quote_timestamp: datetime | None
+    quote_state: _QuoteState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,40 +552,42 @@ def _validated_excluded_app_ids(
 # Quote validation
 
 
-def _ask_quote(
+def _validated_ask(
     card: CatalogCard, context: _PricingContext
-) -> tuple[int, int, datetime] | None:
-    """Return the validated top-ask quote, or ``None`` when unusable.
+) -> tuple[tuple[int, int, datetime] | None, _QuoteState]:
+    """Return the validated top-ask quote plus why it is unusable otherwise.
 
     The ask is the exact buyer total, so no fee conversion is applied again.
     Stale, future, missing, or nonpositive quotes are rejected; they are
-    never coerced into a zero price.
+    never coerced into a zero price.  ``stale`` marks ask data whose quote
+    timestamp left the freshness window or sits in the future; ``missing``
+    marks absent or invalid ask data.  Only ``valid`` yields a quote.
     """
     contract = context.contract
     if contract is None:
-        return None
+        return None, "missing"
     price_text = card.lowest_sell
     quantity = card.lowest_sell_quantity
     timestamp_value = card.lowest_sell_observed_at or card.observed_at
     if price_text is None or quantity is None or timestamp_value is None:
-        return None
+        return None, "missing"
     if isinstance(quantity, bool) or not isinstance(quantity, int):
-        return None
+        return None, "missing"
     if quantity < 1 or quantity > MAX_QUOTE_QUANTITY:
-        return None
+        return None, "missing"
     if not isinstance(timestamp_value, datetime):
-        return None
+        return None, "missing"
     if timestamp_value.tzinfo is None or timestamp_value.utcoffset() is None:
-        return None
+        return None, "missing"
     timestamp = timestamp_value.astimezone(UTC)
     if timestamp > context.now or context.now - timestamp > context.quote_window:
-        return None
+        return None, "stale"
     price_minor = _decimal_to_minor(price_text, contract.minor_digits)
     if isinstance(price_minor, bool) or not isinstance(price_minor, int):
-        return None
+        return None, "missing"
     if price_minor <= 0 or price_minor > _MAX_PRICE_MINOR:
-        return None
-    return (price_minor, quantity, timestamp)
+        return None, "missing"
+    return (price_minor, quantity, timestamp), "valid"
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +617,11 @@ def _build_card_stocks(
         owned_quantity = holding.owned_quantity if holding is not None else 0
         keep_quantity, never_sell = protections.get(market_hash_name, (0, False))
         keep_quantity = min(keep_quantity, owned_quantity)
-        quote = _ask_quote(catalog_card, context) if catalog_card is not None else None
+        quote, quote_state = (
+            _validated_ask(catalog_card, context)
+            if catalog_card is not None
+            else (None, None)
+        )
         stocks.append(
             _CardStock(
                 market_hash_name=market_hash_name,
@@ -618,6 +633,7 @@ def _build_card_stocks(
                 buy_price_minor=quote[0] if quote is not None else None,
                 buy_quantity=quote[1] if quote is not None else None,
                 quote_timestamp=quote[2] if quote is not None else None,
+                quote_state=quote_state,
             )
         )
     return tuple(stocks)
@@ -1101,6 +1117,44 @@ def _unavailable_response(
     )
 
 
+def _purchase_quote_block_reason(
+    games: Sequence[_GameStock],
+) -> str | None:
+    """Diagnose plans whose purchase path could not be evaluated at all.
+
+    Returns an existing availability reason when at least one non-maxed,
+    non-excluded, fully composed game needs purchases for its next craft,
+    every such game is blocked by unusable quote data, and no owned-only
+    craft or budget-blocked route with real costs exists.  A stale quote
+    timestamp wins over entirely missing ask data because it names the
+    provider-side condition: the feed rows exist but left the freshness
+    window, even when the generation timestamp itself looks current.
+    """
+
+    saw_purchase_candidate = False
+    saw_stale_quote = False
+    for stock in games:
+        if (
+            stock.excluded
+            or stock.composition != "full"
+            or stock.badge_level >= _MAX_CRAFTS_PER_BADGE
+        ):
+            continue
+        missing_cards = [card for card in stock.cards if card.available_quantity == 0]
+        if not missing_cards:
+            continue
+        states = [card.quote_state for card in missing_cards]
+        if all(state == "valid" for state in states):
+            # Usable asks exist for the next craft: zero crafts then means the
+            # budget genuinely blocked every route, which is factual as-is.
+            return None
+        saw_purchase_candidate = True
+        saw_stale_quote = saw_stale_quote or any(state == "stale" for state in states)
+    if not saw_purchase_candidate:
+        return None
+    return "price_generation_stale" if saw_stale_quote else "quote_depth_unavailable"
+
+
 def plan_badges(
     *,
     catalog: ResolvedCatalog | None,
@@ -1202,6 +1256,40 @@ def plan_badges(
         )
 
     plans = _build_plans(games, badges=badges, options=options)
+    if all(plan.craft_count == 0 for plan in plans):
+        target_needed = (
+            None
+            if options.mode == "budget" or options.target_level is None
+            else max(
+                0,
+                -(
+                    -(minimum_xp(options.target_level) - badges.player_xp)
+                    // NORMAL_BADGE_XP
+                ),
+            )
+        )
+        if target_needed != 0:
+            quote_block = _purchase_quote_block_reason(games)
+            if quote_block is not None:
+                if contract is None:
+                    quote_block = "currency_contract_missing"
+                elif resolved_catalog is not None and not catalog_is_fresh:
+                    quote_block = "price_generation_stale"
+                # A purchase-only plan could not be evaluated: name the quote
+                # condition instead of a misleading no_opportunity.  A known
+                # pricing reason (stale generation, missing contract) stays
+                # the more precise cause.
+                return _unavailable_response(
+                    availability_reason
+                    if pricing_issue and availability_reason is not None
+                    else quote_block,
+                    current=current,
+                    inventory_time=inventory_time,
+                    badge_time=badge_time,
+                    badges=badges,
+                    contract=contract,
+                    games=game_rows,
+                )
     quote_times = [
         card.quote_timestamp
         for stock in games

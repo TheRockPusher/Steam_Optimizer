@@ -4,6 +4,7 @@ import math
 import re
 import sqlite3
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-PRICE_CACHE_SCHEMA_VERSION = 3
+PRICE_CACHE_SCHEMA_VERSION = 4
 PRICE_CACHE_TTL_SECONDS = 86_400
 PRICE_REFRESH_RETRY_BASE_SECONDS = 60
 PRICE_REFRESH_RETRY_MAX_SECONDS = 3_600
@@ -31,9 +32,9 @@ _MAX_OBSERVED_AT_MILLISECONDS = Decimal(253402300799999)
 _MAX_GENERATION = 2**63 - 1
 _MAX_FAILURE_COUNT = 16
 _BATCH_SIZE = 512
+_NORMAL_CARD_METADATA_ERROR = "Normal card metadata is invalid."
 
 _PRICE_AMOUNT_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
-_NORMAL_CARD_PATTERN = re.compile(r"^([1-9][0-9]*)-(.+) \(Trading Card\)$")
 
 _PRICE_TABLE_NAME = "steamapis_price_cache"
 _PRICE_META_TABLE_NAME = "steamapis_price_cache_meta"
@@ -665,26 +666,36 @@ class SteamApisPriceCache:
             return None
         return parsed if 0 <= parsed <= MAX_PRICE_QUANTITY else None
 
-    @staticmethod
-    def _normal_card_metadata(value: object) -> tuple[int, str] | None:
-        if not isinstance(value, str):
+    @classmethod
+    def _stored_normal_card_metadata(
+        cls,
+        row: tuple[object, ...],
+    ) -> tuple[int, str] | None:
+        """Validate the persisted normal-card membership pair of one row.
+
+        Membership is authoritative provider composition written by a refresh
+        that seeded the normal-card sets; it is never re-derived from the
+        market-hash name.  The stored pair must be both-present or both-absent,
+        and the present form must stay within stored bounds.  A corrupt pair
+        raises so the whole row fails closed instead of silently shrinking a
+        catalog set.
+        """
+
+        app_id = row[6]
+        name = row[7]
+        if app_id is None and name is None:
             return None
-        match = _NORMAL_CARD_PATTERN.fullmatch(value)
-        if match is None:
-            return None
-        try:
-            app_id = int(match.group(1))
-        except TypeError, ValueError:
-            return None
-        card_name = match.group(2)
+        parsed_app_id = cls._sqlite_integer(app_id)
         if (
-            not 0 < app_id <= MAX_NORMAL_CARD_APP_ID
-            or not card_name
-            or len(card_name) > MAX_NORMAL_CARD_NAME_LENGTH
-            or "\x00" in card_name
+            parsed_app_id is None
+            or not 0 < parsed_app_id <= MAX_NORMAL_CARD_APP_ID
+            or not isinstance(name, str)
+            or not name
+            or len(name) > MAX_NORMAL_CARD_NAME_LENGTH
+            or "\x00" in name
         ):
-            return None
-        return app_id, card_name
+            raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+        return parsed_app_id, name
 
     @staticmethod
     def _normalize_amount(value: object) -> str | None:
@@ -757,7 +768,10 @@ class SteamApisPriceCache:
         lowest_sell_quantity = cls._normalize_quantity(row[5])
         normal_card_app_id: int | None = None
         normal_card_name: str | None = None
-        metadata = cls._normal_card_metadata(name)
+        try:
+            metadata = cls._stored_normal_card_metadata(row)
+        except ValueError:
+            return None
         if metadata is not None:
             normal_card_app_id, normal_card_name = metadata
         observed_at = cls._normalize_observed_at(row[8]) if row[8] is not None else None
@@ -1120,7 +1134,11 @@ class SteamApisPriceCache:
 
 
 class SteamApisPriceRefresh:
-    """A transaction that atomically installs one complete streamed generation."""
+    """A transaction that atomically installs one complete streamed generation.
+
+    Normal-card membership comes from the authoritative provider composition
+    seeded before streaming; it is never inferred from market-hash names.
+    """
 
     __slots__ = (
         "_accepted_count",
@@ -1130,6 +1148,7 @@ class SteamApisPriceRefresh:
         "_closed",
         "_connection",
         "_generation",
+        "_normal_membership",
     )
 
     def __init__(
@@ -1143,6 +1162,7 @@ class SteamApisPriceRefresh:
         self._generation = generation
         self._accepted_count = 0
         self._accepted_hashes: set[str] = set()
+        self._normal_membership: dict[str, tuple[int, str]] = {}
         self._batch: list[
             tuple[
                 str,
@@ -1156,6 +1176,45 @@ class SteamApisPriceRefresh:
             ]
         ] = []
         self._closed = False
+
+    def seed_normal_cards(
+        self,
+        sets: Mapping[int, Sequence[str]],
+    ) -> None:
+        """Seed the authoritative normal-card composition for this generation.
+
+        ``sets`` maps each AppID to its literal provider card names (no
+        suffix is appended and no percent-decoding is applied).  Only these
+        exact ``appid-name`` hashes become normal-card catalog members; a
+        market-hash name alone is never treated as proof of item class.
+        Validation is strict: any malformed AppID or name fails the seed so
+        the caller never builds a generation from partial composition.
+        """
+
+        if self._closed:
+            raise RuntimeError(_PRICE_REFRESH_CLOSED_ERROR)
+        if not isinstance(sets, Mapping):
+            raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+        membership: dict[str, tuple[int, str]] = {}
+        for raw_app_id, raw_names in sets.items():
+            if isinstance(raw_app_id, bool) or not isinstance(raw_app_id, int):
+                raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+            if not 0 < raw_app_id <= MAX_NORMAL_CARD_APP_ID:
+                raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+            if isinstance(raw_names, (str, bytes)) or not isinstance(
+                raw_names, Sequence
+            ):
+                raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+            for raw_name in raw_names:
+                if not isinstance(raw_name, str):
+                    raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+                market_hash_name = self._cache._normalize_market_hash_name(
+                    f"{raw_app_id}-{raw_name}"
+                )
+                if market_hash_name is None:
+                    raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+                membership[market_hash_name] = (raw_app_id, raw_name)
+        self._normal_membership = membership
 
     @property
     def generation(self) -> int:
@@ -1195,7 +1254,7 @@ class SteamApisPriceRefresh:
             highest_quantity = None
         if lowest is None:
             lowest_quantity = None
-        metadata = self._cache._normal_card_metadata(name)
+        metadata = self._normal_membership.get(name)
         normal_card_app_id, normal_card_name = (
             metadata if metadata is not None else (None, None)
         )
@@ -1230,6 +1289,20 @@ class SteamApisPriceRefresh:
         )
         self._batch.clear()
 
+    def _install_unpriced_normal_cards(self) -> None:
+        """Persist authoritative members the price feed never quoted.
+
+        A missing price row must survive as an unpriced catalog row instead of
+        truncating its set, so every seeded member without a streamed row is
+        added with no quote sides.  Price lookups ignore such rows while the
+        catalog read keeps them, preserving set completeness.
+        """
+
+        for market_hash_name in sorted(self._normal_membership):
+            if market_hash_name in self._accepted_hashes:
+                continue
+            self.add(market_hash_name, None, None, None)
+
     def commit(
         self,
         *,
@@ -1242,6 +1315,7 @@ class SteamApisPriceRefresh:
         if not math.isfinite(timestamp) or timestamp < 0:
             timestamp = time.time()
         try:
+            self._install_unpriced_normal_cards()
             self._flush()
             self._connection.execute(
                 "DELETE FROM steamapis_price_cache WHERE generation != ?",

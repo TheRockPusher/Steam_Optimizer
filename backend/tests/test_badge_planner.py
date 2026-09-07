@@ -63,7 +63,7 @@ def make_card(
 ) -> CatalogCard:
     name = f"Card {number}"
     return CatalogCard(
-        market_hash_name=f"{app_id}-{name} (Trading Card)",
+        market_hash_name=f"{app_id}-{name}",
         app_id=app_id,
         card_name=name,
         lowest_sell=sell,
@@ -79,7 +79,7 @@ def make_set(app_id: int, game_name: str, cards: list[CatalogCard]) -> CatalogSe
 def make_holdings(app_id: int, counts: dict[int, int]) -> list[Holding]:
     return [
         Holding(
-            market_hash_name=f"{app_id}-Card {number} (Trading Card)",
+            market_hash_name=f"{app_id}-Card {number}",
             owned_quantity=owned,
             sellable_quantity=owned,
         )
@@ -184,8 +184,8 @@ def test_repeated_crafts_respect_cumulative_ask_depth() -> None:
     assert step.badge_level_before == 0
     assert step.badge_level_after == 3
     purchases = {purchase.market_hash_name: purchase for purchase in step.purchases}
-    assert purchases["500-Card 5 (Trading Card)"].quantity == 2
-    assert purchases["500-Card 1 (Trading Card)"].quantity == 2
+    assert purchases["500-Card 5"].quantity == 2
+    assert purchases["500-Card 1"].quantity == 2
     assert all(purchase.unit_price_minor == 10 for purchase in purchases.values())
     # Depth exhaustion is policy-independent: every plan crafts the same three.
     for plan in response.plans:
@@ -208,7 +208,7 @@ def test_protections_reserve_copies_enable_replacements_and_validate() -> None:
         budget_minor=5_000,
         protections=[
             {
-                "market_hash_name": f"600-Card {number} (Trading Card)",
+                "market_hash_name": f"600-Card {number}",
                 "keep_quantity": 1,
                 "never_sell": False,
             }
@@ -234,7 +234,7 @@ def test_protections_reserve_copies_enable_replacements_and_validate() -> None:
         budget_minor=5_000,
         protections=[
             {
-                "market_hash_name": f"600-Card {number} (Trading Card)",
+                "market_hash_name": f"600-Card {number}",
                 "keep_quantity": 2,
                 "never_sell": False,
             }
@@ -257,7 +257,7 @@ def test_protections_reserve_copies_enable_replacements_and_validate() -> None:
         budget_minor=5_000,
         protections=[
             {
-                "market_hash_name": "600-Card 1 (Trading Card)",
+                "market_hash_name": "600-Card 1",
                 "keep_quantity": 0,
                 "never_sell": True,
             }
@@ -281,7 +281,7 @@ def test_protections_reserve_copies_enable_replacements_and_validate() -> None:
                 budget_minor=5_000,
                 protections=[
                     {
-                        "market_hash_name": "600-Card 1 (Trading Card)",
+                        "market_hash_name": "600-Card 1",
                         "keep_quantity": 3,
                         "never_sell": False,
                     }
@@ -300,7 +300,7 @@ def test_protections_reserve_copies_enable_replacements_and_validate() -> None:
                 budget_minor=5_000,
                 protections=[
                     {
-                        "market_hash_name": "600-Unknown (Trading Card)",
+                        "market_hash_name": "600-Unknown",
                         "keep_quantity": 1,
                         "never_sell": False,
                     }
@@ -508,12 +508,16 @@ def test_stale_data_is_visible_but_never_actionable() -> None:
     options = make_options(budget_minor=10_000)
 
     fresh = run_planner(catalog, holdings, metadata, options, contract=contract)
-    assert fresh.status == "ready"
+    # The purchase path cannot be evaluated: every game that needs a purchase
+    # for its next craft is blocked by a stale per-item quote, so the response
+    # names the quote condition instead of a misleading no_opportunity plan.
+    assert fresh.status == "unavailable"
+    assert fresh.reason == "price_generation_stale"
+    assert fresh.plans == []
+    assert fresh.valid_until is None
     by_id = {game.app_id: game for game in fresh.games}
     stale_card = next(
-        card
-        for card in by_id["1300"].cards
-        if card.market_hash_name == "1300-Card 5 (Trading Card)"
+        card for card in by_id["1300"].cards if card.market_hash_name == "1300-Card 5"
     )
     assert stale_card.buy_price_minor is None
     assert stale_card.quote_timestamp is None
@@ -530,8 +534,6 @@ def test_stale_data_is_visible_but_never_actionable() -> None:
     ]
     assert quoted
     assert all(card.quote_timestamp == _iso(NOW) for card in quoted)
-    assert fresh.plans[0].status == "no_opportunity"
-    assert fresh.plans[0].steps == []
 
     stale_inventory = run_planner(
         catalog,
@@ -571,3 +573,64 @@ def test_stale_data_is_visible_but_never_actionable() -> None:
     assert future_inventory.status == "unavailable"
     assert future_inventory.reason == "inventory_snapshot_in_future"
     assert future_inventory.plans == []
+
+
+def test_missing_ask_depth_for_purchase_only_games_is_unavailable() -> None:
+    cards = [make_card(1500, number, sell=None) for number in range(1, 6)]
+    catalog = ResolvedCatalog(
+        generation=1,
+        generated_at=NOW,
+        sets=(make_set(1500, "No Ask Game", cards),),
+    )
+    holdings = make_holdings(1500, {1: 1, 2: 1, 3: 1, 4: 1})
+    response = run_planner(
+        catalog, holdings, {}, make_options(), contract=fee_contract()
+    )
+
+    # The feed rows exist but carry no usable ask, so the purchase path cannot
+    # be evaluated and the response must not claim a factual no_opportunity.
+    assert (response.status, response.reason) == (
+        "unavailable",
+        "quote_depth_unavailable",
+    )
+    assert response.plans == []
+    by_id = {game.app_id: game for game in response.games}
+    assert by_id["1500"].missing_count == 1
+    assert by_id["1500"].completion_cost_minor is None
+
+
+def test_budget_blocked_route_with_usable_quotes_stays_factual() -> None:
+    cards = [make_card(1600, number) for number in range(1, 6)]
+    catalog = ResolvedCatalog(
+        generation=1,
+        generated_at=NOW,
+        sets=(make_set(1600, "Priced Game", cards),),
+    )
+    holdings = make_holdings(1600, {1: 1, 2: 1, 3: 1, 4: 1})
+    contract = fee_contract()
+
+    target = run_planner(
+        catalog,
+        holdings,
+        {},
+        make_options(mode="target", target_level=20, budget_minor=0),
+        contract=contract,
+    )
+    assert (target.status, target.reason) == ("ready", "ready")
+    assert all(
+        plan.status == "no_opportunity" and plan.reason == "budget_insufficient"
+        for plan in target.plans
+    )
+
+    budget = run_planner(
+        catalog,
+        holdings,
+        {},
+        make_options(budget_minor=0),
+        contract=contract,
+    )
+    assert (budget.status, budget.reason) == ("ready", "ready")
+    assert all(
+        plan.status == "no_opportunity" and plan.reason == "no_crafts_available"
+        for plan in budget.plans
+    )
