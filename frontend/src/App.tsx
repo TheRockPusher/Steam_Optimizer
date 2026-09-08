@@ -1413,7 +1413,10 @@ function Brand({ currentPage }: { currentPage: PageKind }) {
       aria-current={currentPage === "home" ? "page" : undefined}
     >
       <span className="brand-mark" aria-hidden="true">
-        SO
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <path d="m12 2 8.5 5v10L12 22l-8.5-5V7L12 2Z" stroke="currentColor" strokeWidth="1.5" />
+          <path d="m7.5 12 3 3 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
       </span>
       <span className="brand-name">Steam Optimizer</span>
     </a>
@@ -2806,7 +2809,7 @@ function WorkspaceHeader({
     <header className="workspace-header">
       <div className="workspace-header-titles">
         <p className="section-label">Badge workspace</p>
-        <h2 id="workspace-title">Badges, planning, and inventory</h2>
+        <h2 id="workspace-title">Your badge workspace</h2>
         <p className="workspace-level-summary" aria-label="Current Steam level summary">
           {levelSummary}
         </p>
@@ -4050,19 +4053,6 @@ function HomePage() {
       </a>
 
       <SiteHeader currentPage="home">
-        {viewState.kind === "signed-out" && (
-          <a className="steam-sign-in-link" href={STEAM_LOGIN_URL}>
-            <picture className="steam-sign-in-picture">
-              <img
-                className="steam-sign-in-image"
-                src={steamSignInWide}
-                width="180"
-                height="35"
-                alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
-              />
-            </picture>
-          </a>
-        )}
         {viewState.kind === "signed-in" && (
           <div className="site-account">
             <AccessSummary
@@ -4100,45 +4090,67 @@ function HomePage() {
       <main id="main-content" className="page-main">
         {viewState.kind !== "signed-in" && (
           <section className="hero" aria-labelledby="page-title">
-            <h1 id="page-title">
-              Plan badge crafting around your own inventory.
-            </h1>
-            <p className="hero-copy">
-              Sign in with Steam to review the badges, trading cards, and
-              prices Steam already exposes publicly, then decide what to craft
-              next. Steam Optimizer is read-only: it never trades, sells,
-              crafts, buys, or changes your account, and every suggestion
-              stays a manual action you take on Steam.
-            </p>
-            <dl className="hero-workflows">
+            <div className="hero-intro">
+              <p className="eyebrow">A little closer to your next badge.</p>
+              <h1 id="page-title">
+                More badges.<br /><span>Less guesswork.</span>
+              </h1>
+              <p className="hero-copy">
+                Put your trading cards to work. Find the badges you can craft,
+                see what’s missing, and plan your next Steam level.
+              </p>
+              <div className="hero-actions">
+                {viewState.kind === "signed-out" && (
+                  <a className="steam-sign-in-link" href={STEAM_LOGIN_URL}>
+                    <picture className="steam-sign-in-picture">
+                      <img
+                        className="steam-sign-in-image"
+                        src={steamSignInWide}
+                        width="180"
+                        height="35"
+                        alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+                      />
+                    </picture>
+                  </a>
+                )}
+                <a className="hero-guide-link" href="#how-it-works">
+                  See how it works <span aria-hidden="true">↘</span>
+                </a>
+              </div>
+              <p className="hero-note">
+                Public inventory. Private password. Always read-only.
+              </p>
+            </div>
+            <aside className="hero-illustration" aria-hidden="true">
+              <div className="badge-emblem">
+                <svg width="280" height="280" viewBox="0 0 280 280" fill="none">
+                  <circle cx="140" cy="140" r="126" stroke="currentColor" strokeOpacity=".12" />
+                  <circle cx="140" cy="140" r="103" stroke="currentColor" strokeOpacity=".2" strokeDasharray="2 8" />
+                  <path d="m108 164-16 66 48-24 48 24-16-66" fill="var(--color-surface-strong)" stroke="currentColor" strokeOpacity=".45" strokeWidth="1.5" />
+                  <path d="m140 47 65 38v76l-65 38-65-38V85l65-38Z" fill="var(--color-surface)" stroke="currentColor" strokeWidth="1.5" />
+                  <path d="m140 60 54 32v62l-54 32-54-32V92l54-32Z" stroke="currentColor" strokeOpacity=".3" />
+                  <path d="m140 88 10 23 25 3-19 17 5 25-21-13-21 13 5-25-19-17 25-3 10-23Z" fill="currentColor" />
+                  <path d="M31 140h12m194 0h12M140 8v12m0 240v12" stroke="currentColor" strokeOpacity=".5" />
+                  <circle cx="43" cy="65" r="3" fill="currentColor" fillOpacity=".45" />
+                  <circle cx="237" cy="214" r="3" fill="currentColor" fillOpacity=".45" />
+                </svg>
+              </div>
+              <p>Your collection, with a plan.</p>
+            </aside>
+            <dl className="hero-workflows" id="how-it-works">
               <div>
-                <dt>Badges</dt>
-                <dd>
-                  Scan your normal game badges for craftable sets, closest
-                  completions, and games you protected or excluded.
-                </dd>
+                <dt><span className="workflow-number">01</span> Find your next badge</dt>
+                <dd>See complete sets and the badges you’re just a few cards away from.</dd>
               </div>
               <div>
-                <dt>Plan</dt>
-                <dd>
-                  Set a target level or a Steam Wallet budget, then compare
-                  cheapest, fewest-purchase, and card-preserving plans before
-                  buying anything.
-                </dd>
+                <dt><span className="workflow-number">02</span> Make a plan</dt>
+                <dd>Choose a target level or a budget. Compare the cards you’d need to buy.</dd>
               </div>
               <div>
-                <dt>Inventory</dt>
-                <dd>
-                  Price your items, compare gem values, and review booster
-                  packs with exact coverage of what Steam reported.
-                </dd>
+                <dt><span className="workflow-number">03</span> Keep control</dt>
+                <dd>Review prices, then act on Steam yourself. We never buy, sell, trade, or craft.</dd>
               </div>
             </dl>
-            <p className="hero-note">
-              Your Steam password never reaches this app. Plans are estimates
-              from the latest snapshot and expire with it; confirm every
-              purchase and craft on Steam itself.
-            </p>
           </section>
         )}
         <p

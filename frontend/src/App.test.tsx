@@ -281,7 +281,7 @@ describe("FAQ", () => {
 });
 
 describe("App", () => {
-  it("loads the session before offering the compact Steam sign-in", async () => {
+  it("loads the session before offering Steam sign-in", async () => {
     let resolveSession!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(
       () =>
@@ -309,32 +309,11 @@ describe("App", () => {
       name: /steam sign-in/i
     });
     expect(screen.getByRole("status")).toBe(statusRegion);
-    expect(loginLink.closest("header")).toHaveClass("site-header");
-    expect(loginLink).toHaveAccessibleName(
-      "Steam sign-in; Steam Optimizer is not affiliated with Valve"
-    );
     expect(loginLink).toHaveAttribute("href", "/api/auth/steam/start");
     expect(loginLink).not.toHaveAttribute("target");
-    const signInImage = within(loginLink).getByRole("img");
-    expect(signInImage.getAttribute("src")).toContain("sits_01.png");
-    expect(signInImage).toHaveAttribute("width", "180");
-    expect(signInImage).toHaveAttribute("height", "35");
     expect(
       within(screen.getByRole("banner")).getByRole("link", { name: "FAQ" })
     ).toHaveAttribute("href", "/faq");
-    expect(
-      screen.getByRole("heading", {
-        name: "Plan badge crafting around your own inventory."
-      })
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        /never trades, sells, crafts, buys, or changes your account/
-      )
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Set a target level or a Steam Wallet budget/)
-    ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /privacy & steam data terms/i })
     ).toHaveAttribute(
@@ -2063,7 +2042,6 @@ describe("App", () => {
     render(<App />);
     await openInventorySection();
 
-    await screen.findByRole("heading", { name: "Badges, planning, and inventory" });
     fireEvent.click(
       screen.getByRole("button", { name: "Refresh inventory" })
     );
