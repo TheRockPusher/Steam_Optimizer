@@ -1,13 +1,19 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v1.1.0
 
-## Unreleased
 
-### Changed
-- Redesign the website with a charcoal and muted-lime palette, a focused Steam sign-in landing page, and a custom badge illustration.
-- Simplify badge, planning, inventory, and FAQ styling with flatter surfaces, clearer typography, and responsive mobile navigation.
-- Extend visible keyboard focus styling to form controls and disclosure summaries.
+### Documentation
+- Update changelog for v1.0.1
+
+
+### Features
+- Redesign website with focused dark interface
+
+
+### Maintenance
+- Prepare release v1.1.0
 
 ## v1.0.1
 
