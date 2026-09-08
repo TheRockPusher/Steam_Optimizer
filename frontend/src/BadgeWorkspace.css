@@ -1,10 +1,22 @@
 /* BadgeWorkspace owns .badge-workspace-prefixed styles and consumes the
-   shared design tokens from index.css. */
+   shared design tokens from index.css.
+
+   Design rules for this sheet:
+   - Large panels use --color-surface with hairline --color-line-soft borders;
+     --color-surface-strong is reserved for cards nested inside panels.
+   - One strong band per screen (the summary), everything else separated by
+     hairlines instead of nested boxes.
+   - Uppercase + tracking is reserved for machine tags (chips, table heads);
+     human labels (dl terms, field labels) stay sentence case.
+   - Status color appears as a hairline or a tinted chip, never as a large
+     filled surface. Tints are derived with color-mix from status tokens. */
 
 .badge-workspace {
   display: grid;
   gap: var(--space-5);
 }
+
+/* Heading */
 
 .badge-workspace-heading {
   display: grid;
@@ -14,6 +26,7 @@
 .badge-workspace-heading h2 {
   margin: 0;
   font-size: var(--text-xl);
+  font-weight: 600;
   letter-spacing: var(--tracking-tight);
 }
 
@@ -24,6 +37,8 @@
   font-size: var(--text-sm);
   line-height: var(--leading-copy);
 }
+
+/* Accessibility helpers (do not restyle) */
 
 .badge-workspace-visually-hidden {
   position: absolute;
@@ -56,17 +71,20 @@
 
 .badge-workspace-status {
   display: grid;
-  gap: var(--space-3);
-  padding: var(--space-5);
+  gap: var(--space-2);
+  justify-items: start;
+  padding: var(--space-4) var(--space-5);
   border: var(--border-width) solid var(--color-line-soft);
+  border-inline-start: 0.1875rem solid var(--color-line);
   border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
 }
 
 .badge-workspace-status h3,
 .badge-workspace-status h4 {
   margin: 0;
   font-size: var(--text-lg);
+  font-weight: 600;
 }
 
 .badge-workspace-status p {
@@ -77,30 +95,39 @@
 }
 
 .badge-workspace-status-loading {
-  border-color: var(--color-accent-soft);
+  border-inline-start-color: var(--color-accent);
 }
 
-.badge-workspace-status-unavailable,
+.badge-workspace-status-unavailable {
+  border-inline-start-color: color-mix(
+    in oklab,
+    var(--color-unavailable) 55%,
+    transparent
+  );
+}
+
 .badge-workspace-status-error {
-  border-color: rgb(255 172 164 / 35%);
+  border-inline-start-color: color-mix(
+    in oklab,
+    var(--color-error) 55%,
+    transparent
+  );
 }
 
 .badge-workspace-status-error h3 {
   color: var(--color-error);
 }
 
-/* Summary strip */
+/* Summary band: the one strong header band; hairline rule instead of a box */
 
 .badge-workspace-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-4);
+  gap: var(--space-3) var(--space-4);
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-4);
-  border: var(--border-width) solid var(--color-line-soft);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  padding: 0 0 var(--space-4);
+  border-bottom: var(--border-width) solid var(--color-line-soft);
 }
 
 .badge-workspace-summary-metrics {
@@ -108,24 +135,7 @@
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-5);
   margin: 0;
-}
-
-.badge-workspace-summary-metrics div {
-  display: grid;
-  gap: 0.1rem;
-}
-
-.badge-workspace-summary-metrics dt {
-  color: var(--color-ink-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-}
-
-.badge-workspace-summary-metrics dd {
-  margin: 0;
-  font-size: var(--text-base);
-  font-weight: 700;
+  min-width: 0;
 }
 
 .badge-workspace-summary-actions {
@@ -141,7 +151,8 @@
   align-items: center;
   justify-content: space-between;
   padding: var(--space-3) var(--space-4);
-  border: var(--border-width) solid rgb(240 189 130 / 45%);
+  border: var(--border-width) solid
+    color-mix(in oklab, var(--color-private) 35%, transparent);
   border-radius: var(--radius-md);
   background: var(--color-private-soft);
 }
@@ -160,9 +171,13 @@
   padding: var(--space-2) var(--space-4);
   border: var(--border-width) solid transparent;
   border-radius: var(--radius-sm);
-  font-weight: 700;
+  font-size: var(--text-sm);
+  font-weight: 600;
   cursor: pointer;
-  transition: filter var(--transition-fast);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .badge-workspace-primary {
@@ -170,9 +185,13 @@
   background: var(--color-accent);
 }
 
+.badge-workspace-primary:hover:not(:disabled) {
+  background: var(--color-accent-strong);
+}
+
 .badge-workspace-primary:disabled {
   cursor: not-allowed;
-  filter: saturate(40%) opacity(60%);
+  opacity: 55%;
 }
 
 .badge-workspace-secondary {
@@ -181,15 +200,33 @@
   background: transparent;
 }
 
-.badge-workspace-primary:hover:not(:disabled),
 .badge-workspace-secondary:hover:not(:disabled) {
-  filter: brightness(1.1);
+  border-color: var(--color-ink-faint);
+  background: color-mix(in oklab, var(--color-ink) 5%, transparent);
+}
+
+.badge-workspace-secondary:disabled {
+  cursor: not-allowed;
+  opacity: 55%;
 }
 
 .badge-workspace-link {
-  color: var(--color-accent);
+  color: var(--color-accent-strong);
   text-decoration: underline;
+  text-decoration-color: color-mix(
+    in oklab,
+    var(--color-accent) 55%,
+    transparent
+  );
   text-underline-offset: 0.2em;
+  transition:
+    color var(--transition-fast),
+    text-decoration-color var(--transition-fast);
+}
+
+.badge-workspace-link:hover {
+  color: var(--color-accent);
+  text-decoration-color: var(--color-accent);
 }
 
 /* Dashboard */
@@ -199,38 +236,51 @@
   gap: var(--space-4);
 }
 
+/* Shared metric pattern: plain label above tabular value, no boxes */
+
+.badge-workspace-summary-metrics dt,
+.badge-workspace-status-summary dt,
+.badge-workspace-game-metrics dt,
+.badge-workspace-policy-metrics dt {
+  color: var(--color-ink-faint);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.badge-workspace-summary-metrics dd,
+.badge-workspace-status-summary dd,
+.badge-workspace-game-metrics dd,
+.badge-workspace-policy-metrics dd {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge-workspace-summary-metrics div,
+.badge-workspace-status-summary div,
+.badge-workspace-game-metrics div,
+.badge-workspace-policy-metrics div {
+  display: grid;
+  gap: var(--space-1);
+}
+
+/* Counts strip: bare, separated from the list by whitespace only */
+
 .badge-workspace-status-summary {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-5);
   margin: 0;
-  padding: var(--space-3) var(--space-4);
-  border: var(--border-width) solid var(--color-line-soft);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  padding: 0;
 }
 
-.badge-workspace-status-summary div {
-  display: grid;
-  gap: 0.1rem;
-}
-
-.badge-workspace-status-summary dt {
-  color: var(--color-ink-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-}
-
-.badge-workspace-status-summary dd {
-  margin: 0;
-  font-weight: 700;
-}
+/* Filters: search grows, select stays natural width */
 
 .badge-workspace-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-3);
+  gap: var(--space-3) var(--space-4);
   align-items: end;
 }
 
@@ -240,10 +290,14 @@
   min-width: 12rem;
 }
 
+.badge-workspace-controls .badge-workspace-field:first-child {
+  flex: 1 1 16rem;
+}
+
 .badge-workspace-field > span {
   color: var(--color-ink-soft);
   font-size: var(--text-sm);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .badge-workspace-field input,
@@ -254,6 +308,16 @@
   border-radius: var(--radius-sm);
   color: var(--color-ink);
   background: var(--color-canvas);
+  transition: border-color var(--transition-fast);
+}
+
+.badge-workspace-field input:hover,
+.badge-workspace-field select:hover {
+  border-color: var(--color-ink-faint);
+}
+
+.badge-workspace-field input::placeholder {
+  color: var(--color-ink-faint);
 }
 
 .badge-workspace-field input[aria-invalid="true"] {
@@ -265,9 +329,11 @@
   font-size: var(--text-xs);
 }
 
+/* Game list: tight rows; status read from the edge bar and chip */
+
 .badge-workspace-games {
   display: grid;
-  gap: var(--space-3);
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -276,8 +342,28 @@
 .badge-workspace-game {
   border: var(--border-width) solid var(--color-line-soft);
   border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   overflow: hidden;
+}
+
+.badge-workspace-game-craftable {
+  border-inline-start: 0.125rem solid
+    color-mix(in oklab, var(--color-public) 55%, transparent);
+}
+
+.badge-workspace-game-incomplete {
+  border-inline-start: 0.125rem solid
+    color-mix(in oklab, var(--color-accent) 55%, transparent);
+}
+
+.badge-workspace-game-maxed {
+  border-inline-start: 0.125rem solid
+    color-mix(in oklab, var(--color-unavailable) 45%, transparent);
+}
+
+.badge-workspace-game-reserved {
+  border-inline-start: 0.125rem solid
+    color-mix(in oklab, var(--color-private) 55%, transparent);
 }
 
 .badge-workspace-game-heading {
@@ -286,6 +372,11 @@
 
 .badge-workspace-game-toggle {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name chip"
+    "meta meta"
+    "facts facts";
   gap: var(--space-1) var(--space-3);
   width: 100%;
   padding: var(--space-3) var(--space-4);
@@ -293,11 +384,39 @@
   background: transparent;
   text-align: start;
   cursor: pointer;
+  transition: background-color var(--transition-fast);
+}
+
+.badge-workspace-game-toggle:hover {
+  background: color-mix(in oklab, var(--color-ink) 3%, transparent);
+}
+
+.badge-workspace-game-toggle > .badge-workspace-game-name {
+  grid-area: name;
+  align-self: center;
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+
+.badge-workspace-game-toggle > .badge-workspace-game-meta {
+  grid-area: meta;
+  color: var(--color-ink-faint);
+  font-size: var(--text-xs);
+}
+
+.badge-workspace-game-toggle > .badge-workspace-chip {
+  grid-area: chip;
+  align-self: start;
+  justify-self: end;
+}
+
+.badge-workspace-game-toggle > .badge-workspace-game-facts {
+  grid-area: facts;
 }
 
 .badge-workspace-game-name {
   font-size: var(--text-base);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .badge-workspace-game-meta {
@@ -308,62 +427,66 @@
 .badge-workspace-game-facts {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1) var(--space-3);
+  gap: var(--space-1) var(--space-4);
   color: var(--color-ink-soft);
   font-size: var(--text-xs);
 }
 
+/* Chips: tinted pill, machine-tag typography, status via token pairs */
+
 .badge-workspace-chip {
   justify-self: start;
-  padding: 0.15rem var(--space-2);
+  padding: 0.125rem var(--space-2);
   border-radius: var(--radius-round);
+  color: var(--color-unavailable);
   font-size: var(--text-xs);
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: var(--tracking-label);
   text-transform: uppercase;
   background: var(--color-unavailable-soft);
-  color: var(--color-unavailable);
 }
 
 .badge-workspace-chip-craftable {
-  background: var(--color-public-soft);
   color: var(--color-public);
+  background: var(--color-public-soft);
 }
 
 .badge-workspace-chip-incomplete {
-  background: var(--color-accent-soft);
   color: var(--color-accent);
+  background: var(--color-accent-soft);
 }
 
 .badge-workspace-chip-maxed {
-  background: var(--color-accent-soft);
-  color: var(--color-accent);
+  color: var(--color-unavailable);
+  background: var(--color-unavailable-soft);
 }
 
 .badge-workspace-chip-reserved {
-  background: var(--color-private-soft);
   color: var(--color-private);
+  background: var(--color-private-soft);
 }
 
 .badge-workspace-chip-plan-ready {
-  background: var(--color-public-soft);
   color: var(--color-public);
+  background: var(--color-public-soft);
 }
 
 .badge-workspace-chip-plan-partial {
-  background: var(--color-private-soft);
   color: var(--color-private);
+  background: var(--color-private-soft);
 }
 
 .badge-workspace-chip-plan-no_opportunity {
-  background: var(--color-unavailable-soft);
   color: var(--color-unavailable);
+  background: var(--color-unavailable-soft);
 }
+
+/* Expanded game: flush with the toggle padding, hairline top */
 
 .badge-workspace-game-details {
   display: grid;
   gap: var(--space-3);
-  padding: var(--space-4);
+  padding: var(--space-3) var(--space-4) var(--space-4);
   border-top: var(--border-width) solid var(--color-line-soft);
 }
 
@@ -380,20 +503,7 @@
   margin: 0;
 }
 
-.badge-workspace-game-metrics div {
-  display: grid;
-  gap: 0.1rem;
-}
-
-.badge-workspace-game-metrics dt {
-  color: var(--color-ink-faint);
-  font-size: var(--text-xs);
-}
-
-.badge-workspace-game-metrics dd {
-  margin: 0;
-  font-weight: 700;
-}
+/* Card table: hairline rows, quiet uppercase heads, tabular figures */
 
 .badge-workspace-table-scroll {
   position: relative;
@@ -404,6 +514,7 @@
   width: 100%;
   border-collapse: collapse;
   font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
 }
 
 .badge-workspace-card-table caption {
@@ -423,11 +534,21 @@
   vertical-align: middle;
 }
 
+.badge-workspace-card-table th:first-child,
+.badge-workspace-card-table td:first-child {
+  padding-inline-start: 0;
+}
+
 .badge-workspace-card-table thead th {
   color: var(--color-ink-faint);
   font-size: var(--text-xs);
+  font-weight: 600;
   letter-spacing: var(--tracking-label);
   text-transform: uppercase;
+}
+
+.badge-workspace-card-table tbody tr:hover {
+  background: color-mix(in oklab, var(--color-ink) 3%, transparent);
 }
 
 .badge-workspace-card-name {
@@ -442,6 +563,13 @@
   border-radius: var(--radius-sm);
   color: var(--color-ink);
   background: var(--color-canvas);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.badge-workspace-keep-input:disabled {
+  cursor: not-allowed;
+  opacity: 55%;
 }
 
 .badge-workspace-never-sell {
@@ -455,12 +583,19 @@
   accent-color: var(--color-accent);
 }
 
+.badge-workspace-never-sell input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 45%;
+}
+
 .badge-workspace-game-actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-4);
   align-items: center;
 }
+
+/* Pagination */
 
 .badge-workspace-pagination {
   display: grid;
@@ -471,6 +606,7 @@
   margin: 0;
   color: var(--color-ink-soft);
   font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
 }
 
 .badge-workspace-pagination-buttons {
@@ -480,17 +616,27 @@
   align-items: center;
 }
 
+.badge-workspace-pagination-buttons > span {
+  color: var(--color-ink-faint);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Empty states */
+
 .badge-workspace-empty {
   display: grid;
   gap: var(--space-2);
+  justify-items: start;
   padding: var(--space-5);
-  border: var(--border-width) dashed var(--color-line);
+  border: var(--border-width) dashed var(--color-line-soft);
   border-radius: var(--radius-md);
 }
 
 .badge-workspace-empty h3 {
   margin: 0;
   font-size: var(--text-lg);
+  font-weight: 600;
 }
 
 .badge-workspace-empty p {
@@ -511,11 +657,11 @@
 .badge-workspace-constraints,
 .badge-workspace-policies {
   display: grid;
-  gap: var(--space-3);
+  gap: var(--space-4);
   padding: var(--space-5);
   border: var(--border-width) solid var(--color-line-soft);
-  border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
 }
 
 .badge-workspace-plan-input h3,
@@ -523,6 +669,7 @@
 .badge-workspace-policies h3 {
   margin: 0;
   font-size: var(--text-lg);
+  font-weight: 600;
 }
 
 .badge-workspace-plan-form {
@@ -543,13 +690,14 @@
   padding: 0;
   color: var(--color-ink-soft);
   font-size: var(--text-sm);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .badge-workspace-radio {
   display: flex;
   gap: var(--space-2);
   align-items: center;
+  font-size: var(--text-sm);
 }
 
 .badge-workspace-radio input[type="radio"] {
@@ -582,6 +730,7 @@
 .badge-workspace-constraints h4 {
   margin: var(--space-2) 0 0;
   font-size: var(--text-base);
+  font-weight: 600;
 }
 
 .badge-workspace-constraints p {
@@ -591,10 +740,11 @@
   font-size: var(--text-sm);
 }
 
+/* Protection/exclusion entries: hairline rows, not stacked boxes */
+
 .badge-workspace-protection-list,
 .badge-workspace-exclusion-list {
   display: grid;
-  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -607,14 +757,12 @@
   gap: var(--space-2) var(--space-3);
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-2) var(--space-3);
-  border: var(--border-width) solid var(--color-line-soft);
-  border-radius: var(--radius-sm);
+  padding: var(--space-2) 0;
+  border-bottom: var(--border-width) solid var(--color-line-soft);
   font-size: var(--text-sm);
 }
 
 .badge-workspace-protection-inactive {
-  border-style: dashed;
   color: var(--color-ink-faint);
 }
 
@@ -624,11 +772,11 @@
   padding: var(--space-1) var(--space-3);
 }
 
-/* Policies */
+/* Policies: lifted cards on the section panel; status as a tinted border */
 
 .badge-workspace-policy-grid {
   display: grid;
-  gap: var(--space-4);
+  gap: var(--space-3);
   grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
 }
 
@@ -639,15 +787,23 @@
   padding: var(--space-4);
   border: var(--border-width) solid var(--color-line-soft);
   border-radius: var(--radius-md);
-  background: var(--color-surface);
+  background: var(--color-surface-strong);
 }
 
 .badge-workspace-policy-ready {
-  border-color: rgb(123 220 167 / 40%);
+  border-color: color-mix(
+    in oklab,
+    var(--color-public) 35%,
+    var(--color-line-soft)
+  );
 }
 
 .badge-workspace-policy-partial {
-  border-color: rgb(240 189 130 / 40%);
+  border-color: color-mix(
+    in oklab,
+    var(--color-private) 35%,
+    var(--color-line-soft)
+  );
 }
 
 .badge-workspace-policy-header {
@@ -660,6 +816,7 @@
 .badge-workspace-policy-header h4 {
   margin: 0;
   font-size: var(--text-base);
+  font-weight: 600;
 }
 
 .badge-workspace-policy-disclosure {
@@ -679,30 +836,17 @@
 
 .badge-workspace-policy-metrics {
   display: grid;
-  gap: var(--space-2);
-  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: var(--space-2) var(--space-3);
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
   margin: 0;
-}
-
-.badge-workspace-policy-metrics div {
-  display: grid;
-  gap: 0.1rem;
-}
-
-.badge-workspace-policy-metrics dt {
-  color: var(--color-ink-faint);
-  font-size: var(--text-xs);
-}
-
-.badge-workspace-policy-metrics dd {
-  margin: 0;
-  font-weight: 700;
+  padding-top: var(--space-3);
+  border-top: var(--border-width) solid var(--color-line-soft);
 }
 
 .badge-workspace-policy-target {
   margin: 0;
   font-size: var(--text-sm);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .badge-workspace-policy-shortfall {
@@ -712,11 +856,15 @@
 .badge-workspace-no-sale {
   margin: 0;
   padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid
+    color-mix(in oklab, var(--color-public) 30%, transparent);
   border-radius: var(--radius-sm);
   background: var(--color-public-soft);
   color: var(--color-public);
   font-size: var(--text-sm);
 }
+
+/* Plan steps: left rule instead of nested boxes */
 
 .badge-workspace-steps {
   display: grid;
@@ -726,20 +874,21 @@
 .badge-workspace-step {
   display: grid;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: var(--border-width) solid var(--color-line-soft);
-  border-radius: var(--radius-sm);
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  border-inline-start: 0.125rem solid var(--color-line);
 }
 
 .badge-workspace-step h5 {
   margin: 0;
   font-size: var(--text-sm);
+  font-weight: 600;
 }
 
 .badge-workspace-step-facts {
   margin: 0;
   color: var(--color-ink-soft);
   font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
 }
 
 .badge-workspace-purchases {
@@ -747,7 +896,12 @@
   gap: var(--space-1);
   margin: 0;
   padding: 0 0 0 var(--space-4);
+  color: var(--color-ink-soft);
   font-size: var(--text-xs);
+}
+
+.badge-workspace-purchases ::marker {
+  color: var(--color-ink-faint);
 }
 
 .badge-workspace-purchases li {
@@ -758,19 +912,20 @@
   justify-content: space-between;
 }
 
-/* Advanced sale-funded swaps */
+/* Advanced sale-funded swaps: a quiet dashed zone */
 
 .badge-workspace-advanced {
   display: grid;
   gap: var(--space-3);
   padding: var(--space-4);
-  border: var(--border-width) dashed var(--color-line);
+  border: var(--border-width) dashed var(--color-line-soft);
   border-radius: var(--radius-md);
 }
 
 .badge-workspace-advanced h3 {
   margin: 0;
   font-size: var(--text-base);
+  font-weight: 600;
 }
 
 .badge-workspace-advanced > p {
