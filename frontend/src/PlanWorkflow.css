@@ -1,0 +1,367 @@
+/* PlanWorkflow owns .plan-workflow-prefixed styles and consumes the shared
+   design tokens from index.css, mirroring BadgeWorkspace's rules: large
+   panels on --color-surface, hairline separation, status as tinted chips or
+   hairlines, uppercase tracking reserved for machine tags. */
+
+.plan-workflow {
+    display: grid;
+    gap: var(--space-5);
+}
+
+/* Heading */
+
+.plan-workflow-heading {
+    display: grid;
+    gap: var(--space-2);
+}
+
+.plan-workflow-heading h2 {
+    margin: 0;
+    font-size: var(--text-xl);
+    font-weight: 600;
+    letter-spacing: var(--tracking-tight);
+}
+
+.plan-workflow-scope {
+    max-width: var(--measure-copy);
+    margin: 0;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+/* Overview: chips plus a hairline reference table, one strong panel */
+
+.plan-workflow-overview {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    border: var(--border-width) solid var(--color-line-soft);
+    border-radius: var(--radius-lg);
+    background: var(--color-surface);
+}
+
+.plan-workflow-chip {
+    justify-self: start;
+    padding: 0.125rem var(--space-2);
+    border-radius: var(--radius-round);
+    color: var(--color-unavailable);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    background: var(--color-unavailable-soft);
+}
+
+.plan-workflow-chip-strategy {
+    color: var(--color-accent);
+    background: var(--color-accent-soft);
+}
+
+.plan-workflow-chip-ready {
+    color: var(--color-public);
+    background: var(--color-public-soft);
+}
+
+.plan-workflow-chip-partial {
+    color: var(--color-private);
+    background: var(--color-private-soft);
+}
+
+.plan-workflow-chip-no_opportunity {
+    color: var(--color-unavailable);
+    background: var(--color-unavailable-soft);
+}
+
+.plan-workflow-reference {
+    display: grid;
+    gap: var(--space-2) var(--space-5);
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    margin: 0;
+    padding-top: var(--space-3);
+    border-top: var(--border-width) solid var(--color-line-soft);
+}
+
+.plan-workflow-reference-item {
+    display: grid;
+    gap: var(--space-1);
+    align-content: start;
+}
+
+.plan-workflow-reference dt {
+    color: var(--color-ink-faint);
+    font-size: var(--text-xs);
+    font-weight: 600;
+}
+
+.plan-workflow-reference dd {
+    margin: 0;
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+}
+
+/* Stale banner and notices: hairline or tinted edge, never a large fill */
+
+.plan-workflow-expiry {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-3) var(--space-4);
+    border: var(--border-width) solid
+        color-mix(in oklab, var(--color-private) 35%, transparent);
+    border-radius: var(--radius-md);
+    background: var(--color-private-soft);
+}
+
+.plan-workflow-expiry p {
+    margin: 0;
+    color: var(--color-private);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+.plan-workflow-note {
+    max-width: var(--measure-copy);
+    margin: 0;
+    color: var(--color-ink-faint);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+.plan-workflow-warnings {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.plan-workflow-warnings li {
+    max-width: var(--measure-copy);
+    padding-inline-start: var(--space-3);
+    border-inline-start: 0.1875rem solid
+        color-mix(in oklab, var(--color-private) 55%, transparent);
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+/* Export toolbar */
+
+.plan-workflow-export {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    align-items: center;
+}
+
+.plan-workflow-remember {
+    display: flex;
+    flex-basis: 100%;
+    gap: var(--space-2);
+    align-items: center;
+    min-height: var(--control-min-height);
+    font-size: var(--text-sm);
+}
+
+.plan-workflow-session-note {
+    flex-basis: 100%;
+    margin: 0;
+    color: var(--color-ink-faint);
+    font-size: var(--text-sm);
+}
+
+.plan-workflow-secondary {
+    min-height: var(--control-min-height);
+    padding: var(--space-2) var(--space-4);
+    border: var(--border-width) solid var(--color-line);
+    border-radius: var(--radius-sm);
+    color: var(--color-ink);
+    background: transparent;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        border-color var(--transition-fast),
+        background-color var(--transition-fast);
+}
+
+.plan-workflow-secondary:hover:not(:disabled) {
+    border-color: var(--color-ink-faint);
+    background: color-mix(in oklab, var(--color-ink) 5%, transparent);
+}
+
+.plan-workflow-secondary:disabled {
+    cursor: not-allowed;
+    opacity: 55%;
+}
+
+.plan-workflow-clear {
+    min-height: 2rem;
+    padding: var(--space-1) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--color-ink-soft);
+    background: transparent;
+    font-size: var(--text-sm);
+    text-decoration: underline;
+    text-decoration-color: color-mix(
+        in oklab,
+        var(--color-accent) 55%,
+        transparent
+    );
+    cursor: pointer;
+}
+
+.plan-workflow-clear:disabled {
+    cursor: not-allowed;
+    opacity: 45%;
+    text-decoration: none;
+}
+
+.plan-workflow-export-count {
+    color: var(--color-ink-faint);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+}
+
+.plan-workflow-notice {
+    flex-basis: 100%;
+    margin: 0;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+}
+
+/* Checklist sections: fieldset legends as quiet labels, hairline rows */
+
+.plan-workflow-sections {
+    display: grid;
+    gap: var(--space-4);
+}
+
+.plan-workflow-section {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: var(--space-4) 0 0;
+    border: 0;
+    border-top: var(--border-width) solid var(--color-line-soft);
+}
+
+.plan-workflow-section legend {
+    padding: 0;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    font-weight: 600;
+}
+
+.plan-workflow-rows {
+    display: grid;
+    gap: var(--space-1);
+}
+
+.plan-workflow-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    align-items: baseline;
+    padding: var(--space-2) var(--space-3);
+    border-bottom: var(--border-width) solid var(--color-line-soft);
+    cursor: pointer;
+}
+
+.plan-workflow-row:hover {
+    background: color-mix(in oklab, var(--color-ink) 3%, transparent);
+}
+
+.plan-workflow-row-checkbox {
+    flex: 0 0 auto;
+    width: 1.25rem;
+    height: 1.25rem;
+    accent-color: var(--color-accent);
+}
+
+.plan-workflow-row-checkbox:disabled {
+    cursor: not-allowed;
+    opacity: 45%;
+}
+
+.plan-workflow-row-kind {
+    padding: 0.125rem var(--space-2);
+    border-radius: var(--radius-round);
+    color: var(--color-ink-faint);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    background: var(--color-unavailable-soft);
+}
+
+.plan-workflow-row-kind-craft {
+    color: var(--color-public);
+    background: var(--color-public-soft);
+}
+
+.plan-workflow-row-kind-purchase {
+    color: var(--color-private);
+    background: var(--color-private-soft);
+}
+
+.plan-workflow-row-kind-want {
+    color: var(--color-accent);
+    background: var(--color-accent-soft);
+}
+
+.plan-workflow-row-kind-surplus {
+    color: var(--color-unavailable);
+    background: var(--color-unavailable-soft);
+}
+
+.plan-workflow-row-text {
+    min-width: 0;
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+}
+
+.plan-workflow-empty {
+    max-width: var(--measure-copy);
+    margin: 0;
+    padding: var(--space-5);
+    border: var(--border-width) dashed var(--color-line-soft);
+    border-radius: var(--radius-md);
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+/* Small screens */
+
+@media (max-width: 48rem) {
+    .plan-workflow-overview {
+        padding: var(--space-4);
+    }
+
+    .plan-workflow-reference {
+        grid-template-columns: 1fr;
+    }
+
+    .plan-workflow-export {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .plan-workflow-export .plan-workflow-secondary {
+        width: 100%;
+    }
+
+    .plan-workflow-row {
+        padding: var(--space-2);
+    }
+}

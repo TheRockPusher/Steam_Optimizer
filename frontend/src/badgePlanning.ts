@@ -9,6 +9,7 @@ import {
   MAX_LEVEL,
   MAX_LEVEL_UP_CARD_ROWS,
   MAX_MINOR_AMOUNT,
+  MAX_NORMAL_BADGE_LEVEL_ROWS,
   MAX_NORMAL_GAME_ROWS,
   MAX_SET_SIZE,
   MAX_STEAM_ID_LENGTH,
@@ -17,8 +18,8 @@ import {
   minimumXpForLevel,
   normalCardAppId,
   type LevelUpCardOwnership,
-  type LevelUpGame,
   type LevelUpInventoryItem,
+  type LevelUpNormalBadgeLevel,
   type LevelUpOptimizationRequest
 } from "./levelUpOptimization";
 
@@ -29,13 +30,34 @@ export const MAX_BADGE_PLANNING_TARGET_LEVEL = 100_000;
 export const MAX_BADGE_PLANNING_BUDGET_MINOR = 1_000_000_000;
 export const BADGE_CRAFT_XP = 100;
 export const MAX_BADGE_CRAFT_LEVEL = 5;
+/** Lowest selectable per-game collector goal. */
+export const MIN_BADGE_COLLECTOR_TARGET_LEVEL = 1;
+/** Shared bound for selected candidates and collector targets. */
+export const MAX_BADGE_PLANNING_SCOPE_IDS = 1_000;
+/** Supported catalog sets/cards plus unsupported original inventory rows. */
+export const MAX_BADGE_PLANNING_CATALOG_GAME_ROWS = 50_000 + MAX_NORMAL_GAME_ROWS;
+export const MAX_BADGE_PLANNING_CATALOG_CARD_ROWS = 250_000 + MAX_LEVEL_UP_CARD_ROWS;
+/** Matches the backend options bound for exclusion lists. */
+const MAX_BADGE_PLANNING_EXCLUDED_IDS = 10_000;
+/**
+ * Backend MAX_APP_ID: normal badge snapshot AppIDs stay inside the signed
+ * 32-bit Steam AppID range.
+ */
+const MAX_BADGE_APP_ID = 2_147_483_647;
 /**
  * Only zero-budget discovery may use this parsing scale before the server
  * confirms currency. Nonzero budgets always require the confirmed scale.
  */
 export const ASSUMED_BUDGET_MINOR_DIGITS = 2;
 
-export type BadgePlanningMode = "target" | "budget";
+export type BadgePlanningMode = "target" | "budget" | "collector";
+
+export type BadgePlanningScope = "inventory" | "selected" | "catalog";
+
+export type BadgeCollectorTarget = {
+  app_id: string;
+  target_level: number;
+};
 
 export type BadgeProtection = {
   market_hash_name: string;
@@ -47,12 +69,18 @@ export type BadgePlanningOptions = {
   mode: BadgePlanningMode;
   target_level: number | null;
   budget_minor: number;
+  scope: BadgePlanningScope;
+  selected_app_ids: string[];
+  collector_targets: BadgeCollectorTarget[];
+  compare_app_id: string | null;
   excluded_app_ids: string[];
   protections: BadgeProtection[];
 };
 
 export type BadgePlanningRequest = LevelUpOptimizationRequest & {
   options: BadgePlanningOptions;
+  /** Complete validated session snapshot, sorted by ascending AppID. */
+  normal_badge_levels: LevelUpNormalBadgeLevel[];
 };
 
 export type BadgeGameStatus =
@@ -89,6 +117,8 @@ export type BadgeGame = {
   status: BadgeGameStatus;
   reason: string;
   cards: BadgeGameCard[];
+  /** Per-game collector goal; null outside collector mode. */
+  target_badge_level: number | null;
 };
 
 export type BadgePlanStrategy =
@@ -142,6 +172,40 @@ export type BadgePlanningMoney = {
   minor_digits: number;
 };
 
+export type BadgePlanningResponseScope =
+  | "inventory_normal_badges"
+  | "selected_normal_badges"
+  | "catalog_normal_badges";
+
+/** One marketable card sold from the compared complete set. */
+export type BadgeSale = {
+  market_hash_name: string;
+  card_name: string;
+  quantity: number;
+  buyer_total_minor: number;
+  seller_receipt_minor: number;
+  quote_timestamp: string;
+};
+
+/**
+ * On-demand complete-set comparison. A ready opportunity prices selling one
+ * complete owned unreserved set of `app_id` and re-planning replacements from
+ * the hypothetical receipts only; an unavailable one carries no quotes,
+ * proceeds or plans and names the blocking reason.
+ */
+export type BadgeOpportunity = {
+  app_id: string;
+  status: "ready" | "unavailable";
+  reason: string;
+  net_proceeds_minor: number | null;
+  craft_xp: number;
+  sales: BadgeSale[];
+  replacement_plan: BadgePlan | null;
+  baseline_plan: BadgePlan | null;
+  additional_xp: number | null;
+  valid_until: string | null;
+};
+
 export type BadgePlanningReadyResponse = {
   status: "ready";
   reason: string;
@@ -153,9 +217,12 @@ export type BadgePlanningReadyResponse = {
   badge_refreshed_at: string;
   player_xp: number;
   player_level: number;
-  scope: "inventory_normal_badges";
+  scope: BadgePlanningResponseScope;
+  /** Explicit candidate count; equals `games.length`. */
+  evaluated_game_count: number;
   games: BadgeGame[];
   plans: BadgePlan[];
+  opportunity: BadgeOpportunity | null;
 };
 
 export type BadgePlanningUnavailableResponse = {
@@ -169,9 +236,11 @@ export type BadgePlanningUnavailableResponse = {
   badge_refreshed_at: string;
   player_xp: number;
   player_level: number;
-  scope: "inventory_normal_badges";
+  scope: BadgePlanningResponseScope;
+  evaluated_game_count: number;
   games: BadgeGame[];
   plans: [];
+  opportunity: null;
 };
 
 export type BadgePlanningResponse =
@@ -183,6 +252,7 @@ const BUDGET_INPUT_PATTERN = /^[0-9]+(?:\.[0-9]+)?$/;
 const TARGET_LEVEL_INPUT_PATTERN = /^[0-9]{1,7}$/;
 const CURRENCY_CODE_PATTERN = /^[A-Z]{3}$/;
 const MAX_INPUT_TEXT_LENGTH = 32;
+const MAX_MARKET_HASH_NAME_LENGTH = 512;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -216,7 +286,6 @@ function isSafeInteger(
   );
 }
 
-
 function isPositiveDecimalId(value: unknown, maxLength: number): value is string {
   return (
     typeof value === "string" &&
@@ -244,11 +313,21 @@ function timestampMilliseconds(value: string): number {
   return Date.parse(value);
 }
 
-
+function isBadgeCollectorTarget(value: unknown): value is BadgeCollectorTarget {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["app_id", "target_level"]) &&
+    isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) &&
+    isSafeInteger(
+      value.target_level,
+      MIN_BADGE_COLLECTOR_TARGET_LEVEL,
+      MAX_BADGE_CRAFT_LEVEL
+    )
+  );
+}
 
 export function isBadgePlanningOptions(
   value: unknown,
-  games: readonly LevelUpGame[],
   cards: readonly LevelUpCardOwnership[]
 ): value is BadgePlanningOptions {
   if (
@@ -257,13 +336,21 @@ export function isBadgePlanningOptions(
       "mode",
       "target_level",
       "budget_minor",
+      "scope",
+      "selected_app_ids",
+      "collector_targets",
+      "compare_app_id",
       "excluded_app_ids",
       "protections"
     ])
   ) {
     return false;
   }
-  if (value.mode !== "target" && value.mode !== "budget") {
+  if (
+    value.mode !== "target" &&
+    value.mode !== "budget" &&
+    value.mode !== "collector"
+  ) {
     return false;
   }
   if (value.mode === "target") {
@@ -276,17 +363,71 @@ export function isBadgePlanningOptions(
   if (!isSafeInteger(value.budget_minor, 0, MAX_BADGE_PLANNING_BUDGET_MINOR)) {
     return false;
   }
-  if (!Array.isArray(value.excluded_app_ids) || value.excluded_app_ids.length > games.length) {
+  if (
+    value.scope !== "inventory" &&
+    value.scope !== "selected" &&
+    value.scope !== "catalog"
+  ) {
     return false;
   }
-  const gameIds = new Set(games.map((game) => game.app_id));
-  const excludedSeen = new Set<string>();
-  for (const appId of value.excluded_app_ids) {
+  if (
+    !Array.isArray(value.selected_app_ids) ||
+    value.selected_app_ids.length > MAX_BADGE_PLANNING_SCOPE_IDS
+  ) {
+    return false;
+  }
+  if (
+    value.scope === "selected"
+      ? value.selected_app_ids.length === 0
+      : value.selected_app_ids.length !== 0
+  ) {
+    return false;
+  }
+  const selectedSeen = new Set<string>();
+  for (const appId of value.selected_app_ids) {
     if (
       !isPositiveDecimalId(appId, MAX_APP_ID_LENGTH) ||
-      !gameIds.has(appId) ||
-      excludedSeen.has(appId)
+      selectedSeen.has(appId)
     ) {
+      return false;
+    }
+    selectedSeen.add(appId);
+  }
+  if (
+    !Array.isArray(value.collector_targets) ||
+    value.collector_targets.length > MAX_BADGE_PLANNING_SCOPE_IDS
+  ) {
+    return false;
+  }
+  if (
+    value.mode === "collector"
+      ? value.collector_targets.length === 0
+      : value.collector_targets.length !== 0
+  ) {
+    return false;
+  }
+  const targetSeen = new Set<string>();
+  for (const target of value.collector_targets) {
+    if (!isBadgeCollectorTarget(target) || targetSeen.has(target.app_id)) {
+      return false;
+    }
+    targetSeen.add(target.app_id);
+  }
+  if (
+    value.compare_app_id !== null &&
+    !isPositiveDecimalId(value.compare_app_id, MAX_APP_ID_LENGTH)
+  ) {
+    return false;
+  }
+  if (
+    !Array.isArray(value.excluded_app_ids) ||
+    value.excluded_app_ids.length > MAX_BADGE_PLANNING_EXCLUDED_IDS
+  ) {
+    return false;
+  }
+  const excludedSeen = new Set<string>();
+  for (const appId of value.excluded_app_ids) {
+    if (!isPositiveDecimalId(appId, MAX_APP_ID_LENGTH) || excludedSeen.has(appId)) {
       return false;
     }
     excludedSeen.add(appId);
@@ -319,21 +460,70 @@ export function isBadgePlanningOptions(
   return true;
 }
 
+type BadgeSnapshotData = {
+  levels: Map<string, number>;
+  rows: LevelUpNormalBadgeLevel[];
+};
+
 /**
- * Attaches validated planning options to an ownership snapshot. `base` must
- * come from `buildLevelUpOptimizationRequest`, which already validated the
- * game and card rows; re-scanning them here would repeat that work on every
- * options change. Only the options (small, user-controlled) are validated,
- * with each membership map built once.
+ * Validates the complete session snapshot rows and returns the level map
+ * keyed by canonical AppID text plus rebuilt rows ready for canonical
+ * (ascending numeric AppID) ordering.
+ */
+function badgeSnapshotData(value: unknown): BadgeSnapshotData | null {
+  if (!Array.isArray(value) || value.length > MAX_NORMAL_BADGE_LEVEL_ROWS) {
+    return null;
+  }
+  const levels = new Map<string, number>();
+  const rows: LevelUpNormalBadgeLevel[] = [];
+  for (const row of value) {
+    if (
+      !isRecord(row) ||
+      !hasExactKeys(row, ["app_id", "level"]) ||
+      !isSafeInteger(row.app_id, 1, MAX_BADGE_APP_ID) ||
+      !isSafeInteger(row.level, 0, MAX_BADGE_CRAFT_LEVEL) ||
+      levels.has(String(row.app_id))
+    ) {
+      return null;
+    }
+    levels.set(String(row.app_id), row.level);
+    rows.push({ app_id: row.app_id, level: row.level });
+  }
+  return { levels, rows };
+}
+
+/**
+ * Attaches validated planning options and the complete normal badge session
+ * snapshot to an ownership request. `base` must come from
+ * `buildLevelUpOptimizationRequest`, which already validated the game and
+ * card rows; only the small user-controlled options and snapshot are
+ * validated here. Every inventory game's badge level must agree with the
+ * snapshot (a missing snapshot entry denotes an uncrafted badge, level 0).
+ * The returned snapshot is a sorted, unique copy.
  */
 export function buildBadgePlanningRequest(
   base: LevelUpOptimizationRequest,
-  options: BadgePlanningOptions
+  options: BadgePlanningOptions,
+  normalBadgeLevels: readonly LevelUpNormalBadgeLevel[]
 ): BadgePlanningRequest {
-  if (!isBadgePlanningOptions(options, base.games, base.cards)) {
+  if (!isBadgePlanningOptions(options, base.cards)) {
     throw new Error("The badge planning options are invalid.");
   }
-  return { ...base, options };
+  const snapshot = badgeSnapshotData(normalBadgeLevels);
+  if (snapshot === null) {
+    throw new Error("The normal badge snapshot is invalid.");
+  }
+  for (const game of base.games) {
+    if (game.badge_level !== (snapshot.levels.get(game.app_id) ?? 0)) {
+      throw new Error(
+        "The inventory badge levels disagree with the session snapshot."
+      );
+    }
+  }
+  const normal_badge_levels = snapshot.rows.sort(
+    (left, right) => left.app_id - right.app_id
+  );
+  return { ...base, options, normal_badge_levels };
 }
 
 export function isBadgePlanningRequest(
@@ -348,16 +538,33 @@ export function isBadgePlanningRequest(
       "player_level",
       "games",
       "cards",
-      "options"
+      "options",
+      "normal_badge_levels"
     ])
   ) {
     return false;
   }
-  const { options, ...base } = value;
+  const { options, normal_badge_levels, ...base } = value;
   if (!isLevelUpOptimizationRequest(base)) {
     return false;
   }
-  return isBadgePlanningOptions(options, base.games, base.cards);
+  if (!isBadgePlanningOptions(options, base.cards)) {
+    return false;
+  }
+  const snapshot = badgeSnapshotData(normal_badge_levels);
+  if (snapshot === null) {
+    return false;
+  }
+  let previousAppId = -1;
+  for (const row of snapshot.rows) {
+    if (row.app_id <= previousAppId) {
+      return false;
+    }
+    previousAppId = row.app_id;
+  }
+  return base.games.every(
+    (game) => game.badge_level === (snapshot.levels.get(game.app_id) ?? 0)
+  );
 }
 
 function validateBadgeGameCard(
@@ -399,8 +606,6 @@ function validateBadgeGameCard(
   );
 }
 
-const MAX_MARKET_HASH_NAME_LENGTH = 512;
-
 function validateBadgeGame(
   value: unknown,
   generatedAtMs: number,
@@ -421,13 +626,20 @@ function validateBadgeGame(
       "completion_cost_minor",
       "status",
       "reason",
-      "cards"
+      "cards",
+      "target_badge_level"
     ]) ||
     !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
     !isGameName(value.game_name) ||
     !isSafeInteger(value.badge_level, 0, MAX_BADGE_CRAFT_LEVEL) ||
     (value.set_size !== null &&
       !isSafeInteger(value.set_size, MIN_SET_SIZE, MAX_SET_SIZE)) ||
+    (value.target_badge_level !== null &&
+      !isSafeInteger(
+        value.target_badge_level,
+        MIN_BADGE_COLLECTOR_TARGET_LEVEL,
+        MAX_BADGE_CRAFT_LEVEL
+      )) ||
     !isSafeInteger(value.owned_unique, 0, MAX_LEVEL_UP_CARD_ROWS) ||
     !isSafeInteger(value.owned_cards, 0, MAX_CARD_QUANTITY * MAX_LEVEL_UP_CARD_ROWS) ||
     value.owned_cards < value.owned_unique ||
@@ -511,6 +723,7 @@ function validateBadgePlanPurchase(
 
 type ResponseGameIndex = Map<string, BadgeGame>;
 
+/** Every craft uses available owned copies before purchasing replacements. */
 function validateBadgePlanStep(
   value: unknown,
   generatedAtMs: number,
@@ -550,7 +763,7 @@ function validateBadgePlanStep(
     value.xp_gain !== value.craft_count * BADGE_CRAFT_XP ||
     !isSafeInteger(value.owned_cards_used, 0, MAX_CARD_QUANTITY) ||
     !Array.isArray(value.purchases) ||
-    value.purchases.length > MAX_LEVEL_UP_CARD_ROWS
+    value.purchases.length > game.cards.length
   ) {
     return false;
   }
@@ -568,15 +781,29 @@ function validateBadgePlanStep(
   }
   let ownedUsed = 0;
   for (const card of game.cards) {
-    const owned = Math.min(card.available_quantity, value.craft_count);
-    ownedUsed += owned;
-    const needed = value.craft_count - owned;
+    const usable = Math.min(card.available_quantity, value.craft_count);
     const purchase = purchases.get(card.market_hash_name);
-    if (needed === 0) {
-      if (purchase !== undefined) return false;
-    } else if (purchase === undefined || purchase.quantity !== needed ||
+    const ownedForCard = purchase === undefined
+      ? value.craft_count
+      : value.craft_count - purchase.quantity;
+    if (purchase === undefined) {
+      if (usable < value.craft_count) {
+        return false;
+      }
+    } else if (
+      purchase.quantity > value.craft_count ||
+      ownedForCard > usable ||
+      purchase.quantity > (card.buy_quantity ?? 0) ||
+      card.buy_price_minor === null ||
       purchase.unit_price_minor !== card.buy_price_minor ||
-      needed > (card.buy_quantity ?? 0) || purchase.quote_timestamp !== card.quote_timestamp) return false;
+      purchase.quote_timestamp !== card.quote_timestamp
+    ) {
+      return false;
+    }
+    if (ownedForCard !== usable) {
+      return false;
+    }
+    ownedUsed += ownedForCard;
     purchases.delete(card.market_hash_name);
   }
   if (purchases.size !== 0 || ownedUsed !== value.owned_cards_used ||
@@ -585,14 +812,14 @@ function validateBadgePlanStep(
     return false;
   }
   if (
-    game.set_size !== null &&
-    purchaseQuantity + value.owned_cards_used !==
+    purchaseQuantity + ownedUsed !==
     value.craft_count * game.set_size
   ) {
     return false;
   }
   return true;
 }
+
 
 function validateBadgePlan(
   value: unknown,
@@ -633,10 +860,11 @@ function validateBadgePlan(
         MAX_BADGE_PLANNING_TARGET_LEVEL
       )) ||
     typeof value.target_reached !== "boolean" ||
+    !isSafeInteger(value.shortfall_xp, 0, MAX_XP) ||
     !isSafeInteger(value.spend_minor, 0, MAX_MINOR_AMOUNT) ||
     !isSafeInteger(value.remaining_budget_minor, 0, MAX_MINOR_AMOUNT) ||
     !Array.isArray(value.steps) ||
-    value.steps.length > MAX_NORMAL_GAME_ROWS
+    value.steps.length > gameIndex.size
   ) {
     return false;
   }
@@ -647,7 +875,13 @@ function validateBadgePlan(
   let ownedCardsUsed = 0;
   const stepApps = new Set<string>();
   for (const step of value.steps) {
-    if (!validateBadgePlanStep(step, generatedAtMs, gameIndex) || stepApps.has(step.app_id)) {
+    if (
+      !validateBadgePlanStep(
+        step,
+        generatedAtMs,
+        gameIndex
+      ) || stepApps.has(step.app_id)
+    ) {
       return false;
     }
     stepApps.add(step.app_id);
@@ -685,11 +919,7 @@ function validateBadgePlan(
   ) {
     return false;
   }
-  if (value.target_level === null) {
-    if (value.shortfall_xp !== 0) {
-      return false;
-    }
-  } else {
+  if (value.target_level !== null) {
     const targetMinimumXp = minimumXpForLevel(value.target_level);
     const expectedShortfall = Math.max(
       0,
@@ -703,6 +933,165 @@ function validateBadgePlan(
     }
   }
   return true;
+}
+
+function validateBadgeSale(
+  value: unknown,
+  generatedAtMs: number
+): value is BadgeSale {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "market_hash_name",
+      "card_name",
+      "quantity",
+      "buyer_total_minor",
+      "seller_receipt_minor",
+      "quote_timestamp"
+    ]) &&
+    isNormalCardMarketHashName(value.market_hash_name) &&
+    isNonEmptyText(value.card_name, MAX_MARKET_HASH_NAME_LENGTH) &&
+    isSafeInteger(value.quantity, 1, 1) &&
+    isSafeInteger(value.buyer_total_minor, 1, MAX_MINOR_AMOUNT) &&
+    isSafeInteger(value.seller_receipt_minor, 1, MAX_MINOR_AMOUNT) &&
+    value.seller_receipt_minor <= value.buyer_total_minor &&
+    isLevelUpIsoTimestamp(value.quote_timestamp) &&
+    timestampMilliseconds(value.quote_timestamp) <= generatedAtMs
+  );
+}
+
+function validateBadgeOpportunity(
+  value: unknown,
+  generatedAtMs: number,
+  responseValidUntilMs: number,
+  hasMoney: boolean,
+  playerXp: number,
+  gameIndex: ResponseGameIndex
+): value is BadgeOpportunity {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "app_id",
+      "status",
+      "reason",
+      "net_proceeds_minor",
+      "craft_xp",
+      "sales",
+      "replacement_plan",
+      "baseline_plan",
+      "additional_xp",
+      "valid_until"
+    ]) ||
+    !isPositiveDecimalId(value.app_id, MAX_APP_ID_LENGTH) ||
+    (value.status !== "ready" && value.status !== "unavailable") ||
+    !isNonEmptyText(value.reason, MAX_GAME_NAME_LENGTH) ||
+    value.craft_xp !== BADGE_CRAFT_XP ||
+    !Array.isArray(value.sales)
+  ) {
+    return false;
+  }
+  const source = gameIndex.get(value.app_id);
+  if (value.status === "unavailable") {
+    // An unavailable comparison carries no quotes, proceeds or plans.
+    return (
+      value.net_proceeds_minor === null &&
+      value.sales.length === 0 &&
+      value.replacement_plan === null &&
+      value.baseline_plan === null &&
+      value.additional_xp === null &&
+      value.valid_until === null
+    );
+  }
+  const replacementPlan = value.replacement_plan;
+  const baselinePlan = value.baseline_plan;
+  const additionalXp = value.additional_xp;
+  const validUntilText = value.valid_until;
+  if (
+    source === undefined ||
+    !hasMoney ||
+    source.craftable_count < 1 ||
+    source.badge_level >= MAX_BADGE_CRAFT_LEVEL ||
+    source.set_size === null ||
+    source.cards.length !== source.set_size ||
+    !isSafeInteger(value.net_proceeds_minor, 1, MAX_MINOR_AMOUNT) ||
+    value.sales.length !== source.cards.length ||
+    replacementPlan === null ||
+    baselinePlan === null ||
+    !Number.isSafeInteger(additionalXp) ||
+    !isLevelUpIsoTimestamp(validUntilText)
+  ) {
+    return false;
+  }
+  const validUntilMs = timestampMilliseconds(validUntilText);
+  if (validUntilMs < generatedAtMs || validUntilMs > responseValidUntilMs) {
+    return false;
+  }
+  const soldHashes = new Set<string>();
+  let proceeds = 0;
+  for (const sale of value.sales) {
+    if (
+      !validateBadgeSale(sale, generatedAtMs) ||
+      soldHashes.has(sale.market_hash_name)
+    ) {
+      return false;
+    }
+    const card = source.cards.find(
+      (row) => row.market_hash_name === sale.market_hash_name
+    );
+    if (
+      card === undefined ||
+      sale.quantity !== 1 ||
+      card.never_sell ||
+      card.owned_quantity < 1 ||
+      card.available_quantity < 1
+    ) {
+      return false;
+    }
+    soldHashes.add(sale.market_hash_name);
+    proceeds += sale.seller_receipt_minor;
+  }
+  if (value.net_proceeds_minor !== proceeds || !Number.isSafeInteger(proceeds)) {
+    return false;
+  }
+  // Only source-game holdings change; that game is excluded from replacements.
+  // Every other game's owned quantities must still match the original snapshot.
+  if (
+    !validateBadgePlan(
+      replacementPlan,
+      generatedAtMs,
+      playerXp,
+      gameIndex
+    ) ||
+    !validateBadgePlan(
+      baselinePlan,
+      generatedAtMs,
+      playerXp,
+      gameIndex
+    )
+  ) {
+    return false;
+  }
+  // The replacement must neither craft nor purchase the source game.
+  if (
+    replacementPlan.strategy !== "cheapest" ||
+    baselinePlan.strategy !== "cheapest" ||
+    replacementPlan.target_level !== null ||
+    baselinePlan.target_level !== null ||
+    replacementPlan.shortfall_xp !== 0 ||
+    baselinePlan.shortfall_xp !== 0 ||
+    baselinePlan.spend_minor !== 0 ||
+    baselinePlan.remaining_budget_minor !== 0 ||
+    replacementPlan.spend_minor + replacementPlan.remaining_budget_minor !== proceeds ||
+    replacementPlan.steps.some((step) => step.app_id === value.app_id) ||
+    replacementPlan.steps.some((step) =>
+      step.purchases.some(
+        (purchase) => normalCardAppId(purchase.market_hash_name) === value.app_id
+      )
+    )
+  ) {
+    return false;
+  }
+  return additionalXp === replacementPlan.xp_gain - baselinePlan.xp_gain;
 }
 
 export function isBadgePlanningResponse(
@@ -722,8 +1111,10 @@ export function isBadgePlanningResponse(
       "player_xp",
       "player_level",
       "scope",
+      "evaluated_game_count",
       "games",
-      "plans"
+      "plans",
+      "opportunity"
     ])
   ) {
     return false;
@@ -758,32 +1149,74 @@ export function isBadgePlanningResponse(
     !isLevelUpIsoTimestamp(value.badge_refreshed_at) ||
     !isSafeInteger(value.player_xp, 0, MAX_XP) ||
     !isSafeInteger(value.player_level, 0, MAX_LEVEL - 1) ||
-    levelForXp(value.player_xp) !== value.player_level ||
-    value.scope !== "inventory_normal_badges" ||
+    levelForXp(value.player_xp) !== value.player_level
+  ) {
+    return false;
+  }
+  if (
+    value.scope !== "inventory_normal_badges" &&
+    value.scope !== "selected_normal_badges" &&
+    value.scope !== "catalog_normal_badges"
+  ) {
+    return false;
+  }
+  const catalogScope = value.scope === "catalog_normal_badges";
+  const selectedScope = value.scope === "selected_normal_badges";
+  const maxGameRows = catalogScope
+    ? MAX_BADGE_PLANNING_CATALOG_GAME_ROWS
+    : selectedScope
+      ? MAX_NORMAL_GAME_ROWS + MAX_BADGE_PLANNING_SCOPE_IDS
+      : MAX_NORMAL_GAME_ROWS;
+  const maxCardRows = catalogScope
+    ? MAX_BADGE_PLANNING_CATALOG_CARD_ROWS
+    : MAX_LEVEL_UP_CARD_ROWS + MAX_BADGE_PLANNING_SCOPE_IDS * MAX_SET_SIZE;
+  if (
+    !isSafeInteger(value.evaluated_game_count, 0, maxGameRows) ||
     !Array.isArray(value.games) ||
-    value.games.length > MAX_NORMAL_GAME_ROWS ||
+    value.games.length > maxGameRows ||
+    value.evaluated_game_count !== value.games.length ||
     !Array.isArray(value.plans) ||
     value.plans.length > 3
   ) {
     return false;
   }
   const gameIndex: ResponseGameIndex = new Map();
+  let cardRows = 0;
   for (const game of value.games) {
-    if (!validateBadgeGame(game, generatedAtMs, hasMoney)) {
-      return false;
-    }
-    if (gameIndex.has(game.app_id)) {
+    if (!validateBadgeGame(game, generatedAtMs, hasMoney) || gameIndex.has(game.app_id)) {
       return false;
     }
     gameIndex.set(game.app_id, game);
+    cardRows += game.cards.length;
+    if (cardRows > maxCardRows) {
+      return false;
+    }
   }
   if (value.status === "unavailable") {
-    return value.plans.length === 0 && value.valid_until === null;
+    return (
+      value.plans.length === 0 &&
+      value.valid_until === null &&
+      value.opportunity === null
+    );
   }
   if (
     !isLevelUpIsoTimestamp(value.valid_until) ||
     timestampMilliseconds(value.valid_until) < generatedAtMs ||
     value.plans.length !== 3
+  ) {
+    return false;
+  }
+  const opportunity = value.opportunity;
+  if (
+    opportunity !== null &&
+    !validateBadgeOpportunity(
+      opportunity,
+      generatedAtMs,
+      timestampMilliseconds(value.valid_until),
+      hasMoney,
+      value.player_xp,
+      gameIndex
+    )
   ) {
     return false;
   }
@@ -822,47 +1255,170 @@ export function responseMatchesRequest(
   ) {
     return false;
   }
-  if (response.games.length !== request.games.length) {
+  const expectedScope = request.options.scope === "inventory"
+    ? "inventory_normal_badges"
+    : request.options.scope === "selected"
+      ? "selected_normal_badges"
+      : "catalog_normal_badges";
+  if (
+    response.scope !== expectedScope ||
+    response.evaluated_game_count !== response.games.length
+  ) {
     return false;
   }
-  const requestGames = new Map(
-    request.games.map((game) => [game.app_id, game])
+  const snapshotLevels = new Map(
+    request.normal_badge_levels.map(
+      (row) => [String(row.app_id), row.level] as const
+    )
   );
+  const collectorTargets = request.options.mode === "collector"
+    ? new Map(
+      request.options.collector_targets.map(
+        (target) => [target.app_id, target.target_level] as const
+      )
+    )
+    : new Map<string, number>();
+  const selectedIds = new Set(request.options.selected_app_ids);
+  const requestGames = new Map(
+    request.games.map((game) => [game.app_id, game] as const)
+  );
+  const ownership = new Map(
+    request.cards.map((card) => [card.market_hash_name, card] as const)
+  );
+  const protections = new Map(
+    request.options.protections.map((row) => [row.market_hash_name, row] as const)
+  );
+  const exclusions = new Set(request.options.excluded_app_ids);
+  const catalogScope = request.options.scope === "catalog";
+  const matchedRequestGames = new Set<string>();
   for (const game of response.games) {
-    const requestGame = requestGames.get(game.app_id);
+    // Every returned row must reflect the complete session snapshot and the
+    // request's collector goals exactly.
     if (
-      requestGame === undefined ||
-      game.game_name !== requestGame.game_name ||
-      game.badge_level !== requestGame.badge_level ||
-      (requestGame.card_set_size !== null &&
-        game.set_size !== requestGame.card_set_size)
+      game.badge_level !== (snapshotLevels.get(game.app_id) ?? 0) ||
+      game.target_badge_level !== (collectorTargets.get(game.app_id) ?? null)
     ) {
       return false;
     }
-  }
-  const ownership = new Map(request.cards.map((card) => [card.market_hash_name, card]));
-  const protections = new Map(request.options.protections.map((row) => [row.market_hash_name, row]));
-  const exclusions = new Set(request.options.excluded_app_ids);
-  for (const game of response.games) {
+    const requestGame = requestGames.get(game.app_id);
+    if (requestGame !== undefined) matchedRequestGames.add(game.app_id);
+    if (requestGame !== undefined && !catalogScope) {
+      // Inventory and selected rows mirror the request's inventory metadata;
+      // catalog rows are authoritative for names and set sizes.
+      if (
+        game.game_name !== requestGame.game_name ||
+        (requestGame.card_set_size !== null &&
+          game.set_size !== requestGame.card_set_size)
+      ) {
+        return false;
+      }
+    } else if (!catalogScope && !selectedIds.has(game.app_id)) {
+      // Inventory scope returns exactly the inventory rows; selected scope
+      // may add discovered zero-owned rows only for selected candidates.
+      return false;
+    }
     for (const card of game.cards) {
       const owned = ownership.get(card.market_hash_name)?.owned_quantity ?? 0;
       const protection = protections.get(card.market_hash_name);
-      if (card.owned_quantity !== owned || card.keep_quantity !== (protection?.keep_quantity ?? 0) ||
-        card.never_sell !== (protection?.never_sell ?? false)) return false;
+      if (
+        card.owned_quantity !== owned ||
+        card.keep_quantity !== (protection?.keep_quantity ?? 0) ||
+        card.never_sell !== (protection?.never_sell ?? false)
+      ) {
+        return false;
+      }
       ownership.delete(card.market_hash_name);
     }
   }
-  if (ownership.size !== 0) return false;
-  const expectedTargetLevel = request.options.mode === "target" ? request.options.target_level : null;
+  // Discovery must retain inventory rows, even when their composition is unknown.
+  if (matchedRequestGames.size !== request.games.length) {
+    return false;
+  }
+  if (ownership.size !== 0) {
+    return false;
+  }
+  const expectedTargetLevel =
+    request.options.mode === "target" ? request.options.target_level : null;
   const requiredCrafts = expectedTargetLevel === null ? Infinity :
     Math.max(0, Math.ceil((minimumXpForLevel(expectedTargetLevel) - request.player_xp) / BADGE_CRAFT_XP));
-  return response.plans.every((plan) =>
-    plan.target_level === expectedTargetLevel &&
-    plan.craft_count <= requiredCrafts &&
-    plan.spend_minor <= request.options.budget_minor &&
-    plan.remaining_budget_minor === request.options.budget_minor - plan.spend_minor &&
-    plan.steps.every((step) => !exclusions.has(step.app_id))
-  );
+  for (const plan of response.plans) {
+    if (
+      plan.target_level !== expectedTargetLevel ||
+      plan.craft_count > requiredCrafts ||
+      plan.spend_minor > request.options.budget_minor ||
+      plan.remaining_budget_minor !==
+      request.options.budget_minor - plan.spend_minor ||
+      plan.steps.some((step) => exclusions.has(step.app_id)) ||
+      (request.options.scope === "selected" &&
+        plan.steps.some((step) => !selectedIds.has(step.app_id)))
+    ) {
+      return false;
+    }
+    if (request.options.mode === "budget" && plan.shortfall_xp !== 0) {
+      return false;
+    }
+    if (request.options.mode === "collector") {
+      // Collector plans may only craft targeted games.
+      if (plan.steps.some((step) => !collectorTargets.has(step.app_id))) {
+        return false;
+      }
+      let shortfallXp = 0;
+      let allTargetsReached = true;
+      for (const target of request.options.collector_targets) {
+        const plannedCrafts =
+          plan.steps.find((step) => step.app_id === target.app_id)?.craft_count ?? 0;
+        const plannedLevel = (snapshotLevels.get(target.app_id) ?? 0) + plannedCrafts;
+        const missingCrafts = Math.max(0, target.target_level - plannedLevel);
+        shortfallXp += missingCrafts * BADGE_CRAFT_XP;
+        allTargetsReached = allTargetsReached && missingCrafts === 0;
+      }
+      if (
+        plan.shortfall_xp !== shortfallXp ||
+        plan.target_reached !== allTargetsReached
+      ) {
+        return false;
+      }
+    }
+  }
+  if (request.options.compare_app_id === null) {
+    return response.opportunity === null;
+  }
+  if (response.status !== "ready") {
+    // The whole response is explicitly unavailable; the on-demand compare
+    // was never evaluated, so the absent opportunity is consistent.
+    return true;
+  }
+  const opportunity = response.opportunity;
+  if (
+    opportunity === null ||
+    opportunity.app_id !== request.options.compare_app_id
+  ) {
+    return false;
+  }
+  if (opportunity.status !== "ready") {
+    return true;
+  }
+  if (
+    exclusions.has(opportunity.app_id) ||
+    opportunity.valid_until === null ||
+    timestampMilliseconds(opportunity.valid_until) >
+    timestampMilliseconds(response.valid_until)
+  ) {
+    return false;
+  }
+  const sellable = new Map(request.cards.map((card) => [card.market_hash_name, card.sellable_quantity]));
+  if (opportunity.sales.some((sale) => (sellable.get(sale.market_hash_name) ?? 0) < sale.quantity)) {
+    return false;
+  }
+  for (const plan of [opportunity.replacement_plan, opportunity.baseline_plan]) {
+    if (plan !== null && plan.steps.some((step) =>
+      exclusions.has(step.app_id) ||
+      (request.options.scope === "selected" && !selectedIds.has(step.app_id))
+    )) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export type BadgePlanningExpectedMoney = {

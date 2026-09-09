@@ -3,7 +3,9 @@
 Each test defends one genuinely risky boundary: repeated crafts under ask
 depth, protected copies, the badge level cap and exclusions, cost-optimality
 of the ``cheapest`` policy against brute force, zero-spend owned sets when
-quotes are unusable, and stale data that must never become actionable.
+quotes are unusable, stale data that must never become actionable, collector
+target ceilings and complete-target status, scope eligibility (selected and
+catalog), and fail-closed references.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from itertools import product
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
 
 from app.badge_planner import (
     BadgePlanningOptions,
@@ -59,6 +62,8 @@ def make_card(
     *,
     sell: str | None = "0.10",
     sell_quantity: int | None = 5,
+    buy: str | None = None,
+    buy_quantity: int | None = None,
     observed_at: datetime = NOW,
 ) -> CatalogCard:
     name = f"Card {number}"
@@ -68,6 +73,8 @@ def make_card(
         card_name=name,
         lowest_sell=sell,
         lowest_sell_quantity=sell_quantity,
+        highest_buy=buy,
+        highest_buy_quantity=buy_quantity,
         observed_at=observed_at,
     )
 
@@ -634,3 +641,450 @@ def test_budget_blocked_route_with_usable_quotes_stays_factual() -> None:
         plan.status == "no_opportunity" and plan.reason == "no_crafts_available"
         for plan in budget.plans
     )
+
+
+def test_collector_targets_cap_crafts_and_skip_untargeted_games() -> None:
+    capped_set, capped_holdings = standard_game(
+        500, "Capped Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    free_set, free_holdings = standard_game(
+        200, "Free Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(
+        generation=1, generated_at=NOW, sets=(capped_set, free_set)
+    )
+    holdings = capped_holdings + free_holdings
+    badges = make_badges(levels={500: 0, 200: 0})
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[{"app_id": "500", "target_level": 3}],
+    )
+
+    response = run_planner(
+        catalog, holdings, {}, options, badges=badges, contract=fee_contract()
+    )
+
+    assert (response.status, response.scope) == ("ready", "inventory_normal_badges")
+    assert response.evaluated_game_count == 2
+    by_id = {game.app_id: game for game in response.games}
+    assert by_id["500"].target_badge_level == 3
+    assert by_id["200"].target_badge_level is None
+    for plan in response.plans:
+        # Collector ceilings replace the player-level target on every plan.
+        assert plan.target_level is None
+        assert plan.status == "ready"
+        assert plan.reason == "target_reached"
+        assert plan.target_reached is True
+        assert plan.shortfall_xp == 0
+        assert plan.craft_count == 3
+        # Untargeted games stay dashboard rows but never enter collector plans.
+        assert [step.app_id for step in plan.steps] == ["500"]
+        assert [step.badge_level_after for step in plan.steps] == [3]
+    cheapest = response.plans[0]
+    # Craft 1 is free (owned copies); crafts 2 and 3 buy one copy per card.
+    assert cheapest.spend_minor == 100
+    assert cheapest.purchase_count == 10
+    assert cheapest.owned_cards_used == 5
+    assert cheapest.remaining_budget_minor == 10_000 - 100
+
+
+def test_collector_target_already_met_is_no_opportunity() -> None:
+    capped_set, capped_holdings = standard_game(
+        500, "Met Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(capped_set,))
+    badges = make_badges(levels={500: 2})
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[{"app_id": "500", "target_level": 2}],
+    )
+
+    response = run_planner(
+        catalog, capped_holdings, {}, options, badges=badges, contract=fee_contract()
+    )
+
+    assert response.status == "ready"
+    for plan in response.plans:
+        assert plan.status == "no_opportunity"
+        assert plan.reason == "target_already_met"
+        assert plan.target_reached is True
+        assert plan.shortfall_xp == 0
+        assert plan.craft_count == 0
+    # The dashboard stays factual: the badge itself is not maxed.
+    assert response.games[0].status == "craftable"
+
+
+def test_collector_partial_budget_reports_shortfall() -> None:
+    capped_set, capped_holdings = standard_game(
+        500, "Tight Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(capped_set,))
+    options = make_options(
+        mode="collector",
+        budget_minor=60,
+        collector_targets=[{"app_id": "500", "target_level": 3}],
+    )
+
+    response = run_planner(
+        catalog, capped_holdings, {}, options, contract=fee_contract()
+    )
+
+    cheapest = response.plans[0]
+    # Crafts 1 and 2 fit (0 + 50); craft 3 needs another 50 and is blocked.
+    assert cheapest.status == "partial"
+    assert cheapest.reason == "budget_insufficient"
+    assert cheapest.target_reached is False
+    assert cheapest.shortfall_xp == 100
+    assert cheapest.craft_count == 2
+    assert cheapest.spend_minor == 50
+    assert cheapest.remaining_budget_minor == 10
+
+
+def test_collector_depth_shortfall_never_overbuys_past_asks() -> None:
+    thin_cards = [make_card(600, number, sell_quantity=2) for number in range(1, 6)]
+    catalog = ResolvedCatalog(
+        generation=1,
+        generated_at=NOW,
+        sets=(make_set(600, "Thin Game", thin_cards),),
+    )
+    holdings = make_holdings(600, {1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[{"app_id": "600", "target_level": 5}],
+    )
+
+    response = run_planner(catalog, holdings, {}, options, contract=fee_contract())
+
+    cheapest = response.plans[0]
+    # Depth 2 tops the owned copy at craft 3: crafts 4 and 5 stay missing.
+    assert cheapest.status == "partial"
+    assert cheapest.reason == "craft_depth_insufficient"
+    assert cheapest.craft_count == 3
+    assert cheapest.target_reached is False
+    assert cheapest.shortfall_xp == 200
+
+
+def test_collector_excluded_target_keeps_shortfall_without_crafts() -> None:
+    capped_set, capped_holdings = standard_game(
+        500, "Excluded Target", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(capped_set,))
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[{"app_id": "500", "target_level": 2}],
+        excluded_app_ids=["500"],
+    )
+
+    response = run_planner(
+        catalog, capped_holdings, {}, options, contract=fee_contract()
+    )
+
+    assert response.games[0].status == "excluded"
+    for plan in response.plans:
+        assert plan.status == "no_opportunity"
+        assert plan.reason == "no_crafts_available"
+        assert plan.craft_count == 0
+        assert plan.target_reached is False
+        assert plan.shortfall_xp == 200
+
+
+def test_collector_protection_reserves_are_never_consumed() -> None:
+    reserved_set, reserved_holdings = standard_game(
+        700,
+        "Reserved Target",
+        owned_counts=dict.fromkeys(range(1, 6), 2),
+        sell="0.30",
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(reserved_set,))
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[{"app_id": "700", "target_level": 2}],
+        protections=[
+            {
+                "market_hash_name": f"700-Card {number}",
+                "keep_quantity": 1,
+                "never_sell": False,
+            }
+            for number in range(1, 6)
+        ],
+    )
+
+    response = run_planner(
+        catalog, reserved_holdings, {}, options, contract=fee_contract()
+    )
+
+    cheapest = response.plans[0]
+    # Craft 1 uses the single unreserved copy per card; craft 2 buys all five.
+    assert cheapest.craft_count == 2
+    assert cheapest.owned_cards_used == 5
+    assert cheapest.purchase_count == 5
+    assert cheapest.spend_minor == 150
+    assert cheapest.target_reached is True
+
+
+def test_selected_scope_limits_crafts_but_keeps_every_row() -> None:
+    picked_set, picked_holdings = standard_game(
+        200, "Picked Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    dropped_set, dropped_holdings = standard_game(
+        500, "Dropped Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(
+        generation=1, generated_at=NOW, sets=(picked_set, dropped_set)
+    )
+    holdings = picked_holdings + dropped_holdings
+    options = make_options(
+        budget_minor=10_000, scope="selected", selected_app_ids=["200"]
+    )
+
+    response = run_planner(catalog, holdings, {}, options, contract=fee_contract())
+
+    assert response.scope == "selected_normal_badges"
+    assert response.evaluated_game_count == 2
+    # Ownership rows stay visible for protections and validation.
+    assert [game.app_id for game in response.games] == ["200", "500"]
+    for plan in response.plans:
+        assert plan.status == "ready"
+        assert [step.app_id for step in plan.steps] == ["200"]
+        assert plan.craft_count == 5
+    cheapest = response.plans[0]
+    # Craft 1 is the owned set; crafts 2-5 buy one copy per card.
+    assert cheapest.spend_minor == 200
+    assert cheapest.owned_cards_used == 5
+    assert cheapest.purchase_count == 20
+
+
+def test_selected_and_collector_references_fail_closed() -> None:
+    picked_set, picked_holdings = standard_game(
+        200, "Picked Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(picked_set,))
+    contract = fee_contract()
+
+    unknown_selected = run_planner(
+        catalog,
+        picked_holdings,
+        {},
+        make_options(budget_minor=10_000, scope="selected", selected_app_ids=["999"]),
+        contract=contract,
+    )
+    assert (unknown_selected.status, unknown_selected.reason) == (
+        "unavailable",
+        "selected_app_unknown",
+    )
+    assert unknown_selected.plans == []
+    assert unknown_selected.opportunity is None
+    assert unknown_selected.evaluated_game_count == 1
+
+    unknown_target = run_planner(
+        catalog,
+        picked_holdings,
+        {},
+        make_options(
+            mode="collector",
+            budget_minor=10_000,
+            collector_targets=[{"app_id": "999", "target_level": 1}],
+        ),
+        contract=contract,
+    )
+    assert (unknown_target.status, unknown_target.reason) == (
+        "unavailable",
+        "collector_target_unknown",
+    )
+
+    both_sets, both_holdings = standard_game(
+        500, "Known Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    out_of_scope_target = run_planner(
+        ResolvedCatalog(generation=1, generated_at=NOW, sets=(picked_set, both_sets)),
+        picked_holdings + both_holdings,
+        {},
+        make_options(
+            mode="collector",
+            budget_minor=10_000,
+            scope="selected",
+            selected_app_ids=["200"],
+            collector_targets=[{"app_id": "500", "target_level": 1}],
+        ),
+        contract=contract,
+    )
+    assert (out_of_scope_target.status, out_of_scope_target.reason) == (
+        "unavailable",
+        "collector_target_out_of_scope",
+    )
+
+
+def test_catalog_scope_discovers_full_sets_with_snapshot_levels() -> None:
+    priced_cards = [make_card(300, number, sell="0.50") for number in range(1, 6)]
+    owned_set, owned_holdings = standard_game(
+        200, "Owned Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    maxed_set, maxed_holdings = standard_game(
+        400, "Maxed Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(
+        generation=1,
+        generated_at=NOW,
+        sets=(
+            make_set(300, "Discovered Game", priced_cards),
+            owned_set,
+            maxed_set,
+        ),
+    )
+    holdings = owned_holdings + maxed_holdings
+    badges = make_badges(levels={400: 5})
+    options = make_options(budget_minor=10_000, scope="catalog")
+
+    response = run_planner(
+        catalog, holdings, {}, options, badges=badges, contract=fee_contract()
+    )
+
+    assert response.scope == "catalog_normal_badges"
+    # Every considered game is returned: catalog discovery never truncates.
+    assert response.evaluated_game_count == 3
+    assert [game.app_id for game in response.games] == ["200", "300", "400"]
+    by_id = {game.app_id: game for game in response.games}
+    discovered = by_id["300"]
+    assert discovered.game_name == "Discovered Game"
+    assert discovered.set_size == 5
+    assert discovered.badge_level == 0
+    assert discovered.completion_cost_minor == 250
+    assert by_id["400"].status == "maxed"
+    cheapest = response.plans[0]
+    # The wallet crafts everything eligible to the badge cap: the owned game
+    # costs one replacement round, the discovered game five full purchases.
+    steps = {step.app_id: step for step in cheapest.steps}
+    assert steps["200"].craft_count == 5
+    assert steps["200"].spend_minor == 200
+    assert steps["300"].craft_count == 5
+    assert steps["300"].spend_minor == 1_250
+    purchases = {row.market_hash_name: row for row in steps["300"].purchases}
+    assert all(
+        row.quantity == 5 and row.unit_price_minor == 50 for row in purchases.values()
+    )
+    assert "400" not in steps
+    assert cheapest.spend_minor == 1_450
+    assert cheapest.remaining_budget_minor == 10_000 - 1_450
+    for plan in response.plans[1:]:
+        other = {step.app_id for step in plan.steps}
+        assert other == {"200", "300"}
+
+    with pytest.raises(ValidationError) as missing_target:
+        BadgePlanningOptions(mode="target", budget_minor=0)
+    assert "target_level is required for mode 'target'" in str(missing_target.value)
+
+    with pytest.raises(ValidationError) as target_on_budget:
+        BadgePlanningOptions(mode="budget", budget_minor=0, target_level=3)
+    assert "target_level must be null for mode 'budget'" in str(target_on_budget.value)
+
+    with pytest.raises(ValidationError) as target_on_collector:
+        BadgePlanningOptions(
+            mode="collector",
+            budget_minor=0,
+            target_level=3,
+            collector_targets=[{"app_id": "1", "target_level": 1}],
+        )
+    assert "target_level must be null for mode 'collector'" in str(
+        target_on_collector.value
+    )
+
+    with pytest.raises(ValidationError) as missing_targets:
+        BadgePlanningOptions(mode="collector", budget_minor=0)
+    assert "collector_targets are required for mode 'collector'" in str(
+        missing_targets.value
+    )
+
+    with pytest.raises(ValidationError) as stray_targets:
+        BadgePlanningOptions(
+            mode="budget",
+            budget_minor=0,
+            collector_targets=[{"app_id": "1", "target_level": 1}],
+        )
+    assert "collector_targets must be empty unless mode is 'collector'" in str(
+        stray_targets.value
+    )
+
+    with pytest.raises(ValidationError) as missing_selection:
+        BadgePlanningOptions(mode="budget", budget_minor=0, scope="selected")
+    assert "selected_app_ids are required for scope 'selected'" in str(
+        missing_selection.value
+    )
+
+    with pytest.raises(ValidationError) as stray_selection:
+        BadgePlanningOptions(mode="budget", budget_minor=0, selected_app_ids=["1"])
+    assert "selected_app_ids must be empty unless scope is 'selected'" in str(
+        stray_selection.value
+    )
+
+    with pytest.raises(ValidationError) as duplicate_selection:
+        BadgePlanningOptions(
+            mode="budget",
+            budget_minor=0,
+            scope="selected",
+            selected_app_ids=["1", "1"],
+        )
+    assert "selected_app_ids entries must be unique" in str(duplicate_selection.value)
+
+    with pytest.raises(ValidationError) as duplicate_targets:
+        BadgePlanningOptions(
+            mode="collector",
+            budget_minor=0,
+            collector_targets=[
+                {"app_id": "1", "target_level": 1},
+                {"app_id": "1", "target_level": 2},
+            ],
+        )
+    assert "collector target AppIDs must be unique" in str(duplicate_targets.value)
+
+    with pytest.raises(ValidationError) as target_range:
+        BadgePlanningOptions(
+            mode="collector",
+            budget_minor=0,
+            collector_targets=[{"app_id": "1", "target_level": 6}],
+        )
+    assert "target_level" in str(target_range.value)
+
+    with pytest.raises(ValidationError) as bad_compare:
+        BadgePlanningOptions(mode="budget", budget_minor=0, compare_app_id="0")
+    assert "compare_app_id must be a positive app ID" in str(bad_compare.value)
+
+
+def test_collector_satisfied_target_never_crafts_again() -> None:
+    met_set, met_holdings = standard_game(
+        200, "Met Game", owned_counts=dict.fromkeys(range(1, 6), 2)
+    )
+    open_set, open_holdings = standard_game(
+        500, "Open Game", owned_counts=dict.fromkeys(range(1, 6), 1)
+    )
+    catalog = ResolvedCatalog(generation=1, generated_at=NOW, sets=(met_set, open_set))
+    holdings = met_holdings + open_holdings
+    badges = make_badges(levels={200: 2, 500: 0})
+    options = make_options(
+        mode="collector",
+        budget_minor=10_000,
+        collector_targets=[
+            {"app_id": "200", "target_level": 1},
+            {"app_id": "500", "target_level": 2},
+        ],
+    )
+
+    response = run_planner(
+        catalog, holdings, {}, options, badges=badges, contract=fee_contract()
+    )
+
+    by_id = {game.app_id: game for game in response.games}
+    assert by_id["200"].target_badge_level == 1
+    for plan in response.plans:
+        # The satisfied ceiling closes game 200 entirely; only the open game
+        # crafts, exactly to its own target.
+        steps = {step.app_id: step for step in plan.steps}
+        assert steps["500"].craft_count == 2
+        assert "200" not in steps
+        assert plan.target_reached is True
+        assert plan.shortfall_xp == 0
+        assert plan.status == "ready"

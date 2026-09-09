@@ -4,8 +4,11 @@
 
 Steam Optimizer is an open-source, read-only Steam Community inventory and badge optimizer. The
 shipped product inspects a public inventory, shows craftability and completion costs, and plans
-normal-badge crafts against a target level or wallet budget. A separate sale-funded swap adviser
-remains available. It is not an account operator or marketplace automation tool.
+normal-badge crafts against a target Steam level, Wallet budget, or per-game collector targets.
+Exportable checklists, optional saved intent, goal-aware surplus/wanted cards, public badge
+artwork, and complete-set craft-vs-sell comparisons support a manual workflow. A separate one-card
+sale-funded swap adviser remains available. The app is not an account operator or marketplace
+automation tool.
 
 The current stage includes a FastAPI health endpoint, Steam OpenID 2.0 login, an application-owned
 signed session, concurrent profile and badge-progress session checks, and server-only SteamApis v2
@@ -34,23 +37,32 @@ The workspace displays current XP and level from the latest in-memory session ba
 Planning reuses this snapshot without contacting the badge provider. Badges presents ready crafts,
 cheapest next crafts, closest sets, maxed/reserved/excluded games, and explicit unavailable states.
 The dashboard searches and filters games, renders at most 50 game rows per page, and expands one
-game's card controls at a time. Plan accepts a target level or wallet budget and compares three
-read-only policies with manual purchase and badge-page links.
+game's card controls at a time. Plan accepts target-level, budget, or collector goals and compares
+three read-only policies. Scope can include inventory games, an explicit selection, or supported
+complete normal-card sets with no owned copies. Every purchase and craft remains manual.
 
 The existing one-card sale optimizer is lazy-loaded only after opening **Advanced: sale-funded
 swaps**. It sends a separate request to `POST /api/auth/level-up`; its local XP calculator does not
 change swap selection. Reserved copies and never-sell flags reduce the source pool, while game
 exclusions apply to both workflows. Failed module downloads stay local to the affected workspace.
 
-### Goal and budget planning contract
+### Goal, budget, and collector planning contract
 
 `POST /api/auth/badge-planning` requires the signed session and matching `X-Expected-Steam-ID`.
-It accepts the existing bounded ownership/game/badge snapshot plus `options`:
+It accepts the existing bounded inventory/game snapshot, timestamps and XP/level, the complete
+`normal_badge_levels` snapshot, and `options`:
 
-- `mode`: `target` or `budget`; `target_level` is required only in target mode.
+- `mode`: `target`, `budget`, or `collector`; `target_level` is present only in target mode.
 - `budget_minor`: nonnegative integer Steam Wallet spending ceiling, never projected sale proceeds.
+- `scope`: `inventory`, `selected`, or `catalog`. Selected scope requires unique `selected_app_ids`.
+- `collector_targets`: unique `{app_id, target_level}` entries, levels 1–5, only in collector mode.
 - `protections`: unique owned card hashes with `keep_quantity` and `never_sell`.
-- `excluded_app_ids`: unique game IDs from the submitted inventory.
+- `excluded_app_ids`: unique game IDs, including discovered games absent from inventory.
+- `compare_app_id`: optional source for the independent complete-set sale comparison.
+
+Selected games and collector targets are bounded to 1,000 each. Catalog discovery is bounded to
+50,000 verified sets and 250,000 card identities. It uses generation-bound names and composition,
+never synthetic game names. Unknown selected games fail explicitly rather than disappearing.
 
 The endpoint rejects oversized/duplicate-member JSON, unknown or duplicate protection targets,
 reserves exceeding ownership, inconsistent badge XP/levels, and mismatched account identities.
@@ -58,10 +70,11 @@ Responses use `Cache-Control: no-store`. Inputs and plans are not logged or pers
 endpoint makes no inventory, badge, or booster metadata provider calls. Price generation refreshes
 use the existing shared asynchronous cache refresh, never a request-blocking catalog download.
 
-The pure `badge_planner.plan_badges` domain returns every submitted game, including unpriceable
-and unknown games, plus three independent policy plans. Scope is normal badges for games already
-represented in this inventory, not the whole Steam catalog. Foil, event, community, and other
-non-normal badges are excluded. A craft yields 100 XP and cannot exceed normal badge level five.
+The pure `badge_planner.plan_badges` domain retains every inventory game, including unpriceable
+and unsupported rows, and adds eligible discovered games. Complete normal-badge levels prevent
+an unowned maxed badge from being treated as level zero. The response reports the evaluated scope
+and game count alongside three independent policies. Foil, event, community, and other non-normal
+badges are excluded. A craft yields 100 XP and cannot exceed normal badge level five.
 Craftability is computed only for verified full composition, either from a complete catalog set or
 from all distinct owned cards matching a known set size. Missing composition never becomes a craft.
 
@@ -69,8 +82,9 @@ Kept quantities reserve copies from consumption. Never-sell alone still permits 
 The cheapest policy merges each game's nondecreasing marginal craft-cost sequence: owned copies
 are used before purchases, and purchased copies consume cumulative top-ask depth. It exactly
 minimizes spending to reach the target, or maximizes craft XP under the budget, within this fixed
-scope and price snapshot. Fewest-purchases and preserve-owned-cards are explicitly labeled
-heuristics, not global optima. Each alternative starts from the same inventory and budget; they
+scope and price snapshot. Collector mode caps each targeted game at its chosen level and does not
+craft untargeted games. Fewest-purchases and preserve-owned-cards remain labeled heuristics, not
+global optima. Each alternative starts from the same inventory and budget; they
 are mutually exclusive alternatives, not additive recommendations.
 
 Plans disclose craft/XP counts, projected level, shortfall, owned-card use, purchase copies,
@@ -85,8 +99,57 @@ and refreshed snapshots update freshness. Changed requests and account boundarie
 responses. Editing target/budget disables plan links until Apply. Nonzero budgets require a server-
 confirmed currency/scale, bound to that request; a currency change resets the budget to zero.
 Catalog-refresh responses trigger bounded automatic retries and retain explicit manual refresh.
-Preferences, drafts, and responses live only in account-scoped React memory, never IndexedDB,
-localStorage, cookies, or server-side user storage. Reload, logout, and account changes discard them.
+Live responses stay in account-scoped React memory; they are never cached as saved plans.
+Preferences and drafts also stay in memory unless the user explicitly saves intent on this device.
+Saved intent is restored only into the draft, then validated and applied against current snapshots.
+Inventory changes gate paid actions until the user confirms remaining Wallet funds; after manual
+crafts, refresh both inventory and badge data before recalculating.
+
+### Export, resume, and card disposition
+
+The chosen policy exports as clipboard text, CSV, or JSON, with account, currency/scale,
+snapshot and quote timestamps, expiry, purchases, crafts, wanted/surplus cards, and manual marks.
+CSV neutralizes spreadsheet formulas and quotes embedded separators. Exports are reference data,
+not live quotes or executable instructions.
+
+Surplus subtracts reservations and repeated planned crafts, then retains copies needed for
+unfinished collector targets. Never-sell and excluded rows are withheld; tradeable copies are
+derived conservatively from eligible owned assets. Wanted rows use verified identities and actual
+remaining goal quantities, never guessed card names or zero-valued missing quotes.
+
+Optional saved intent uses a bounded SteamID64-keyed `localStorage` record containing only inputs:
+mode, goals, scope, budget/currency, protections, exclusions, and strategy. Checklist marks have a
+separate opt-in record containing row IDs and an opaque plan fingerprint. They can resume on the
+same regenerated plan, but changed holdings or plan details clear their applicability. No
+inventory, badge snapshot, quotes, or full plan is stored in either record. Account switches do not
+expose another account's intent or marks. Forget saved setup and untick remembered marks to delete
+them; sign-out leaves opted-in intent/marks on this device. Marks never prove a Steam action.
+
+### Complete-set craft-versus-sell comparison
+
+A source must contain one full, unreserved, marketable normal set below badge level five, with
+fresh positive bids and depth for every member. Never-sell, exclusions, and kept quantities are
+respected. Exact per-item Steam/publisher fees produce net receipts; gross bids are never used as
+spending power. Missing prerequisites produce an explicit unavailable comparison.
+
+The cheapest replacement plan spends only those hypothetical receipts and excludes the entire
+source game, including retained copies. The baseline is the cheapest zero-spend plan over the
+original holdings. Both retain the selected scope, protections, and exclusions but deliberately
+ignore collector caps and the original target/Wallet budget. Additional XP is replacement XP minus
+baseline XP and can be negative. This is an alternative XP scenario, not cash profit; crafting
+rewards, fills, and account restrictions are not predicted.
+
+### Genuine badge artwork
+
+Authenticated `GET /api/auth/badge-artwork/{app_id}` validates the expected SteamID and reads
+configured public Steam Community donor game-card pages through the shared limiter. The service
+stops at the first verified normal badge, validates its app, level, title, and fixed Steam image
+origin, and caches the public result by game. Public pages show their owner's current level, not
+all five levels; missing artwork is explicit, never synthesized.
+
+The client fetches lazily on game expansion, aborts obsolete requests, and never paints another
+game/account's result. Only verified levels are displayed and the collector target is highlighted
+only when present. Transient failures can be retried without blocking badge planning.
 
 ## Safety and identity boundary
 
@@ -198,8 +261,8 @@ groups; an optional `card_set_size` only cross-checks the group length.
 The shared refresh obtains membership from SteamApis' [normal-card sets endpoint](https://docs.steamapis.com/raw/v1/market/cards.md)
 and joins those exact names to the v2 bulk quote feed. Only supported, unambiguous 5–15-card sets
 enter the catalog. A missing quote retains the member as unpriced rather than shortening the set.
-Normal membership is persisted explicitly; schema version 4 invalidates the old suffix-derived
-generation and rebuilds it on the next refresh.
+Normal membership and canonical set names are persisted explicitly. Schema version 5 invalidates
+older generations and rebuilds them on the next refresh; no backward-compatibility shim is kept.
 Missing, invalid, or set-size-mismatched groups are excluded from candidacy; if none remain, the
 result is `no_sellable_card`. Every held sellable normal card is
 evaluated as a one-copy source candidate, including cards from maxed badges; destinations must
@@ -389,17 +452,18 @@ remain compatible.
 
 ## Deliberately deferred
 
-The dashboard, goal/budget planner, and separate sale-funded optimizer are implemented.
-The following remain outside their contracts:
+The dashboard, scoped goal/budget/collector planner, manual checklist, complete-set comparison,
+and separate one-card sale-funded optimizer are implemented. The following remain outside their
+contracts:
 
 - Marketplace, purchase, sale, trade, or any other transaction automation.
-- A persisted transaction checklist, saved plans, or automatic repricing after source sales.
-- Multiple source sales or multiple copies sold in one recommendation. The advanced swap adviser
-  still limits destinations to five single crafts; the wallet-budget planner supports repeated
-  crafts and more destination games without financing them through sales.
+- Persisted live plans, transaction verification, or automatic repricing after source sales.
+- Multiple source games or multiple copies of the same card sold in one comparison. Complete-set
+  comparison sells one copy of each member of one set. The advanced swap adviser remains a
+  one-card sale with at most five destination crafts.
 - Leftover-portfolio optimization, unrestricted whole-Steam-catalog optimization, or a claim of
   global maximum XP beyond the scoped snapshot.
-- Raw XP targets, automatic wallet-balance discovery, or cross-session preference persistence.
+- Raw XP targets, automatic Wallet-balance discovery, or server-side user preference persistence.
 - Execution of patient listings or buy orders, order-book walking, fill-probability models,
   taxes, regional pricing, market holds, or account-specific restrictions. Advanced exchange
   alternatives provide patient estimates only, not guaranteed fills.

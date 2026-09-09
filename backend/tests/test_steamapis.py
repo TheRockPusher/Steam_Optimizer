@@ -13,8 +13,11 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app.level_up_optimizer import Holding
+
 if TYPE_CHECKING:
     from collections.abc import (
+        AsyncGenerator,
         AsyncIterator,
         Awaitable,
         Iterable,
@@ -26,7 +29,11 @@ if TYPE_CHECKING:
 
 import app.steam_gateway as steam_gateway
 import app.steamapis_price_cache as steamapis_price_cache
-from app.badge_planner import BadgePlanningOptions, BadgePlanningResponse
+from app.badge_planner import (
+    BadgeCollectorTarget,
+    BadgePlanningOptions,
+    BadgePlanningResponse,
+)
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import (
     GemKey,
@@ -60,7 +67,22 @@ from app.steam_gateway import (
     _observed_at,
     _provider_amount,
 )
-from app.steamapis_price_cache import SteamApisPriceCache
+from app.steamapis_price_cache import (
+    NormalCardSetMetadata,
+    NormalCardSetSeed,
+    SteamApisPriceCache,
+)
+
+
+def seeded_normal_card_sets(
+    names_by_app: Mapping[int, Sequence[str]],
+) -> dict[int, NormalCardSetSeed]:
+    """Wrap provider card names with their retained composition metadata."""
+
+    return {
+        app_id: NormalCardSetSeed(f"Game {app_id}", tuple(names))
+        for app_id, names in names_by_app.items()
+    }
 
 
 class FakeResponse:
@@ -155,7 +177,7 @@ class FakeHTTPClient:
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
-    ) -> AsyncIterator[FakeResponse]:
+    ) -> AsyncGenerator[FakeResponse]:
         self.stream_calls.append(
             {
                 "method": method,
@@ -2763,7 +2785,7 @@ def test_price_cache_reopens_legacy_index_shape_without_losing_generation(
     cache_path = tmp_path / "prices.sqlite3"
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
-    refresh.seed_normal_cards({440: ["Card (Trading Card)"]})
+    refresh.seed_normal_cards(seeded_normal_card_sets({440: ["Card (Trading Card)"]}))
     refresh.add(
         "440-Card (Trading Card)",
         "0.10",
@@ -2851,7 +2873,9 @@ def test_price_cache_catalog_filters_unrelated_app_ids(
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
     refresh.seed_normal_cards(
-        {app_id: ["Card (Trading Card)"] for app_id in (10, 440, 999)}
+        seeded_normal_card_sets(
+            {app_id: ["Card (Trading Card)"] for app_id in (10, 440, 999)}
+        )
     )
     quote_time = "2026-08-26T12:00:00Z"
     for app_id in (10, 440, 999):
@@ -2901,13 +2925,15 @@ def test_price_cache_catalog_truncation_reports_overflow_rows(
     cache = SteamApisPriceCache(cache_path)
     refresh = cache.begin_refresh()
     refresh.seed_normal_cards(
-        {
-            440: [
-                "Alpha (Trading Card)",
-                "Beta (Trading Card)",
-            ],
-            999: ["Gamma (Trading Card)"],
-        }
+        seeded_normal_card_sets(
+            {
+                440: [
+                    "Alpha (Trading Card)",
+                    "Beta (Trading Card)",
+                ],
+                999: ["Gamma (Trading Card)"],
+            }
+        )
     )
     quote_time = "2026-08-26T12:00:00Z"
     for name in (
@@ -3590,7 +3616,9 @@ def test_level_up_invalid_catalog_group_is_excluded(
         f"440-Oversized Set Card {index} (Trading Card)" for index in range(16)
     ]
     refresh.seed_normal_cards(
-        {440: [f"Oversized Set Card {index} (Trading Card)" for index in range(16)]}
+        seeded_normal_card_sets(
+            {440: [f"Oversized Set Card {index} (Trading Card)" for index in range(16)]}
+        )
     )
     for market_hash_name in market_hash_names:
         refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
@@ -3686,7 +3714,9 @@ def test_level_up_uses_supplied_badges_without_redundant_provider_calls(
     refresh = price_cache.begin_refresh()
     source_hashes = [f"440-Source Card {index} (Trading Card)" for index in range(1, 6)]
     refresh.seed_normal_cards(
-        {440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)]}
+        seeded_normal_card_sets(
+            {440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)]}
+        )
     )
     for market_hash_name in source_hashes:
         refresh.add(market_hash_name, "1.00", "1.00", quote_time.isoformat(), 1, 1)
@@ -3762,21 +3792,30 @@ def test_level_up_real_gateway_returns_flat_ready_plan_without_inventory_fetch(
         f"30-Unaffordable Card {index} (Trading Card)" for index in range(1, 6)
     ]
     refresh.seed_normal_cards(
-        {
-            440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
-            50: [f"Unqualified Source {index} (Trading Card)" for index in range(1, 6)],
-            10: [
-                f"Destination 10 Card {index} (Trading Card)" for index in range(1, 6)
-            ],
-            20: [
-                f"Destination 20 Card {index} (Trading Card)" for index in range(1, 6)
-            ],
-            40: [
-                f"Unqualified Destination {index} (Trading Card)"
-                for index in range(1, 6)
-            ],
-            30: [f"Unaffordable Card {index} (Trading Card)" for index in range(1, 6)],
-        }
+        seeded_normal_card_sets(
+            {
+                440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
+                50: [
+                    f"Unqualified Source {index} (Trading Card)"
+                    for index in range(1, 6)
+                ],
+                10: [
+                    f"Destination 10 Card {index} (Trading Card)"
+                    for index in range(1, 6)
+                ],
+                20: [
+                    f"Destination 20 Card {index} (Trading Card)"
+                    for index in range(1, 6)
+                ],
+                40: [
+                    f"Unqualified Destination {index} (Trading Card)"
+                    for index in range(1, 6)
+                ],
+                30: [
+                    f"Unaffordable Card {index} (Trading Card)" for index in range(1, 6)
+                ],
+            }
+        )
     )
     for market_hash_name in source_hashes:
         refresh.add(market_hash_name, "10.00", "1.00", quote_time.isoformat(), 1, 1)
@@ -3896,10 +3935,14 @@ def test_level_up_gateway_uses_one_sellable_card_and_partial_destination(
         f"20-Destination Card {index} (Trading Card)" for index in range(1, 6)
     ]
     refresh.seed_normal_cards(
-        {
-            440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
-            20: [f"Destination Card {index} (Trading Card)" for index in range(1, 6)],
-        }
+        seeded_normal_card_sets(
+            {
+                440: [f"Source Card {index} (Trading Card)" for index in range(1, 6)],
+                20: [
+                    f"Destination Card {index} (Trading Card)" for index in range(1, 6)
+                ],
+            }
+        )
     )
     for index, market_hash_name in enumerate(source_hashes, start=1):
         refresh.add(
@@ -4059,7 +4102,9 @@ def test_badge_planning_reaches_pure_planner_for_known_sets_without_provider_cal
         f"440-Alpha Card {index} (Trading Card)" for index in range(1, 6)
     ]
     refresh.seed_normal_cards(
-        {440: [f"Alpha Card {index} (Trading Card)" for index in range(1, 6)]}
+        seeded_normal_card_sets(
+            {440: [f"Alpha Card {index} (Trading Card)" for index in range(1, 6)]}
+        )
     )
     for market_hash_name in market_hash_names:
         refresh.add(market_hash_name, "0.10", "0.25", quote_time.isoformat(), 1, 5)
@@ -4135,10 +4180,12 @@ def test_owned_crafts_survive_unusable_prices_and_partial_metadata(
         quote_time = now - timedelta(seconds=1200 if catalog_state == "stale" else 0)
         refresh = cache.begin_refresh()
         refresh.seed_normal_cards(
-            {
-                app_id: [f"Card {number} (Trading Card)" for number in range(5)]
-                for app_id in (440, 550)
-            }
+            seeded_normal_card_sets(
+                {
+                    app_id: [f"Card {number} (Trading Card)" for number in range(5)]
+                    for app_id in (440, 550)
+                }
+            )
         )
         for app_id in (440, 550):
             for number in range(5):
@@ -4381,14 +4428,16 @@ def test_price_cache_keeps_committed_catalog_readable_during_large_refresh(
     cache = SteamApisPriceCache(tmp_path / "prices.sqlite3")
     name = "440-Card (Trading Card)"
     original = cache.begin_refresh()
-    original.seed_normal_cards({440: ["Card (Trading Card)"]})
+    original.seed_normal_cards(seeded_normal_card_sets({440: ["Card (Trading Card)"]}))
     original.add(name, "0.10", "0.20", None)
     original.commit(optimizer_complete=True)
     before = cache.read_catalog(app_ids=[440])
 
     replacement = cache.begin_refresh()
     try:
-        replacement.seed_normal_cards({440: ["Card (Trading Card)"]})
+        replacement.seed_normal_cards(
+            seeded_normal_card_sets({440: ["Card (Trading Card)"]})
+        )
         replacement.add(name, "0.11", "0.21", None)
         # Exceed SQLite's default page cache while the streamed transaction is open.
         for index in range(50_000):
@@ -4403,3 +4452,537 @@ def test_price_cache_keeps_committed_catalog_readable_during_large_refresh(
     after = cache.read_catalog(app_ids=[440])
     assert after.generation == before.generation + 1
     assert after.groups[440][0].lowest_sell == "0.21"
+
+
+def test_price_cache_persists_set_metadata_and_replaces_it_per_generation(
+    tmp_path: Path,
+) -> None:
+    cache = SteamApisPriceCache(tmp_path / "prices.sqlite3")
+    alpha_names = [f"Alpha Card {index} (Trading Card)" for index in range(1, 6)]
+    dest_names = [f"Dest Card {index} (Trading Card)" for index in range(1, 6)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(
+        seeded_normal_card_sets({440: alpha_names, 20: dest_names})
+    )
+    for name in alpha_names:
+        refresh.add(f"440-{name}", "0.10", "0.20", None, 1, 5)
+    refresh.commit(optimizer_complete=True)
+
+    read = cache.read_catalog()
+    assert set(read.sets) == {440, 20}
+    assert read.sets[440] == NormalCardSetMetadata("Game 440", 5)
+    assert read.sets[20] == NormalCardSetMetadata("Game 20", 5)
+    # Unpriced destination members survive so their set stays complete.
+    assert set(read.groups) == {440, 20}
+    assert [card.lowest_sell for card in read.groups[440]] == ["0.20"] * 5
+    assert all(card.lowest_sell is None for card in read.groups[20])
+
+    replacement = cache.begin_refresh()
+    replacement.seed_normal_cards(seeded_normal_card_sets({440: alpha_names}))
+    for name in alpha_names:
+        replacement.add(f"440-{name}", "0.11", "0.21", None, 1, 5)
+    replacement.commit(optimizer_complete=True)
+
+    replaced = cache.read_catalog()
+    assert set(replaced.sets) == {440}
+    assert replaced.sets[440] == NormalCardSetMetadata("Game 440", 5)
+    assert set(replaced.groups) == {440}
+
+
+def test_price_cache_read_catalog_filters_generation_sets_by_app_ids(
+    tmp_path: Path,
+) -> None:
+    cache = SteamApisPriceCache(tmp_path / "prices.sqlite3")
+    names = [f"Card {index} (Trading Card)" for index in range(5)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(seeded_normal_card_sets({440: names, 20: names}))
+    for app_id in (440, 20):
+        for name in names:
+            refresh.add(f"{app_id}-{name}", "0.10", "0.20", None, 1, 5)
+    refresh.commit(optimizer_complete=True)
+
+    filtered = cache.read_catalog(app_ids=[440])
+    assert set(filtered.groups) == {440}
+    assert set(filtered.sets) == {440}
+
+    metadata_only = cache.read_catalog(app_ids=[], max_rows=0)
+    assert metadata_only.generation == 1
+    assert metadata_only.groups == {}
+    assert metadata_only.sets == {}
+
+    empty = SteamApisPriceCache(tmp_path / "empty.sqlite3").read_catalog()
+    assert empty.generation == 0
+    assert empty.groups == {}
+    assert empty.sets == {}
+
+
+def test_price_cache_corrupt_set_metadata_fails_closed(tmp_path: Path) -> None:
+    cache_path = tmp_path / "prices.sqlite3"
+    cache = SteamApisPriceCache(cache_path)
+    names = [f"Card {index} (Trading Card)" for index in range(5)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(seeded_normal_card_sets({440: names}))
+    for name in names:
+        refresh.add(f"440-{name}", "0.10", "0.20", None, 1, 5)
+    refresh.commit(optimizer_complete=True)
+    connection = sqlite3.connect(cache_path)
+    try:
+        connection.execute(
+            "UPDATE steamapis_price_cache_sets SET set_size = 0 WHERE app_id = 440"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    failed = cache.read_catalog()
+    assert failed.generation == 0
+    assert failed.groups == {}
+    assert failed.sets == {}
+
+
+def test_price_cache_schema_bump_invalidates_legacy_cache(tmp_path: Path) -> None:
+    """A pre-metadata cache schema is dropped and rebuilt, never reused."""
+
+    cache_path = tmp_path / "prices.sqlite3"
+    legacy = SteamApisPriceCache(cache_path)
+    names = [f"Card {index} (Trading Card)" for index in range(5)]
+    refresh = legacy.begin_refresh()
+    refresh.seed_normal_cards(seeded_normal_card_sets({440: names}))
+    for name in names:
+        refresh.add(f"440-{name}", "0.10", "0.20", None, 1, 5)
+    refresh.commit(optimizer_complete=True)
+    assert legacy.read().generation == 1
+    connection = sqlite3.connect(cache_path)
+    try:
+        connection.execute("DROP TABLE steamapis_price_cache_sets")
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = SteamApisPriceCache(cache_path)
+    reopened.initialize()
+    assert reopened.read().generation == 0
+    catalog = reopened.read_catalog()
+    assert catalog.groups == {}
+    assert catalog.sets == {}
+    # The rebuilt cache still accepts a fresh generation.
+    reseeded = reopened.begin_refresh()
+    reseeded.seed_normal_cards(seeded_normal_card_sets({440: names}))
+    for name in names:
+        reseeded.add(f"440-{name}", "0.10", "0.20", None, 1, 5)
+    reseeded.commit(optimizer_complete=True)
+    assert reopened.read().generation == 1
+
+
+def test_parse_card_sets_payload_retains_and_degrades_game_names() -> None:
+    def set_entry(app_id: int, game: object) -> dict[str, object]:
+        return {
+            "appid": app_id,
+            "game": game,
+            "normal": {
+                "count": 5,
+                "names": [f"Card {index} (Trading Card)" for index in range(5)],
+            },
+        }
+
+    payload = {
+        "data": {
+            "games": 7,
+            "cards": 0,
+            "foils": 0,
+            "sets": [
+                set_entry(440, "  Half-Life 2  "),
+                set_entry(20, "Portal"),
+                set_entry(220, None),
+                set_entry(550, "   "),
+                set_entry(730, "x" * (steam_gateway.MAX_GAME_NAME_LENGTH + 1)),
+                set_entry(570, "Bad\0Name"),
+                set_entry(731, 12345),
+            ],
+        }
+    }
+
+    parsed = steam_gateway._parse_card_sets_payload(payload)
+
+    assert parsed is not None
+    assert set(parsed) == {440, 20, 220, 550, 570, 730}
+    assert parsed[440].game_name == "Half-Life 2"
+    assert parsed[20].game_name == "Portal"
+    assert parsed[220].game_name is None
+    assert parsed[550].game_name is None
+    assert parsed[570].game_name is None
+    assert parsed[730].game_name is None
+    assert parsed[730].names == (
+        "Card 0 (Trading Card)",
+        "Card 1 (Trading Card)",
+        "Card 2 (Trading Card)",
+        "Card 3 (Trading Card)",
+        "Card 4 (Trading Card)",
+    )
+    # A non-string game name is a malformed entry: that set is skipped whole.
+    duplicate = {"data": {"sets": [set_entry(440, "A"), set_entry(440, "B")]}}
+    assert steam_gateway._parse_card_sets_payload(duplicate) is None
+    non_string_game = {"data": {"sets": [set_entry(440, 12345)]}}
+    assert steam_gateway._parse_card_sets_payload(non_string_game) == {}
+
+
+def _catalog_scope_settings(tmp_path: Path) -> Settings:
+    return settings(
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1000,
+        level_up_min_fee_minor=1,
+        level_up_max_quote_age_seconds=900,
+        level_up_max_inventory_age_seconds=3600,
+    )
+
+
+def _seed_two_set_cache(
+    configured: Settings,
+    quote_time: datetime,
+) -> SteamApisPriceCache:
+    cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    alpha_names = [f"Alpha Card {index} (Trading Card)" for index in range(1, 6)]
+    dest_names = [f"Dest Card {index} (Trading Card)" for index in range(1, 6)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(
+        seeded_normal_card_sets({440: alpha_names, 20: dest_names})
+    )
+    for app_id, names in ((440, alpha_names), (20, dest_names)):
+        for name in names:
+            refresh.add(
+                f"{app_id}-{name}",
+                "0.10",
+                "0.25",
+                quote_time.isoformat(),
+                5,
+                5,
+            )
+    refresh.commit(optimizer_complete=True)
+    return cache
+
+
+def test_badge_planning_catalog_scope_discovers_supported_sets_without_inventory(
+    tmp_path: Path,
+) -> None:
+    configured = _catalog_scope_settings(tmp_path)
+    cache = _seed_two_set_cache(configured, datetime.now(UTC))
+    now = datetime.now(UTC)
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(
+        configured,
+        http_client=client,
+        price_cache=cache,
+        booster_pricing=ExplodingLevelUpProviders(),  # type: ignore[arg-type]
+    )
+    options = BadgePlanningOptions(
+        mode="collector",
+        target_level=None,
+        budget_minor=0,
+        scope="catalog",
+        selected_app_ids=[],
+        collector_targets=[BadgeCollectorTarget(app_id="440", target_level=1)],
+        compare_app_id=None,
+        excluded_app_ids=[],
+        protections=[],
+    )
+
+    result = run(
+        gateway.check_badge_planning(
+            (),
+            {},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            options=options,
+            now=now,
+        )
+    )
+
+    assert isinstance(result, BadgePlanningResponse)
+    assert result.status == "ready", (result.status, result.reason)
+    assert result.scope == "catalog_normal_badges"
+    assert result.evaluated_game_count == len(result.games) == 2
+    games = {game.app_id: game for game in result.games}
+    assert set(games) == {"440", "20"}
+    # Retained authoritative composition metadata names and sizes every set.
+    assert games["440"].game_name == "Game 440"
+    assert games["440"].set_size == 5
+    assert games["20"].game_name == "Game 20"
+    assert games["20"].set_size == 5
+    # Only the collector target carries a target level.
+    assert games["440"].target_badge_level == 1
+    assert games["20"].target_badge_level is None
+    # Planning is a pure cached-generation read: no per-game provider calls.
+    assert client.get_calls == []
+    assert client.stream_calls == []
+
+
+def test_badge_planning_selected_scope_expands_authoritative_metadata(
+    tmp_path: Path,
+) -> None:
+    configured = _catalog_scope_settings(tmp_path)
+    cache = _seed_two_set_cache(configured, datetime.now(UTC))
+    now = datetime.now(UTC)
+    client = FakeHTTPClient([])
+    gateway = SteamGateway(
+        configured,
+        http_client=client,
+        price_cache=cache,
+        booster_pricing=ExplodingLevelUpProviders(),  # type: ignore[arg-type]
+    )
+    options = BadgePlanningOptions(
+        mode="target",
+        target_level=1,
+        budget_minor=500,
+        scope="selected",
+        selected_app_ids=["440", "20"],
+        collector_targets=[],
+        compare_app_id=None,
+        excluded_app_ids=[],
+        protections=[],
+    )
+
+    result = run(
+        gateway.check_badge_planning(
+            (),
+            {},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            options=options,
+            now=now,
+        )
+    )
+
+    assert isinstance(result, BadgePlanningResponse)
+    assert result.status == "ready", (result.status, result.reason)
+    assert result.scope == "selected_normal_badges"
+    assert result.evaluated_game_count == len(result.games) == 2
+    games = {game.app_id: game for game in result.games}
+    assert games["440"].game_name == "Game 440"
+    assert games["440"].set_size == 5
+    assert games["20"].game_name == "Game 20"
+    assert all(game.target_badge_level is None for game in games.values())
+    assert client.get_calls == []
+    assert client.stream_calls == []
+
+
+def test_badge_planning_unknown_selected_identifier_fails_closed(
+    tmp_path: Path,
+) -> None:
+    configured = _catalog_scope_settings(tmp_path)
+    cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    names = [f"Card {index} (Trading Card)" for index in range(5)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(seeded_normal_card_sets({440: names}))
+    for name in names:
+        refresh.add(f"440-{name}", "0.10", "0.25", None, 5, 5)
+    refresh.commit(optimizer_complete=True)
+    now = datetime.now(UTC)
+    gateway = SteamGateway(
+        configured,
+        http_client=FakeHTTPClient([]),
+        price_cache=cache,
+    )
+    options = BadgePlanningOptions(
+        mode="target",
+        target_level=1,
+        budget_minor=500,
+        scope="selected",
+        selected_app_ids=["999"],
+        collector_targets=[],
+        compare_app_id=None,
+        excluded_app_ids=[],
+        protections=[],
+    )
+
+    result = run(
+        gateway.check_badge_planning(
+            (),
+            {},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            options=options,
+            now=now,
+        )
+    )
+
+    assert isinstance(result, BadgePlanningResponse)
+    assert result.status == "unavailable"
+    assert result.reason == "selected_app_unknown"
+    assert result.opportunity is None
+
+
+@pytest.mark.parametrize("catalog_state", ["missing", "stale", "partial"])
+def test_catalog_scope_reports_unusable_generation_honestly(
+    tmp_path: Path,
+    catalog_state: str,
+) -> None:
+    now = datetime.now(UTC)
+    configured = settings(
+        steamapi_key="",
+        steamapis_price_cache_path=str(tmp_path / "prices.sqlite3"),
+        level_up_currency_code="USD",
+        level_up_currency_minor_digits=2,
+        level_up_price_basis="buyer_total",
+        level_up_steam_fee_bps=500,
+        level_up_publisher_fee_bps=1000,
+        level_up_min_fee_minor=1,
+    )
+    cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    if catalog_state != "missing":
+        quote_time = now - timedelta(seconds=1200 if catalog_state == "stale" else 0)
+        refresh = cache.begin_refresh()
+        refresh.seed_normal_cards(
+            seeded_normal_card_sets(
+                {
+                    app_id: [f"Card {number} (Trading Card)" for number in range(5)]
+                    for app_id in (440, 550)
+                }
+            )
+        )
+        for app_id in (440, 550):
+            for number in range(5):
+                refresh.add(
+                    f"{app_id}-Card {number} (Trading Card)",
+                    "0.03",
+                    "0.05",
+                    quote_time.isoformat(),
+                    10,
+                    10,
+                )
+        refresh.commit(
+            now=quote_time.timestamp(),
+            optimizer_complete=catalog_state != "partial",
+        )
+    gateway = SteamGateway(
+        configured,
+        http_client=FakeHTTPClient([]),
+        price_cache=cache,
+    )
+    options = BadgePlanningOptions(
+        mode="target",
+        target_level=1,
+        budget_minor=0,
+        scope="catalog",
+        selected_app_ids=[],
+        collector_targets=[],
+        compare_app_id=None,
+        excluded_app_ids=[],
+        protections=[],
+    )
+
+    result = run(
+        gateway.check_badge_planning(
+            (),
+            {},
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            options=options,
+            now=now,
+        )
+    )
+
+    assert isinstance(result, BadgePlanningResponse)
+    expected_status = {
+        # With no generation the catalog universe is empty: the pure planner
+        # answers ready with zero considered games and names the condition.
+        "missing": "ready",
+        "stale": "unavailable",
+        "partial": "unavailable",
+    }[catalog_state]
+    expected_reason = {
+        "missing": "price_generation_unavailable",
+        "stale": "price_generation_stale",
+        "partial": "price_generation_refreshing",
+    }[catalog_state]
+    if catalog_state == "missing":
+        assert result.status == expected_status
+        assert result.reason == expected_reason
+        assert result.games == []
+        assert result.evaluated_game_count == 0
+        assert all(plan.craft_count == 0 for plan in result.plans)
+    else:
+        assert result.status == expected_status
+        assert result.reason == expected_reason
+        assert result.evaluated_game_count == len(result.games) == 2
+    assert result.scope == "catalog_normal_badges"
+    if catalog_state != "missing":
+        assert result.plans == []
+    assert result.opportunity is None
+    games = {game.app_id for game in result.games}
+    assert games <= {"440", "550"}
+
+
+def test_badge_discovery_preserves_inventory_names_without_inventing_catalog_names(
+    tmp_path: Path,
+) -> None:
+    configured = _catalog_scope_settings(tmp_path)
+    cache = SteamApisPriceCache(configured.steamapis_price_cache_path)
+    now = datetime.now(UTC)
+    names = [f"Card {index}" for index in range(5)]
+    refresh = cache.begin_refresh()
+    refresh.seed_normal_cards(
+        {
+            440: NormalCardSetSeed(None, names),
+            20: NormalCardSetSeed(None, names),
+        }
+    )
+    for app_id in (440, 20):
+        for name in names:
+            refresh.add(f"{app_id}-{name}", "0.10", "0.25", now.isoformat(), 5, 5)
+    refresh.commit(now=now.timestamp(), optimizer_complete=True)
+    gateway = SteamGateway(
+        configured,
+        http_client=FakeHTTPClient([]),
+        price_cache=cache,
+    )
+    holdings = tuple(
+        Holding(market_hash_name=f"440-{name}", owned_quantity=1, sellable_quantity=1)
+        for name in names
+    )
+    metadata = {440: ("Inventory game name", 5)}
+    catalog = run(
+        gateway.check_badge_planning(
+            holdings,
+            metadata,
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            now=now,
+            options=BadgePlanningOptions(
+                mode="budget", budget_minor=0, scope="catalog"
+            ),
+        )
+    )
+    assert catalog.status == "ready"
+    assert [(game.app_id, game.game_name) for game in catalog.games] == [
+        ("440", "Inventory game name")
+    ]
+    assert catalog.plans[0].craft_count == 1
+    selected = run(
+        gateway.check_badge_planning(
+            holdings,
+            metadata,
+            BadgeState(0, 0, {}),
+            inventory_refreshed_at=now,
+            badge_refreshed_at=now,
+            now=now,
+            options=BadgePlanningOptions(
+                mode="budget",
+                budget_minor=0,
+                scope="selected",
+                selected_app_ids=["20"],
+            ),
+        )
+    )
+    assert selected.status == "unavailable"
+    assert selected.reason == "selected_app_unknown"
+    assert all(game.app_id != "20" for game in selected.games)

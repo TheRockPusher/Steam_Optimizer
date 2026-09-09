@@ -1,0 +1,131 @@
+/* BadgeArtwork owns .badge-artwork-prefixed styles and consumes the
+   shared design tokens from index.css.  Uppercase + tracking is reserved
+   for machine tags (level chips, target flag); human labels stay
+   sentence case.  Badge art sits on the #1B1B1B background Steam's own
+   badge pages use. */
+
+.badge-artwork {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border: var(--border-width) solid var(--color-line-soft);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+}
+
+.badge-artwork-heading {
+    display: grid;
+    gap: var(--space-1);
+}
+
+.badge-artwork-title {
+    margin: 0;
+    font-size: var(--text-base);
+    font-weight: 600;
+    letter-spacing: var(--tracking-tight);
+}
+
+.badge-artwork-subject {
+    margin: 0;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+.badge-artwork-note {
+    margin: 0;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    line-height: var(--leading-copy);
+}
+
+.badge-artwork-note--error {
+    color: var(--color-error);
+}
+
+.badge-artwork-note--unavailable {
+    color: var(--color-unavailable);
+}
+
+.badge-artwork-retry {
+    min-height: var(--control-min-height);
+    justify-self: start;
+    padding: 0 var(--space-4);
+    border: var(--border-width) solid var(--color-line);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-ink);
+    font-size: var(--text-sm);
+    cursor: pointer;
+}
+
+.badge-artwork-retry:hover {
+    border-color: var(--color-accent);
+    color: var(--color-accent-strong);
+}
+
+.badge-artwork-levels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.badge-artwork-level {
+    display: grid;
+    gap: var(--space-1);
+    justify-items: center;
+    padding: var(--space-2);
+    border: var(--border-width) solid var(--color-line-soft);
+    border-radius: var(--radius-md);
+    background: var(--color-surface-strong);
+}
+
+.badge-artwork-level--target {
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 var(--space-1) var(--color-accent-soft);
+}
+
+.badge-artwork-image {
+    width: 5rem;
+    height: 5rem;
+    object-fit: contain;
+    background: #1b1b1b;
+    border-radius: var(--radius-sm);
+}
+
+.badge-artwork-level-tag {
+    color: var(--color-ink-faint);
+    font-size: var(--text-xs);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+}
+
+.badge-artwork-level--target .badge-artwork-level-tag {
+    color: var(--color-accent-strong);
+}
+
+.badge-artwork-level-name {
+    max-width: 8rem;
+    overflow-wrap: anywhere;
+    color: var(--color-ink-soft);
+    font-size: var(--text-sm);
+    text-align: center;
+}
+
+.badge-artwork-target-tag {
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-round);
+    background: var(--color-accent-soft);
+    color: var(--color-accent-strong);
+    font-size: var(--text-xs);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+}
+
+.badge-artwork-source {
+    justify-self: start;
+    font-size: var(--text-sm);
+}

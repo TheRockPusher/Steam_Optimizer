@@ -12,10 +12,17 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Iterable,
+        Mapping,
+        Sequence,
+    )
 
     from httpx2 import Response
 
+from app.badge_artwork import BadgeArtworkBadge, BadgeArtworkResponse
 from app.badge_planner import BadgePlanningOptions, BadgePlanningResponse
 from app.booster_pricing import BoosterResolution, BoosterScanResult
 from app.cookies import (
@@ -71,6 +78,8 @@ class FakeGateway:
         level_up_error: Exception | None = None,
         badge_planning_result: BadgePlanningResponse | None = None,
         badge_planning_error: Exception | None = None,
+        badge_artwork_result: BadgeArtworkResponse | None = None,
+        badge_artwork_error: Exception | None = None,
         profile_error: Exception | None = None,
         badge_result: BadgeCheck | None = None,
         badge_error: Exception | None = None,
@@ -84,6 +93,8 @@ class FakeGateway:
         self.profile_error = profile_error
         self.badge_result = badge_result
         self.badge_error = badge_error
+        self.badge_artwork_result = badge_artwork_result
+        self.badge_artwork_error = badge_artwork_error
         self.profile_calls = 0
         self.badge_calls = 0
         self.inventory_calls = 0
@@ -108,6 +119,7 @@ class FakeGateway:
                 datetime | str | int | None,
             ]
         ] = []
+        self.badge_artwork_calls: list[tuple[int, str]] = []
         self.gem_refresh_calls: list[list[GemKey]] = []
         self.booster_refresh_calls: list[tuple[str, ...]] = []
 
@@ -221,6 +233,26 @@ class FakeGateway:
             scope="inventory_normal_badges",
             games=[],
             plans=[],
+            opportunity=None,
+            evaluated_game_count=0,
+        )
+
+    async def check_badge_artwork(
+        self,
+        app_id: int,
+        steam_id: str,
+    ) -> BadgeArtworkResponse:
+        self.badge_artwork_calls.append((app_id, steam_id))
+        del steam_id
+        if self.badge_artwork_error is not None:
+            raise self.badge_artwork_error
+        if self.badge_artwork_result is not None:
+            return self.badge_artwork_result
+        return BadgeArtworkResponse(
+            app_id=str(app_id),
+            status="unavailable",
+            badges=[],
+            source_url=None,
         )
 
     async def refresh_gems(
@@ -1177,6 +1209,12 @@ def _valid_badge_planning_options() -> dict[str, object]:
 
 def _valid_badge_planning_payload() -> dict[str, object]:
     payload = _valid_level_up_payload()
+    # The complete validated session snapshot: game 20 is crafted to level 1
+    # and game 440 is uncrafted, so its snapshot row may be explicit or absent.
+    payload["normal_badge_levels"] = [
+        {"app_id": 20, "level": 1},
+        {"app_id": 440, "level": 0},
+    ]
     payload["options"] = _valid_badge_planning_options()
     return payload
 
@@ -1287,10 +1325,35 @@ def test_badge_planning_requires_session_and_matching_expected_account() -> None
             options=_badge_options_with(excluded_app_ids=["440", "440"])
         ),
         _badge_planning_payload_with(
-            options=_badge_options_with(excluded_app_ids=["999"])
+            options=_badge_options_with(excluded_app_ids=["0"])
         ),
         _badge_planning_payload_with(
-            options=_badge_options_with(excluded_app_ids=["0"])
+            normal_badge_levels=[
+                {"app_id": 440, "level": 0},
+                {"app_id": 20, "level": 1},
+            ]
+        ),
+        _badge_planning_payload_with(
+            normal_badge_levels=[
+                {"app_id": 20, "level": 1},
+                {"app_id": 20, "level": 1},
+            ]
+        ),
+        _badge_planning_payload_with(
+            normal_badge_levels=[
+                {"app_id": 20, "level": 6},
+            ]
+        ),
+        _badge_planning_payload_with(
+            normal_badge_levels=[
+                {"app_id": 20, "level": 0},
+                {"app_id": 440, "level": 0},
+            ]
+        ),
+        _badge_planning_payload_with(
+            normal_badge_levels=[
+                {"app_id": index + 1, "level": 0} for index in range(10_001)
+            ]
         ),
     ],
 )
@@ -1319,6 +1382,232 @@ def test_badge_planning_rejects_invalid_snapshot_contract(
     assert response.headers["cache-control"] == "no-store"
     assert gateway.badge_planning_calls == []
     assert gateway.inventory_calls == 0
+
+
+def test_badge_planning_forwards_exclusion_for_discovered_zero_owned_game() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_badge_planning_payload_with(
+                options=_badge_options_with(excluded_app_ids=["999"])
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert len(gateway.badge_planning_calls) == 1
+    _, _, _, _, _, options, _ = gateway.badge_planning_calls[0]
+    # Exclusions may reference discovered catalog/selected candidates with
+    # zero owned copies; inventory membership is resolved by the domain, not
+    # by the route validator.
+    assert options.excluded_app_ids == ["999"]
+    assert gateway.inventory_calls == 0
+
+
+def test_badge_planning_forwards_complete_snapshot_badge_state() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.post(
+            "/api/auth/badge-planning",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+            json=_valid_badge_planning_payload(),
+        )
+
+    assert response.status_code == 200
+    assert len(gateway.badge_planning_calls) == 1
+    holdings, game_metadata, badge_state, refreshed_at, badge_at, options, _ = (
+        gateway.badge_planning_calls[0]
+    )
+    # The engine receives the complete submitted snapshot, so a normal badge
+    # missing from it denotes uncrafted instead of unknown.
+    assert badge_state == BadgeState(0, 0, {20: 1, 440: 0})
+    assert game_metadata == {
+        440: ("Test Game", None),
+        20: ("Destination Game", 5),
+    }
+    assert refreshed_at == "2026-08-26T12:00:00Z"
+    assert badge_at == "2026-08-26T12:00:00Z"
+    assert len(holdings) == 2
+    assert options.mode == "target"
+    assert gateway.inventory_calls == 0
+
+
+def test_badge_artwork_requires_session_and_matching_expected_account() -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        unauthenticated = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+        _authenticate(client, settings)
+        mismatched = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": "76561198000000001"},
+        )
+
+    assert unauthenticated.status_code == 401
+    assert mismatched.status_code == 401
+    assert unauthenticated.headers["cache-control"] == "no-store"
+    assert mismatched.headers["cache-control"] == "no-store"
+    assert gateway.badge_artwork_calls == []
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        ok = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert ok.status_code == 200
+    assert ok.headers["cache-control"] == "no-store"
+    assert gateway.badge_artwork_calls == [(440, AUTHENTICATED_STEAM_ID)]
+    assert ok.json() == {
+        "app_id": "440",
+        "status": "unavailable",
+        "badges": [],
+        "source_url": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "app_id",
+    ["abc", "0", "-1", "12345678901", "44x0", " "],
+)
+def test_badge_artwork_rejects_invalid_path_app_ids(app_id: str) -> None:
+    settings = make_settings()
+    gateway = FakeGateway()
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get(
+            f"/api/auth/badge-artwork/{app_id}",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Badge artwork AppID is invalid."}
+    assert response.headers["cache-control"] == "no-store"
+    assert gateway.badge_artwork_calls == []
+
+
+def test_badge_artwork_forwards_ready_service_result() -> None:
+    settings = make_settings()
+    image_url = (
+        "https://community.cloudflare.steamstatic.com/community_assets/"
+        "images/items/440/" + "a" * 40
+    )
+    ready = BadgeArtworkResponse(
+        app_id="440",
+        status="ready",
+        badges=[BadgeArtworkBadge(level=1, name="Level 1", image_url=image_url)],
+        source_url="https://steamcommunity.com/profiles/76561198000000000/gamecards/440/",
+    )
+    gateway = FakeGateway(badge_artwork_result=ready)
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "app_id": "440",
+        "status": "ready",
+        "badges": [{"level": 1, "name": "Level 1", "image_url": image_url}],
+        "source_url": (
+            "https://steamcommunity.com/profiles/76561198000000000/gamecards/440/"
+        ),
+    }
+
+
+def test_badge_artwork_maps_value_error_to_rejected_app_id() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(badge_artwork_error=ValueError("app id out of range"))
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Badge artwork AppID is invalid."}
+    assert gateway.badge_artwork_calls == [(440, AUTHENTICATED_STEAM_ID)]
+
+
+def test_badge_artwork_maps_service_failures_to_unavailable_shape() -> None:
+    settings = make_settings()
+    gateway = FakeGateway(badge_artwork_error=TimeoutError())
+    app = create_app(
+        settings,
+        steam_gateway=gateway,
+        openid_verifier=FakeVerifier(),
+        clock=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        _authenticate(client, settings)
+        response = client.get(
+            "/api/auth/badge-artwork/440",
+            headers={"X-Expected-Steam-ID": AUTHENTICATED_STEAM_ID},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "app_id": "440",
+        "status": "unavailable",
+        "badges": [],
+        "source_url": None,
+    }
 
 
 def test_badge_planning_rejects_oversize_and_duplicate_json_members() -> None:
@@ -1628,7 +1917,7 @@ class FakeStreamMixin:
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
-    ) -> AsyncIterator[FakeResponse]:
+    ) -> AsyncGenerator[FakeResponse]:
         del method, url, params, headers, follow_redirects, timeout
         yield FakeResponse(500, {})
 
