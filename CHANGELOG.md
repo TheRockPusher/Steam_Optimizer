@@ -1,21 +1,19 @@
 # Changelog
 
 All notable changes to Steam Optimizer are documented here.
+## v1.2.0
 
-## Unreleased
+
+### Documentation
+- Update changelog for v1.1.0
+
 
 ### Features
-- Export badge plans as clipboard checklists, CSV, or JSON with quote and snapshot provenance.
-- Save account-scoped planning intent and optionally resume checklist marks on the same device.
-- Derive goal-aware wanted and surplus cards after reservations and repeated crafts.
-- Discover eligible normal badges across inventory, selected games, or the supported catalog.
-- Set per-game collector targets and preview genuine, explicitly partial Steam badge artwork.
-- Compare crafting one complete owned set with selling it to fund other badges, net of exact fees.
+- Add resumable badge planning and collector workflows
 
-### Safety
-- Preserve complete normal-badge levels for unowned games and retain unsupported inventory rows.
-- Reconfirm remaining Wallet funds after refreshed holdings; saved marks never imply execution.
-- Bind comparisons to fresh bids, sellable quantities, reservations, and an independent zero-spend baseline.
+
+### Maintenance
+- Prepare release v1.2.0
 
 ## v1.1.0
 
