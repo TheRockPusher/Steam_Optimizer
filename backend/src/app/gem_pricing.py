@@ -33,8 +33,8 @@ STEAM_GOO_VALUE_ENDPOINT = (
 )
 STEAM_COMMUNITY_REFERER = f"{STEAM_COMMUNITY_BASE_URL}/market/"
 STEAM_COMMUNITY_COOKIE = "bMarketOptOut=1"
-STEAM_OPTIMIZER_USER_AGENT = (
-    "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+STEAMALLY_USER_AGENT = (
+    "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
 SACK_OF_GEMS_MARKET_HASH_NAME: Literal["753-Sack of Gems"] = "753-Sack of Gems"
 SACK_OF_GEMS_GEM_COUNT = 1000
@@ -1274,7 +1274,7 @@ class SteamCommunityGemProvider:
             "Accept": "application/json",
             "Cookie": STEAM_COMMUNITY_COOKIE,
             "Referer": STEAM_COMMUNITY_REFERER,
-            "User-Agent": STEAM_OPTIMIZER_USER_AGENT,
+            "User-Agent": STEAMALLY_USER_AGENT,
         }
 
     async def lookup(

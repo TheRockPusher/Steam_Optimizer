@@ -2,7 +2,7 @@
 header = """
 # Changelog
 
-All notable changes to Steam Optimizer are documented here.
+All notable changes to Steam Ally are documented here.
 """
 body = """
 {% if version %}## {{ version }}{% else %}## Unreleased{% endif %}
@@ -22,7 +22,9 @@ trim = true
 conventional_commits = true
 filter_unconventional = false
 split_commits = false
-commit_preprocessors = []
+commit_preprocessors = [
+  { pattern = "Steam Optimizer", replace = "Steam Ally" },
+]
 commit_parsers = [
   { message = "^feat", group = "Features" },
   { message = "^fix", group = "Bug Fixes" },

@@ -1,5 +1,5 @@
 export const INVENTORY_CACHE_SCHEMA_VERSION = 6;
-export const INVENTORY_CACHE_DATABASE_NAME = "steam-optimizer-inventory";
+export const INVENTORY_CACHE_DATABASE_NAME = "steamally-inventory";
 export const INVENTORY_CACHE_STORE_NAME = "inventory";
 
 const INVENTORY_CACHE_DATABASE_VERSION = 2;

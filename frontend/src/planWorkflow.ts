@@ -50,7 +50,7 @@ import type {
 export const PLAN_INTENT_SCHEMA_VERSION = 1;
 /** Mirrors the request-side card-row bound for stored protections. */
 export const MAX_PLAN_INTENT_PROTECTIONS = MAX_LEVEL_UP_CARD_ROWS;
-export const PLAN_INTENT_KEY_PREFIX = "steam-optimizer:plan-intent";
+export const PLAN_INTENT_KEY_PREFIX = "steamally:plan-intent";
 /** Checklist rows rendered inline before the download note takes over. */
 export const PLAN_CHECKLIST_RENDER_LIMIT = 300;
 

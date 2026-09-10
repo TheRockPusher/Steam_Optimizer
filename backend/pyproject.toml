@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "steam-optimizer-backend"
+name = "steamally-backend"
 version = "1.2.0"
-description = "Read-only Steam Optimizer API"
+description = "Read-only Steam Ally API"
 requires-python = ">=3.14"
 dependencies = [
   "fastapi>=0.115,<1.0",

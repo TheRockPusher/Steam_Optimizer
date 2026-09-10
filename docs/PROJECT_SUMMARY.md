@@ -2,7 +2,7 @@
 
 ## Product direction
 
-Steam Optimizer is an open-source, read-only Steam Community inventory and badge optimizer. The
+Steam Ally is an open-source, read-only Steam Community inventory and badge optimizer. The
 shipped product inspects a public inventory, shows craftability and completion costs, and plans
 normal-badge crafts against a target Steam level, Wallet budget, or per-game collector targets.
 Exportable checklists, optional saved intent, goal-aware surplus/wanted cards, public badge
@@ -369,12 +369,12 @@ storage, deletion, warranty, and liability terms.
   `(generation, normal_card_app_id)` index. The optimizer constructs and sorts destination options
   once, then performs a single small-candidate source scan with exact integer fee arithmetic. The
   frontend and backend remain independently deployable services.
-- **Hosting:** Railway project `steam-optimizer`
+- **Hosting:** Railway project `steamally`
   (`a6d0c0d3-2a41-486b-9f3b-1de0db5da949`) has a production environment with separate backend
-  and frontend services in EU-West (`europe-west4-drams3a`). The browser uses the frontend origin
-  for both UI and `/api`; Caddy proxies API traffic to the backend. The attached `backend-data`
-  volume is mounted at `/data`; the global market cache uses
-  `/data/steamapis_prices.sqlite3`, separate from `/data/gem_prices.sqlite3`.
+  and frontend services in EU-West (`europe-west4-drams3a`). The canonical website is
+  `https://steamally.com`; the browser uses this origin for both UI and `/api`. Caddy proxies API traffic to the
+  backend. The attached `backend-data` volume is mounted at `/data`; the global market cache
+  uses `/data/steamapis_prices.sqlite3`, separate from `/data/gem_prices.sqlite3`.
 - **License:** GNU Affero General Public License v3.0, preserving source availability for
   modified hosted versions.
 
@@ -397,7 +397,7 @@ preventing their update or deletion, allowing the repository-scoped `GITHUB_TOKE
 validated release tag.
 
 The workflow uses Railway CLI 5.44.1 to upload `./backend` and then `./frontend` with
-`--path-as-root`, explicitly selecting the project, `production` environment, and service. It
+`--path-as-root --ci`, explicitly selecting the project, `production` environment, and service and waiting for the deployment verdict. It
 does not use Railway native branch autodeploy, `--detach`, or deprecated `railway.toml` or
 `railway.json` configuration. Infrastructure is managed separately with the current
 `.railway/railway.ts`, which
@@ -411,9 +411,9 @@ Configure the following before a production release:
   `a6d0c0d3-2a41-486b-9f3b-1de0db5da949`.
 - GitHub `production` environment secret `RAILWAY_TOKEN` must be a Railway project token scoped
   to this project, not an account- or workspace-wide token. Never commit or print this secret.
-- GitHub `production` environment variables `BACKEND_URL` and `FRONTEND_URL` must contain the
-  actual public URLs of the deployed services. Their values are intentionally not documented
-  here.
+- GitHub `production` environment variable `FRONTEND_URL` must be `https://steamally.com`;
+  `BACKEND_URL` must be the actual public backend service URL. Release smoke checks verify
+  Steam Ally branding, FAQ routing, and canonical Steam OpenID realm and callback URLs.
 - The Railway backend service requires `ENVIRONMENT=production`, an exact frontend-origin JSON
   list in `ALLOWED_ORIGINS`, `FRONTEND_URL` and `PUBLIC_BACKEND_URL` set to the frontend origin,
   a random `SIGNING_SECRET` of at least 32 characters, `COOKIE_SECURE=true`, and

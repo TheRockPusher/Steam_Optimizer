@@ -1409,7 +1409,7 @@ function Brand({ currentPage }: { currentPage: PageKind }) {
     <a
       className="brand"
       href="/"
-      aria-label="Steam Optimizer home"
+      aria-label="Steam Ally home"
       aria-current={currentPage === "home" ? "page" : undefined}
     >
       <span className="brand-mark" aria-hidden="true">
@@ -1418,7 +1418,7 @@ function Brand({ currentPage }: { currentPage: PageKind }) {
           <path d="m7.5 12 3 3 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </span>
-      <span className="brand-name">Steam Optimizer</span>
+      <span className="brand-name">Steam Ally</span>
     </a>
   );
 }
@@ -1452,7 +1452,7 @@ function SiteHeader({
 function SiteFooter() {
   return (
     <footer className="site-footer">
-      <p>Steam Optimizer</p>
+      <p>Steam Ally</p>
       <div className="footer-links">
         <a href="/faq">FAQ</a>
         <a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer">
@@ -3215,10 +3215,10 @@ const InventoryFaq = memo(function InventoryFaq({
           </div>
         </details>
         <details className="inventory-faq-item">
-          <summary>Can Steam Optimizer change my Steam account?</summary>
+          <summary>Can Steam Ally change my Steam account?</summary>
           <div className="inventory-faq-answer">
             <p>
-              No. Steam Optimizer only reads information Steam exposes
+              No. Steam Ally only reads information Steam exposes
               publicly. It cannot trade, sell, craft, or change your account.
               Any future account action stays manual and happens on Steam.
             </p>
@@ -4047,7 +4047,7 @@ function HomePage() {
 
   return (
     <div className="app-shell">
-      <title>Steam Optimizer</title>
+      <title>Steam Ally</title>
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
@@ -4108,7 +4108,7 @@ function HomePage() {
                         src={steamSignInWide}
                         width="180"
                         height="35"
-                        alt="Steam sign-in; Steam Optimizer is not affiliated with Valve"
+                        alt="Steam sign-in; Steam Ally is not affiliated with Valve"
                       />
                     </picture>
                   </a>
@@ -4193,7 +4193,7 @@ function HomePage() {
 function FaqPage() {
   return (
     <div className="app-shell">
-      <title>FAQ | Steam Optimizer</title>
+      <title>FAQ | Steam Ally</title>
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
@@ -4210,9 +4210,9 @@ function FaqPage() {
 
         <div className="faq-list">
           <section id="account-access">
-            <h2>Can Steam Optimizer change my account?</h2>
+            <h2>Can Steam Ally change my account?</h2>
             <p>
-              No. Steam Optimizer reads public Steam Community data. It cannot
+              No. Steam Ally reads public Steam Community data. It cannot
               trade, sell, craft, buy, or change your account. Any action you
               choose stays manual and happens on Steam.
             </p>
@@ -4380,7 +4380,7 @@ function FaqPage() {
           <section id="affiliation">
             <h2>Is this affiliated with Valve?</h2>
             <p>
-              No. Steam Optimizer is an independent open-source project and is
+              No. Steam Ally is an independent open-source project and is
               not affiliated with Valve.
             </p>
           </section>

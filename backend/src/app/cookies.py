@@ -80,7 +80,7 @@ class SignedCookieCodec:
             raise InvalidCookiePurposeError
         return hmac.new(
             self.secret.encode("utf-8"),
-            b"steam-optimizer-cookie:" + purpose.encode("ascii"),
+            b"steamally-cookie:" + purpose.encode("ascii"),
             hashlib.sha256,
         ).digest()
 

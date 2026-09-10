@@ -393,7 +393,7 @@ wheels = [
 ]
 
 [[package]]
-name = "steam-optimizer-backend"
+name = "steamally-backend"
 version = "1.2.0"
 source = { editable = "." }
 dependencies = [

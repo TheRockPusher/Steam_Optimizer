@@ -47,7 +47,7 @@ export default defineRailway(() => {
     },
   });
 
-  return project("steam-optimizer", {
+  return project("steamally", {
     resources: [frontend, backend, backendData],
   });
 });

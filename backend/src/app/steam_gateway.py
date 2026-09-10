@@ -98,8 +98,8 @@ STEAMAPIS_INVENTORY_ENDPOINT = (
 STEAMAPIS_ITEMS_ENDPOINT = f"{STEAMAPIS_BASE_URL}/v2/steam/items/753/list"
 STEAMAPIS_CARDS_ENDPOINT = f"{STEAMAPIS_BASE_URL}/market/items/cards"
 STEAM_ICON_BASE_URL = "https://community.cloudflare.steamstatic.com/economy/image/"
-STEAM_OPTIMIZER_USER_AGENT = (
-    "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+STEAMALLY_USER_AGENT = (
+    "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
 _CANONICAL_SACK_PRICE_ERROR = "Sack price must be a canonical decimal."
 _GEM_CASH_CONTEXT_QUOTE_ERROR = "At least one sack price quote is required."
@@ -2406,7 +2406,7 @@ class SteamApisClient:
         key = self._api_key
         if key is None:
             return None
-        return {"x-api-key": key, "User-Agent": STEAM_OPTIMIZER_USER_AGENT}
+        return {"x-api-key": key, "User-Agent": STEAMALLY_USER_AGENT}
 
     async def fetch_inventory(self, steam_id: str) -> InventoryCheck:
         task = self._inventory_inflight.get(steam_id)
@@ -2854,7 +2854,7 @@ class SteamApisClient:
         a message that embeds the request URL.
         """
 
-        headers = {"User-Agent": STEAM_OPTIMIZER_USER_AGENT}
+        headers = {"User-Agent": STEAMALLY_USER_AGENT}
         response = await self.http_client.get(
             STEAMAPIS_CARDS_ENDPOINT,
             params={"api_key": api_key},

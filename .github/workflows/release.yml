@@ -284,7 +284,7 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
-        run: railway up ./backend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service backend
+        run: railway up ./backend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service backend --ci
 
   smoke-backend:
     name: Smoke check backend
@@ -323,7 +323,7 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
-        run: railway up ./frontend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service frontend
+        run: railway up ./frontend --path-as-root --project "$RAILWAY_PROJECT_ID" --environment production --service frontend --ci
 
   smoke-frontend:
     name: Smoke check frontend
@@ -337,6 +337,40 @@ jobs:
     steps:
       - name: Check frontend root
         run: curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors "${{ vars.FRONTEND_URL }}/"
+      - name: Check Steam Ally page titles
+        env:
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import time
+          from urllib.request import urlopen
+
+          frontend_url = os.environ["FRONTEND_URL"].rstrip("/")
+
+          def page_html(path):
+              for attempt in range(5):
+                  try:
+                      with urlopen(f"{frontend_url}{path}", timeout=20) as response:
+                          return response.read().decode("utf-8", "replace")
+                  except OSError:
+                      if attempt == 4:
+                          raise
+                      time.sleep(5)
+
+          for path in ("/", "/faq"):
+              html = page_html(path)
+              match = re.search(r"<title[^>]*>(.*?)</title>", html, re.DOTALL)
+              if match is None:
+                  raise SystemExit(f"No HTML title served at {frontend_url}{path}.")
+              title = " ".join(match.group(1).split())
+              if "Steam Ally" not in title:
+                  raise SystemExit(
+                      f"Page at {frontend_url}{path} is not Steam Ally branded: {title!r}"
+                  )
+              print(f"{frontend_url}{path} title: {title}")
+          PY
       - name: Check proxied authentication endpoints
         env:
           FRONTEND_URL: ${{ vars.FRONTEND_URL }}
@@ -393,6 +427,9 @@ jobs:
           expected_callback = f"{frontend_url}/api/auth/steam/callback?state="
           if not return_to.startswith(expected_callback):
               raise SystemExit(f"Unexpected OpenID return_to: {return_to}")
+          realm = parameters.get("openid.realm", [""])[0]
+          if realm != f"{frontend_url}/":
+              raise SystemExit(f"Unexpected OpenID realm: {realm}")
 
           state_cookie = redirect_response.headers.get("Set-Cookie", "")
           required_attributes = ("HttpOnly", "Secure", "SameSite=lax")
@@ -497,6 +534,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: Steam Ally ${{ needs.prepare.outputs.release_tag }}
           body_path: RELEASE_NOTES.md
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           target_commitish: ${{ needs.prepare.outputs.release_commit }}

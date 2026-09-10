@@ -1,4 +1,4 @@
-[Steam Optimizer](https://github.com/TheRockPusher/Steam_Optimizer) is a read-only Steam
+[Steam Ally](https://github.com/TheRockPusher/Steam_Optimizer) is a read-only Steam
 Community inventory adviser for Steam users, written in
 [TypeScript](https://www.typescriptlang.org/) and [Python](https://www.python.org/) and
 released under the [GNU AGPL v3.0](LICENSE).
@@ -445,7 +445,7 @@ release notes in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Privacy and Steam Data Policy
 
-This section is Steam Optimizer's published privacy policy. It applies to the deployed service and
+This section is Steam Ally's published privacy policy. It applies to the deployed service and
 was last updated on 2026-09-05.
 
 - Data handling and privacy policy: the browser redirects to Steam for login, and the backend
@@ -454,7 +454,7 @@ was last updated on 2026-09-05.
   authenticated requests and cleared by logout or expiry. The session endpoint checks profile
   visibility and the current badge snapshot concurrently; it does not request inventory. Only
   validated XP, level, `checked_at`, and normal badge levels reach React memory, and no badge data
-  or inventory data is placed in a cookie. Steam handles passwords and Steam Guard; Steam Optimizer
+  or inventory data is placed in a cookie. Steam handles passwords and Steam Guard; Steam Ally
   never receives or stores either.
 - Inventory retention and refresh: after authentication, the client reads one current-user browser
   IndexedDB record keyed to SteamID64. A valid matching public/private record is rendered without
@@ -523,7 +523,7 @@ was last updated on 2026-09-05.
   unavailable state and no partial plan. `estimated seller receipt` and `unspent swap proceeds`
   are estimates, not received funds; taxes, holds, and the current wallet balance are excluded.
 - Manual Steam navigation: Market listing and gamecards links are constructed from fixed
-  `steamcommunity.com` origins. They are ordinary navigation only; Steam Optimizer never lists,
+  `steamcommunity.com` origins. They are ordinary navigation only; Steam Ally never lists,
   orders, buys, sells, trades, or crafts on the user's behalf, and it never accepts provider URLs.
   Users must recheck live Steam prices, fills, and confirmations before taking any manual action.
 - Sign-in branding: the local button uses the [Steam-requested sign-in
