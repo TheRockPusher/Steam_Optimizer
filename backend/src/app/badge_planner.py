@@ -1,17 +1,26 @@
-"""Pure badge dashboard and goal/budget planner domain.
+"""Pure badge dashboard, goal/budget/collector planner, and sale-alternative domain.
 
-Scope is explicitly ``inventory_normal_badges``: only normal game badges whose
-cards are represented by the request inventory (or the request game rows)
-appear in the dashboard, and only those games are ever planned.  The module is
-read-only with respect to Steam: it prices hypothetical purchases from the
-resolved catalog's top asks and never folds projected sale receipts into the
-wallet budget.
+The dashboard universe is selected per request via ``options.scope``:
+
+* ``inventory`` — only normal game badges whose cards are represented by the
+  request inventory (or the request game rows) appear in the dashboard, and
+  every assembled game is eligible for planning (v1.1 behavior).
+* ``selected`` — every inventory-covered row stays visible for ownership and
+  protection validation, but only ``selected_app_ids`` games are eligible
+  crafts.
+* ``catalog`` — every full set of the resolved provider generation joins the
+  dashboard as a discovered candidate (inventory rows retained); each
+  candidate can be planned from scratch out of purchases plus owned copies.
+
+The module is read-only with respect to Steam: it prices hypothetical
+purchases from the resolved catalog's top asks and never folds projected sale
+receipts into the wallet budget.
 
 The dashboard shows every known game row, including unresolved, maxed,
 reserved and excluded games, and never treats an absent or stale quote as a
-zero price.  Ready owned sets do not depend on monetary prices: a complete set
-whose available (post-protection) copies cover a craft is craftable with zero
-spend even when no quote is usable.
+zero price.  Ready owned sets do not depend on monetary prices: a complete
+set whose available (post-protection) copies cover a craft is craftable with
+zero spend even when no quote is usable.
 
 Planning returns three comparable deterministic policies over the same
 constraint envelope (budget, badge cap of five, protections, and cumulative
@@ -28,6 +37,25 @@ top-ask depth):
 * ``preserve_cards`` prefers marginal crafts that consume fewer owned copies,
   then cheaper ones, so intact owned sets are left unspent when the budget
   allows buying replacements.  It is likewise a heuristic.
+
+Modes.  ``target`` and ``budget`` keep their exact prior semantics.
+``collector`` carries per-game ``collector_targets`` ceilings: only targeted
+games may craft, each up to its target level, ``target_reached`` holds when
+every target level is reached, and ``shortfall_xp`` sums the missing target
+crafts times the 100 XP per craft.  Untargeted games stay visible as
+dashboard rows but never appear in collector plans.  Unknown selected or
+collector AppIDs fail the whole request closed with an ``unavailable``
+response reason instead of being ignored.
+
+Complete-set sale alternative.  When ``compare_app_id`` is set on a ready
+response, the planner prices selling exactly one complete owned, unreserved,
+marketable normal set of that game into fresh positive bid quotes, converts
+each buyer total into the exact seller receipt, removes the sold copies, and
+compares a receipt-funded replacement plan (``cheapest``, source game
+excluded from crafts and purchases) against the free-craft baseline
+(``cheapest`` with zero budget over the original holdings in the same
+eligible scope).  Wallet budget never mixes into the alternative, and the
+alternative is informational: it never triggers a transaction.
 
 ``plan_badges`` raises :class:`OptimizerInputError` only for malformed
 requests (bad option references, duplicate holdings, unusable timestamps).
@@ -47,7 +75,7 @@ from __future__ import annotations
 
 import heapq
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
@@ -86,6 +114,9 @@ from app.market_fees import MarketFeeContract
 from app.market_fees import (
     decimal_to_minor as _decimal_to_minor,
 )
+from app.market_fees import (
+    seller_receipt_from_buyer_total as _seller_receipt_from_buyer_total,
+)
 
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 900
 DEFAULT_MAX_INVENTORY_AGE_SECONDS = 3_600
@@ -93,7 +124,18 @@ MAX_BUDGET_MINOR = 1_000_000_000
 _MAX_PRICE_MINOR = (2**53 - 1) // MAX_NORMAL_SET_SIZE
 _MAX_CRAFTS_PER_BADGE = 5
 
-_PLANNING_SCOPE = "inventory_normal_badges"
+PlanningMode = Literal["target", "budget", "collector"]
+PlanningScope = Literal["inventory", "selected", "catalog"]
+PlanningScopeWire = Literal[
+    "inventory_normal_badges",
+    "selected_normal_badges",
+    "catalog_normal_badges",
+]
+_SCOPE_WIRE: dict[str, PlanningScopeWire] = {
+    "inventory": "inventory_normal_badges",
+    "selected": "selected_normal_badges",
+    "catalog": "catalog_normal_badges",
+}
 GameStatus = Literal[
     "craftable",
     "incomplete",
@@ -117,11 +159,36 @@ _TIMESTAMP_INVALID = "timestamp_invalid"
 _PROTECTION_UNKNOWN_CARD = "protection_unknown_card"
 _PROTECTION_KEEP_EXCEEDS_OWNED = "protection_keep_exceeds_owned"
 _EXCLUDED_APP_UNKNOWN = "excluded_app_unknown"
+_SELECTED_APP_UNKNOWN = "selected_app_unknown"
+_COLLECTOR_TARGET_UNKNOWN = "collector_target_unknown"
+_COLLECTOR_TARGET_OUT_OF_SCOPE = "collector_target_out_of_scope"
+_COMPARE_APP_UNKNOWN = "compare_app_unknown"
+_COMPARE_SOURCE_EXCLUDED = "compare_source_excluded"
+_SOURCE_BADGE_MAXED = "source_badge_maxed"
+_SOURCE_SET_COMPOSITION_UNKNOWN = "source_set_composition_unknown"
+_SOURCE_SET_INCOMPLETE = "source_set_incomplete"
+_SOURCE_SET_RESERVED = "source_set_reserved"
+_SOURCE_SET_PROTECTED = "source_set_protected"
 _DUPLICATE_PROTECTION_ERROR = "protections must reference each holding once"
 _EXCLUDED_APP_ERROR = "excluded_app_ids entries must be positive app IDs"
 _DUPLICATE_EXCLUSION_ERROR = "excluded_app_ids entries must be unique"
+_SELECTED_APP_ERROR = "selected_app_ids entries must be positive app IDs"
+_DUPLICATE_SELECTED_ERROR = "selected_app_ids entries must be unique"
+_COMPARE_APP_ERROR = "compare_app_id must be a positive app ID"
+_COLLECTOR_APP_ERROR = "collector target AppIDs must be positive app IDs"
+_DUPLICATE_TARGET_ERROR = "collector target AppIDs must be unique"
 _TARGET_REQUIRED_ERROR = "target_level is required for mode 'target'"
 _TARGET_BUDGET_ERROR = "target_level must be null for mode 'budget'"
+_TARGET_COLLECTOR_ERROR = "target_level must be null for mode 'collector'"
+_COLLECTOR_TARGETS_REQUIRED_ERROR = (
+    "collector_targets are required for mode 'collector'"
+)
+_COLLECTOR_TARGETS_FORBIDDEN_ERROR = (
+    "collector_targets must be empty unless mode is 'collector'"
+)
+_SELECTED_REQUIRED_ERROR = "selected_app_ids are required for scope 'selected'"
+_SELECTED_FORBIDDEN_ERROR = "selected_app_ids must be empty unless scope is 'selected'"
+_MAX_SCOPE_SELECTIONS = 1_000
 _PRICE_AVAILABILITY_REASONS = frozenset(
     {
         "price_generation_unavailable",
@@ -138,6 +205,31 @@ _PRICE_AVAILABILITY_REASONS = frozenset(
 # Request options
 
 
+def _validated_app_id_text(value: object, error: str) -> int:
+    """Parse a bounded positive app-ID text or raise the request error."""
+    if not isinstance(value, str) or _APP_ID_TEXT_RE.fullmatch(value) is None:
+        raise ValueError(error)
+    app_id = int(value)
+    if app_id > MAX_APP_ID:
+        raise ValueError(error)
+    return app_id
+
+
+class BadgeCollectorTarget(BaseModel):
+    """One collector goal: a game plus the badge level to stop crafting at."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: Annotated[StrictStr, Field(max_length=20)]
+    target_level: StrictInt = Field(ge=1, le=_MAX_CRAFTS_PER_BADGE)
+
+    @field_validator("app_id")
+    @classmethod
+    def validate_app_id(cls, value: str) -> str:
+        _validated_app_id_text(value, _COLLECTOR_APP_ERROR)
+        return value
+
+
 class BadgeProtectionOptions(BaseModel):
     """One protected holding: copies kept out of crafting, selling and gemming."""
 
@@ -152,16 +244,28 @@ class BadgePlanningOptions(BaseModel):
     """Strict planner options validated at the domain boundary.
 
     ``budget_minor`` is the real available Steam Wallet spending ceiling in
-    minor units for both modes; projected sale receipts are never part of it.
+    minor units for every mode; projected sale receipts are never part of it.
     ``target_level`` is required for ``mode="target"`` and must stay ``None``
-    for ``mode="budget"``.
+    for ``mode="budget"`` and ``mode="collector"``.  ``selected_app_ids`` is
+    nonempty exactly for ``scope="selected"`` and ``collector_targets`` is
+    nonempty exactly for ``mode="collector"``.  ``compare_app_id`` asks for
+    the on-demand complete-set sale alternative and never triggers a
+    transaction.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["target", "budget"]
+    mode: PlanningMode
     target_level: StrictInt | None = Field(default=None, ge=0, le=MAX_PLAYER_LEVEL)
     budget_minor: StrictInt = Field(ge=0, le=MAX_BUDGET_MINOR)
+    scope: PlanningScope = "inventory"
+    selected_app_ids: list[Annotated[StrictStr, Field(max_length=20)]] = Field(
+        default_factory=list, max_length=_MAX_SCOPE_SELECTIONS
+    )
+    collector_targets: list[BadgeCollectorTarget] = Field(
+        default_factory=list, max_length=_MAX_SCOPE_SELECTIONS
+    )
+    compare_app_id: StrictStr | None = None
     excluded_app_ids: list[Annotated[StrictStr, Field(max_length=20)]] = Field(
         default_factory=list, max_length=10_000
     )
@@ -186,14 +290,41 @@ class BadgePlanningOptions(BaseModel):
     def validate_excluded_app_ids(cls, value: list[str]) -> list[str]:
         seen: set[int] = set()
         for item in value:
-            if _APP_ID_TEXT_RE.fullmatch(item) is None:
-                raise ValueError(_EXCLUDED_APP_ERROR)
-            app_id = int(item)
-            if app_id > MAX_APP_ID:
-                raise ValueError(_EXCLUDED_APP_ERROR)
+            app_id = _validated_app_id_text(item, _EXCLUDED_APP_ERROR)
             if app_id in seen:
                 raise ValueError(_DUPLICATE_EXCLUSION_ERROR)
             seen.add(app_id)
+        return value
+
+    @field_validator("selected_app_ids")
+    @classmethod
+    def validate_selected_app_ids(cls, value: list[str]) -> list[str]:
+        seen: set[int] = set()
+        for item in value:
+            app_id = _validated_app_id_text(item, _SELECTED_APP_ERROR)
+            if app_id in seen:
+                raise ValueError(_DUPLICATE_SELECTED_ERROR)
+            seen.add(app_id)
+        return value
+
+    @field_validator("collector_targets")
+    @classmethod
+    def validate_unique_targets(
+        cls, value: list[BadgeCollectorTarget]
+    ) -> list[BadgeCollectorTarget]:
+        seen: set[int] = set()
+        for target in value:
+            app_id = _validated_app_id_text(target.app_id, _COLLECTOR_APP_ERROR)
+            if app_id in seen:
+                raise ValueError(_DUPLICATE_TARGET_ERROR)
+            seen.add(app_id)
+        return value
+
+    @field_validator("compare_app_id")
+    @classmethod
+    def validate_compare_app_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validated_app_id_text(value, _COMPARE_APP_ERROR)
         return value
 
     @model_validator(mode="after")
@@ -202,7 +333,21 @@ class BadgePlanningOptions(BaseModel):
             if self.target_level is None:
                 raise ValueError(_TARGET_REQUIRED_ERROR)
         elif self.target_level is not None:
-            raise ValueError(_TARGET_BUDGET_ERROR)
+            raise ValueError(
+                _TARGET_BUDGET_ERROR
+                if self.mode == "budget"
+                else _TARGET_COLLECTOR_ERROR
+            )
+        if self.mode == "collector":
+            if not self.collector_targets:
+                raise ValueError(_COLLECTOR_TARGETS_REQUIRED_ERROR)
+        elif self.collector_targets:
+            raise ValueError(_COLLECTOR_TARGETS_FORBIDDEN_ERROR)
+        if self.scope == "selected":
+            if not self.selected_app_ids:
+                raise ValueError(_SELECTED_REQUIRED_ERROR)
+        elif self.selected_app_ids:
+            raise ValueError(_SELECTED_FORBIDDEN_ERROR)
         return self
 
 
@@ -243,6 +388,7 @@ class BadgeGame(BaseModel):
     completion_cost_minor: StrictInt | None = Field(default=None, ge=0)
     status: GameStatus
     reason: StrictStr
+    target_badge_level: StrictInt | None = Field(default=None, ge=1, le=5)
     cards: list[BadgeCard]
 
 
@@ -297,6 +443,45 @@ class BadgePlan(BaseModel):
     steps: list[BadgeStep]
 
 
+class BadgeSale(BaseModel):
+    """One exact bid-backed sale of a single card copy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    market_hash_name: StrictStr
+    card_name: StrictStr
+    quantity: StrictInt = Field(ge=1)
+    buyer_total_minor: StrictInt = Field(ge=1)
+    seller_receipt_minor: StrictInt = Field(ge=0)
+    quote_timestamp: StrictStr
+
+
+class BadgeOpportunity(BaseModel):
+    """On-demand complete-set sale alternative; informational, never transacted.
+
+    A ready opportunity sold exactly one complete owned, unreserved, marketable
+    set of ``app_id`` into fresh positive bids: ``net_proceeds_minor`` is the
+    summed exact seller receipt, ``replacement_plan`` spends only those
+    receipts outside the source game, and ``baseline_plan`` free-crafts the
+    original holdings with zero budget in the same eligible scope.
+    ``additional_xp`` compares the two and may be negative.  An unavailable
+    opportunity carries no quotes, proceeds, or plans.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: StrictStr
+    status: Literal["ready", "unavailable"]
+    reason: StrictStr
+    net_proceeds_minor: StrictInt | None = Field(default=None, ge=0)
+    craft_xp: StrictInt = Field(ge=0)
+    sales: list[BadgeSale]
+    replacement_plan: BadgePlan | None = None
+    baseline_plan: BadgePlan | None = None
+    additional_xp: StrictInt | None = None
+    valid_until: StrictStr | None = None
+
+
 class BadgePlanningResponse(BaseModel):
     """Full badge dashboard plus the three comparable plans."""
 
@@ -312,9 +497,11 @@ class BadgePlanningResponse(BaseModel):
     badge_refreshed_at: StrictStr
     player_xp: StrictInt = Field(ge=0)
     player_level: StrictInt = Field(ge=0)
-    scope: Literal["inventory_normal_badges"]
+    scope: PlanningScopeWire
     games: list[BadgeGame]
     plans: list[BadgePlan]
+    opportunity: BadgeOpportunity | None
+    evaluated_game_count: StrictInt = Field(ge=0)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +524,7 @@ class _CardStock:
     market_hash_name: str
     card_name: str
     owned_quantity: int
+    sellable_quantity: int
     keep_quantity: int
     never_sell: bool
     available_quantity: int
@@ -344,6 +532,10 @@ class _CardStock:
     buy_quantity: int | None
     quote_timestamp: datetime | None
     quote_state: _QuoteState | None = None
+    sell_price_minor: int | None = None
+    sell_quantity: int | None = None
+    sell_timestamp: datetime | None = None
+    sell_state: _QuoteState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +593,23 @@ class _StrategyRun:
     executed: Mapping[int, int]
     spend_minor: int
     budget_blocked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanIntent:
+    """Mode-derived planning envelope for one response.
+
+    ``crafts_needed`` caps total crafts for ``target`` (player threshold) and
+    ``collector`` (summed per-game shortfalls); it is ``None`` for ``budget``.
+    ``per_game_crafts`` carries collector per-game needs so marginals stop at
+    each target ceiling, and ``targets`` repeats the requested goal mapping.
+    """
+
+    mode: PlanningMode
+    target_level: int | None
+    crafts_needed: int | None
+    targets: Mapping[int, int]
+    per_game_crafts: Mapping[int, int]
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +740,7 @@ def _normalize_protections(
 
 def _validated_excluded_app_ids(
     excluded_app_ids: Sequence[str],
-    known_app_ids: Mapping[int, object],
+    known_app_ids: Collection[int],
 ) -> frozenset[int]:
     excluded: set[int] = set()
     for text in excluded_app_ids:
@@ -552,23 +761,23 @@ def _validated_excluded_app_ids(
 # Quote validation
 
 
-def _validated_ask(
-    card: CatalogCard, context: _PricingContext
+def _validated_quote(
+    price_text: str | None,
+    quantity: object,
+    timestamp_value: object,
+    context: _PricingContext,
 ) -> tuple[tuple[int, int, datetime] | None, _QuoteState]:
-    """Return the validated top-ask quote plus why it is unusable otherwise.
+    """Validate one side quote and say why it is unusable otherwise.
 
-    The ask is the exact buyer total, so no fee conversion is applied again.
-    Stale, future, missing, or nonpositive quotes are rejected; they are
-    never coerced into a zero price.  ``stale`` marks ask data whose quote
+    Quote prices are exact buyer totals, so no fee conversion is applied
+    again.  Stale, future, missing, or nonpositive quotes are rejected; they
+    are never coerced into a zero price.  ``stale`` marks data whose quote
     timestamp left the freshness window or sits in the future; ``missing``
-    marks absent or invalid ask data.  Only ``valid`` yields a quote.
+    marks absent or invalid data.  Only ``valid`` yields a quote.
     """
     contract = context.contract
     if contract is None:
         return None, "missing"
-    price_text = card.lowest_sell
-    quantity = card.lowest_sell_quantity
-    timestamp_value = card.lowest_sell_observed_at or card.observed_at
     if price_text is None or quantity is None or timestamp_value is None:
         return None, "missing"
     if isinstance(quantity, bool) or not isinstance(quantity, int):
@@ -590,6 +799,36 @@ def _validated_ask(
     return (price_minor, quantity, timestamp), "valid"
 
 
+def _validated_ask(
+    card: CatalogCard, context: _PricingContext
+) -> tuple[tuple[int, int, datetime] | None, _QuoteState]:
+    """Return the validated top-ask quote plus why it is unusable otherwise."""
+    return _validated_quote(
+        card.lowest_sell,
+        card.lowest_sell_quantity,
+        card.lowest_sell_observed_at or card.observed_at,
+        context,
+    )
+
+
+def _validated_bid(
+    card: CatalogCard, context: _PricingContext
+) -> tuple[tuple[int, int, datetime] | None, _QuoteState]:
+    """Return the validated top-bid quote plus why it is unusable otherwise.
+
+    A sale is modeled as selling into the current top bid: the buyer total
+    is the bid price and the exact seller receipt comes from the fee
+    contract inversion.  Positive depth is required because the alternative
+    sells exactly one copy of each source card.
+    """
+    return _validated_quote(
+        card.highest_buy,
+        card.highest_buy_quantity,
+        card.highest_buy_observed_at or card.observed_at,
+        context,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Game assembly
 
@@ -600,6 +839,8 @@ def _build_card_stocks(
     holdings_by_hash: Mapping[str, Holding],
     game_hashes: Sequence[str],
     protections: Mapping[str, tuple[int, bool]],
+    *,
+    sell_quotes: bool = False,
 ) -> tuple[_CardStock, ...]:
     cards_by_hash: dict[str, CatalogCard] = {}
     if catalog_set is not None:
@@ -615,11 +856,17 @@ def _build_card_stocks(
             parsed = parse_normal_card_hash(market_hash_name)
             card_name = parsed[1] if parsed is not None else market_hash_name
         owned_quantity = holding.owned_quantity if holding is not None else 0
+        sellable_quantity = holding.sellable_quantity if holding is not None else 0
         keep_quantity, never_sell = protections.get(market_hash_name, (0, False))
         keep_quantity = min(keep_quantity, owned_quantity)
-        quote, quote_state = (
+        ask, ask_state = (
             _validated_ask(catalog_card, context)
             if catalog_card is not None
+            else (None, None)
+        )
+        bid, bid_state = (
+            _validated_bid(catalog_card, context)
+            if sell_quotes and catalog_card is not None
             else (None, None)
         )
         stocks.append(
@@ -627,13 +874,18 @@ def _build_card_stocks(
                 market_hash_name=market_hash_name,
                 card_name=card_name,
                 owned_quantity=owned_quantity,
+                sellable_quantity=sellable_quantity,
                 keep_quantity=keep_quantity,
                 never_sell=never_sell,
                 available_quantity=max(0, owned_quantity - keep_quantity),
-                buy_price_minor=quote[0] if quote is not None else None,
-                buy_quantity=quote[1] if quote is not None else None,
-                quote_timestamp=quote[2] if quote is not None else None,
-                quote_state=quote_state,
+                buy_price_minor=ask[0] if ask is not None else None,
+                buy_quantity=ask[1] if ask is not None else None,
+                quote_timestamp=ask[2] if ask is not None else None,
+                quote_state=ask_state,
+                sell_price_minor=bid[0] if bid is not None else None,
+                sell_quantity=bid[1] if bid is not None else None,
+                sell_timestamp=bid[2] if bid is not None else None,
+                sell_state=bid_state,
             )
         )
     return tuple(stocks)
@@ -647,6 +899,9 @@ def _build_games(
     excluded_app_ids: frozenset[int],
     protections: Mapping[str, tuple[int, bool]],
     badges: BadgeState,
+    *,
+    extra_app_ids: frozenset[int] = frozenset(),
+    sell_quote_app_id: int | None = None,
 ) -> list[_GameStock]:
     sets_by_app: dict[int, CatalogSet] = {}
     if catalog is not None:
@@ -659,7 +914,7 @@ def _build_games(
             # Holding construction already guarantees parseable hashes.
             continue
         hashes_by_app.setdefault(parsed[0], []).append(market_hash_name)
-    known_app_ids = sorted(set(metadata) | set(hashes_by_app))
+    known_app_ids = sorted(set(metadata) | set(hashes_by_app) | extra_app_ids)
     games: list[_GameStock] = []
     for app_id in known_app_ids:
         metadata_name, metadata_size = metadata.get(app_id, (None, None))
@@ -702,7 +957,12 @@ def _build_games(
                 unknown_reason=unknown_reason,
                 excluded=app_id in excluded_app_ids,
                 cards=_build_card_stocks(
-                    context, catalog_set, holdings_by_hash, game_hashes, protections
+                    context,
+                    catalog_set,
+                    holdings_by_hash,
+                    game_hashes,
+                    protections,
+                    sell_quotes=app_id == sell_quote_app_id,
                 ),
             )
         )
@@ -764,7 +1024,7 @@ def _game_status(stock: _GameStock) -> tuple[GameStatus, str]:
     return ("craftable", "owned_set_ready")
 
 
-def _game_row(stock: _GameStock) -> BadgeGame:
+def _game_row(stock: _GameStock, collector_targets: Mapping[int, int]) -> BadgeGame:
     status, reason = _game_status(stock)
     return BadgeGame(
         app_id=str(stock.app_id),
@@ -779,6 +1039,7 @@ def _game_row(stock: _GameStock) -> BadgeGame:
         completion_cost_minor=_completion_cost_minor(stock),
         status=status,
         reason=reason,
+        target_badge_level=collector_targets.get(stock.app_id),
         cards=[
             BadgeCard(
                 market_hash_name=card.market_hash_name,
@@ -801,27 +1062,114 @@ def _game_row(stock: _GameStock) -> BadgeGame:
 
 
 # ---------------------------------------------------------------------------
+# Scope eligibility and mode intent
+
+
+def _selected_app_ids_of(options: BadgePlanningOptions) -> frozenset[int]:
+    return frozenset(int(text) for text in options.selected_app_ids)
+
+
+def _collector_targets_of(options: BadgePlanningOptions) -> dict[int, int]:
+    return {
+        int(target.app_id): target.target_level for target in options.collector_targets
+    }
+
+
+def _scope_eligible_stocks(
+    games: Sequence[_GameStock], options: BadgePlanningOptions
+) -> dict[int, _GameStock]:
+    """Stocks allowed to craft under the request scope alone.
+
+    ``selected`` scope limits crafts to ``selected_app_ids`` while every
+    inventory row stays visible on the dashboard; inventory and catalog
+    scopes leave every assembled game eligible.  Collector targeting is NOT
+    applied here: the sale-alternative baseline and replacement ignore the
+    original collector constraints and compare across the whole scope.
+    """
+    selected = _selected_app_ids_of(options) if options.scope == "selected" else None
+    eligible: dict[int, _GameStock] = {}
+    for stock in games:
+        if selected is not None and stock.app_id not in selected:
+            continue
+        eligible[stock.app_id] = stock
+    return eligible
+
+
+def _plan_eligible_stocks(
+    games: Sequence[_GameStock], options: BadgePlanningOptions
+) -> dict[int, _GameStock]:
+    """Stocks the three comparable plans may craft in.
+
+    Collector mode narrows the scope-eligible set to the targeted games;
+    untargeted games stay dashboard rows but never enter collector plans.
+    """
+    eligible = _scope_eligible_stocks(games, options)
+    if options.mode != "collector":
+        return eligible
+    targeted = _collector_targets_of(options)
+    return {app_id: stock for app_id, stock in eligible.items() if app_id in targeted}
+
+
+def _plan_intent(options: BadgePlanningOptions, badges: BadgeState) -> _PlanIntent:
+    """Derive the shared planning envelope from the validated options."""
+    targets: Mapping[int, int] = {}
+    per_game: Mapping[int, int] = {}
+    crafts_needed: int | None = None
+    target_level: int | None = None
+    if options.mode == "target":
+        target_level = options.target_level
+        if target_level is not None:
+            threshold = minimum_xp(target_level)
+            crafts_needed = max(
+                0, -(-(threshold - badges.player_xp) // NORMAL_BADGE_XP)
+            )
+    elif options.mode == "collector":
+        targets = _collector_targets_of(options)
+        # Zero-need targets stay in the mapping: their craft ceiling of zero
+        # must close the game's marginal sequence entirely, so an
+        # already-satisfied target is never crafted past again.
+        per_game = {
+            app_id: max(0, goal - badges.level_for_game(app_id))
+            for app_id, goal in targets.items()
+        }
+        crafts_needed = sum(per_game.values())
+    return _PlanIntent(
+        mode=options.mode,
+        target_level=target_level,
+        crafts_needed=crafts_needed,
+        targets=targets,
+        per_game_crafts=per_game,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Marginal craft planning
 
 
-def _game_marginals(stock: _GameStock) -> _GameMarginals | None:
+def _game_marginals(
+    stock: _GameStock, max_crafts: int | None = None
+) -> _GameMarginals | None:
     """Build the exact nondecreasing marginal-craft sequence for one game.
 
     Craft ``j`` consumes the ``j``-th copy of every card in the set: an
     available (post-protection) owned copy when one exists, otherwise a
     purchase from the cumulative top-ask depth.  Per-game marginal costs are
     therefore nondecreasing in ``j``, which makes the shared prefix heap
-    exact for the ``cheapest`` policy.
+    exact for the ``cheapest`` policy.  ``max_crafts`` caps the sequence at a
+    mode ceiling, e.g. the collector target level.
     """
     if stock.excluded or stock.composition != "full":
         return None
     if stock.badge_level >= _MAX_CRAFTS_PER_BADGE or not stock.cards:
         return None
+    ceiling = _MAX_CRAFTS_PER_BADGE - stock.badge_level
+    if max_crafts is not None:
+        ceiling = min(ceiling, max(0, max_crafts))
     caps: list[int] = []
     for card in stock.cards:
         depth = card.buy_quantity or 0
         caps.append(card.available_quantity + depth)
-    total = min(_MAX_CRAFTS_PER_BADGE - stock.badge_level, *caps)
+    total = min(ceiling, *caps)
     if total <= 0:
         return None
     marginals: list[_Marginal] = []
@@ -953,13 +1301,43 @@ def _plan_steps(
     return tuple(steps)
 
 
+def _collector_outcome(
+    intent: _PlanIntent,
+    run: _StrategyRun,
+    craft_count: int,
+) -> tuple[bool, int, PlanStatus, str]:
+    """Complete-target status: reached only when every target level is met.
+
+    ``shortfall_xp`` sums the missing target crafts times the per-craft XP;
+    target ceilings keep ``craft_count`` at or below the summed needs, so the
+    plan is ready exactly when every collector goal is satisfied.
+    """
+    missing_crafts = 0
+    for app_id, need in intent.per_game_crafts.items():
+        missing_crafts += max(0, need - run.executed.get(app_id, 0))
+    shortfall = missing_crafts * NORMAL_BADGE_XP
+    if intent.crafts_needed is None or intent.crafts_needed <= 0:
+        return True, 0, "no_opportunity", "target_already_met"
+    if missing_crafts == 0:
+        return True, 0, "ready", "target_reached"
+    if craft_count > 0:
+        status: PlanStatus = "partial"
+        reason = (
+            "budget_insufficient" if run.budget_blocked else "craft_depth_insufficient"
+        )
+    else:
+        status = "no_opportunity"
+        reason = "budget_insufficient" if run.budget_blocked else "no_crafts_available"
+    return False, shortfall, status, reason
+
+
 def _build_plan(
     strategy: PlanStrategy,
     run: _StrategyRun,
     stocks_by_app: Mapping[int, _GameStock],
     *,
     badges: BadgeState,
-    target_level: int | None,
+    intent: _PlanIntent,
     budget_minor: int,
 ) -> BadgePlan:
     steps = _plan_steps(run, stocks_by_app)
@@ -970,10 +1348,16 @@ def _build_plan(
     purchase_count = sum(
         purchase.quantity for step in steps for purchase in step.purchases
     )
-    if target_level is None:
+    if intent.mode == "collector":
+        target_level = None
+        target_reached, shortfall, status, reason = _collector_outcome(
+            intent, run, craft_count
+        )
+    elif intent.target_level is None:
         # Budget mode maximizes craft XP under the wallet ceiling; there is
         # no target threshold, so shortfall stays zero and the plan is ready
         # whenever at least one craft fits.
+        target_level = None
         target_reached = False
         shortfall = 0
         if craft_count == 0:
@@ -983,8 +1367,9 @@ def _build_plan(
             status = "ready"
             reason = "xp_maximized"
     else:
+        target_level = intent.target_level
+        needed = intent.crafts_needed or 0
         threshold = minimum_xp(target_level)
-        needed = -(-(threshold - badges.player_xp) // NORMAL_BADGE_XP)
         target_reached = projection.xp >= threshold
         shortfall = max(0, threshold - projection.xp)
         if needed <= 0:
@@ -1024,24 +1409,32 @@ def _build_plan(
     )
 
 
-def _build_plans(
-    games: Sequence[_GameStock],
-    *,
-    badges: BadgeState,
-    options: BadgePlanningOptions,
-) -> list[BadgePlan]:
+def _marginals_for(
+    stocks: Mapping[int, _GameStock],
+    per_game_crafts: Mapping[int, int] | None = None,
+) -> tuple[dict[int, _GameMarginals], dict[int, _GameStock]]:
+    """Cheapest-first marginal sequences plus the priced stocks behind them."""
     marginals_by_app: dict[int, _GameMarginals] = {}
     stocks_by_app: dict[int, _GameStock] = {}
-    for stock in games:
-        game_marginals = _game_marginals(stock)
+    for app_id, stock in stocks.items():
+        game_marginals = _game_marginals(
+            stock,
+            max_crafts=None if per_game_crafts is None else per_game_crafts.get(app_id),
+        )
         if game_marginals is not None and game_marginals.marginals:
-            marginals_by_app[stock.app_id] = game_marginals
-            stocks_by_app[stock.app_id] = stock
-    target_level = options.target_level if options.mode == "target" else None
-    crafts_needed: int | None = None
-    if target_level is not None:
-        threshold = minimum_xp(target_level)
-        crafts_needed = max(0, -(-(threshold - badges.player_xp) // NORMAL_BADGE_XP))
+            marginals_by_app[app_id] = game_marginals
+            stocks_by_app[app_id] = stock
+    return marginals_by_app, stocks_by_app
+
+
+def _build_plans(
+    eligible: Mapping[int, _GameStock],
+    *,
+    badges: BadgeState,
+    intent: _PlanIntent,
+    budget_minor: int,
+) -> list[BadgePlan]:
+    marginals_by_app, stocks_by_app = _marginals_for(eligible, intent.per_game_crafts)
     plans: list[BadgePlan] = []
     strategies: tuple[PlanStrategy, ...] = (
         "cheapest",
@@ -1052,8 +1445,8 @@ def _build_plans(
         run = _run_strategy(
             strategy,
             marginals_by_app,
-            crafts_needed=crafts_needed,
-            budget_minor=options.budget_minor,
+            crafts_needed=intent.crafts_needed,
+            budget_minor=budget_minor,
         )
         plans.append(
             _build_plan(
@@ -1061,11 +1454,46 @@ def _build_plans(
                 run,
                 stocks_by_app,
                 badges=badges,
-                target_level=target_level,
-                budget_minor=options.budget_minor,
+                intent=intent,
+                budget_minor=budget_minor,
             )
         )
     return plans
+
+
+def _budget_intent() -> _PlanIntent:
+    """Unconstrained budget-mode envelope used by sale-alternative plans."""
+    return _PlanIntent(
+        mode="budget",
+        target_level=None,
+        crafts_needed=None,
+        targets={},
+        per_game_crafts={},
+    )
+
+
+def _cheapest_budget_plan(
+    stocks: Mapping[int, _GameStock],
+    *,
+    badges: BadgeState,
+    budget_minor: int,
+) -> BadgePlan:
+    """One ``cheapest`` budget-mode plan over the given eligible stocks."""
+    marginals_by_app, stocks_by_app = _marginals_for(stocks)
+    run = _run_strategy(
+        "cheapest",
+        marginals_by_app,
+        crafts_needed=None,
+        budget_minor=budget_minor,
+    )
+    return _build_plan(
+        "cheapest",
+        run,
+        stocks_by_app,
+        badges=badges,
+        intent=_budget_intent(),
+        budget_minor=budget_minor,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1527,7 @@ def _unavailable_response(
     badges: BadgeState,
     contract: MarketFeeContract | None,
     games: list[BadgeGame],
+    scope: PlanningScopeWire,
 ) -> BadgePlanningResponse:
     return BadgePlanningResponse(
         status="unavailable",
@@ -1111,14 +1540,16 @@ def _unavailable_response(
         badge_refreshed_at=_iso_utc(badge_time),
         player_xp=badges.player_xp,
         player_level=badges.player_level,
-        scope=_PLANNING_SCOPE,
+        scope=scope,
         games=games,
         plans=[],
+        opportunity=None,
+        evaluated_game_count=len(games),
     )
 
 
 def _purchase_quote_block_reason(
-    games: Sequence[_GameStock],
+    games: Iterable[_GameStock],
 ) -> str | None:
     """Diagnose plans whose purchase path could not be evaluated at all.
 
@@ -1153,6 +1584,142 @@ def _purchase_quote_block_reason(
     if not saw_purchase_candidate:
         return None
     return "price_generation_stale" if saw_stale_quote else "quote_depth_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Complete-set sale alternative
+
+
+def _opportunity_unavailable(app_id: str, reason: str) -> BadgeOpportunity:
+    """An alternative that could not be priced carries no quotes or plans."""
+    return BadgeOpportunity(
+        app_id=app_id,
+        status="unavailable",
+        reason=reason,
+        net_proceeds_minor=None,
+        craft_xp=NORMAL_BADGE_XP,
+        sales=[],
+        replacement_plan=None,
+        baseline_plan=None,
+        additional_xp=None,
+        valid_until=None,
+    )
+
+
+def _build_opportunity(
+    *,
+    games: Sequence[_GameStock],
+    eligible: Mapping[int, _GameStock],
+    badges: BadgeState,
+    options: BadgePlanningOptions,
+    context: _PricingContext,
+    response_valid_until: datetime,
+) -> BadgeOpportunity | None:
+    """Price the on-demand complete-set sale alternative, or fail it closed.
+
+    Exactly one complete owned, unreserved, marketable set of the source game
+    sells into fresh positive bids; each buyer total converts to the exact
+    seller receipt.  The sold copies then leave the holdings, the source game
+    is excluded from replacement crafts and purchases to avoid churn, and a
+    ``cheapest`` replacement plan spends only the receipts.  The baseline
+    re-runs ``cheapest`` with zero budget over the original holdings in the
+    same eligible scope, so ``additional_xp`` preserves the free-craft
+    opportunity cost and may be negative.  The Wallet budget never mixes in
+    and nothing here transacts.
+    """
+    app_id_text = options.compare_app_id
+    if app_id_text is None:
+        return None
+    app_id = int(app_id_text)
+    source = next((stock for stock in games if stock.app_id == app_id), None)
+    if source is None:
+        return _opportunity_unavailable(app_id_text, _COMPARE_APP_UNKNOWN)
+    if source.excluded:
+        return _opportunity_unavailable(app_id_text, _COMPARE_SOURCE_EXCLUDED)
+    if source.composition != "full":
+        return _opportunity_unavailable(app_id_text, _SOURCE_SET_COMPOSITION_UNKNOWN)
+    if source.badge_level >= _MAX_CRAFTS_PER_BADGE:
+        return _opportunity_unavailable(app_id_text, _SOURCE_BADGE_MAXED)
+    for card in source.cards:
+        if card.owned_quantity < 1:
+            return _opportunity_unavailable(app_id_text, _SOURCE_SET_INCOMPLETE)
+        if card.never_sell:
+            return _opportunity_unavailable(app_id_text, _SOURCE_SET_PROTECTED)
+        if card.available_quantity < 1:
+            return _opportunity_unavailable(app_id_text, _SOURCE_SET_RESERVED)
+        if card.sellable_quantity < 1:
+            return _opportunity_unavailable(app_id_text, "source_set_unmarketable")
+    contract = context.contract
+    if contract is None:
+        return _opportunity_unavailable(app_id_text, "currency_contract_missing")
+    saw_stale_bid = False
+    saw_missing_bid = False
+    for card in source.cards:
+        if card.sell_state == "stale":
+            saw_stale_bid = True
+        elif card.sell_state != "valid":
+            saw_missing_bid = True
+    if saw_stale_bid or saw_missing_bid:
+        # A stale bid names the provider-side condition the way stale asks
+        # do; entirely absent bid data stays quote_depth_unavailable.
+        return _opportunity_unavailable(
+            app_id_text,
+            "price_generation_stale" if saw_stale_bid else "quote_depth_unavailable",
+        )
+    sales: list[BadgeSale] = []
+    net_proceeds = 0
+    bid_deadline: datetime | None = None
+    for card in source.cards:
+        price = card.sell_price_minor
+        timestamp = card.sell_timestamp
+        if price is None or timestamp is None:
+            return _opportunity_unavailable(app_id_text, "quote_depth_unavailable")
+        receipt = _seller_receipt_from_buyer_total(price, contract)
+        if receipt is None:
+            return _opportunity_unavailable(app_id_text, "quote_depth_unavailable")
+        sales.append(
+            BadgeSale(
+                market_hash_name=card.market_hash_name,
+                card_name=card.card_name,
+                quantity=1,
+                buyer_total_minor=price,
+                seller_receipt_minor=receipt,
+                quote_timestamp=_iso_utc(timestamp),
+            )
+        )
+        net_proceeds += receipt
+        deadline = timestamp + context.quote_window
+        bid_deadline = deadline if bid_deadline is None else min(bid_deadline, deadline)
+    # Excluding the entire source prevents churn and makes both the sold
+    # copies and any retained source copies unavailable to replacement crafts.
+    replacement_stocks = {
+        stock_app: stock for stock_app, stock in eligible.items() if stock_app != app_id
+    }
+    replacement_plan = _cheapest_budget_plan(
+        replacement_stocks,
+        badges=badges,
+        budget_minor=net_proceeds,
+    )
+    baseline_plan = _cheapest_budget_plan(
+        eligible,
+        badges=badges,
+        budget_minor=0,
+    )
+    valid_until = response_valid_until
+    if bid_deadline is not None:
+        valid_until = min(valid_until, bid_deadline)
+    return BadgeOpportunity(
+        app_id=app_id_text,
+        status="ready",
+        reason="complete_set_sale_alternative",
+        net_proceeds_minor=net_proceeds,
+        craft_xp=NORMAL_BADGE_XP,
+        sales=sales,
+        replacement_plan=replacement_plan,
+        baseline_plan=baseline_plan,
+        additional_xp=replacement_plan.xp_gain - baseline_plan.xp_gain,
+        valid_until=_iso_utc(valid_until),
+    )
 
 
 def plan_badges(
@@ -1213,17 +1780,53 @@ def plan_badges(
         contract=contract if catalog_is_fresh and not pricing_issue else None,
     )
 
-    known_app_ids: dict[int, None] = {}
+    known_app_ids: set[int] = set()
     for holding in holdings_by_hash.values():
         parsed = parse_normal_card_hash(holding.market_hash_name)
         if parsed is not None:
-            known_app_ids.setdefault(parsed[0], None)
-    for app_id in metadata:
-        known_app_ids.setdefault(app_id, None)
-    excluded_app_ids = _validated_excluded_app_ids(
-        options.excluded_app_ids, known_app_ids
+            known_app_ids.add(parsed[0])
+    known_app_ids.update(metadata)
+    catalog_app_ids = (
+        {catalog_set.app_id for catalog_set in resolved_catalog.sets}
+        if resolved_catalog is not None
+        else set()
     )
+    # Discovered candidates join the knowledge base per scope: catalog scope
+    # plans every supported full set, while inventory and selected scope stay
+    # inside the request's inventory universe, so unknown references fail
+    # closed instead of being silently ignored.
+    knowledge = known_app_ids | (
+        catalog_app_ids if options.scope == "catalog" else set()
+    )
+    scope_block: str | None = None
+    extra_app_ids: set[int] = set()
+    selected_app_ids = _selected_app_ids_of(options)
+    collector_targets = (
+        _collector_targets_of(options) if options.mode == "collector" else {}
+    )
+    if options.scope == "selected":
+        for app_id in sorted(selected_app_ids):
+            if app_id not in knowledge:
+                scope_block = _SELECTED_APP_UNKNOWN
+                break
+            extra_app_ids.add(app_id)
+    if scope_block is None:
+        for app_id in sorted(collector_targets):
+            if app_id not in knowledge:
+                scope_block = _COLLECTOR_TARGET_UNKNOWN
+                break
+            if options.scope == "selected" and app_id not in selected_app_ids:
+                scope_block = _COLLECTOR_TARGET_OUT_OF_SCOPE
+                break
+            extra_app_ids.add(app_id)
+    if options.scope == "catalog":
+        extra_app_ids |= catalog_app_ids
+
+    excluded_app_ids = _validated_excluded_app_ids(options.excluded_app_ids, knowledge)
     protections = _normalize_protections(options.protections, holdings_by_hash)
+    compare_app_id = (
+        int(options.compare_app_id) if options.compare_app_id is not None else None
+    )
 
     games = _build_games(
         context,
@@ -1233,8 +1836,10 @@ def plan_badges(
         excluded_app_ids,
         protections,
         badges,
+        extra_app_ids=frozenset(extra_app_ids),
+        sell_quote_app_id=compare_app_id,
     )
-    game_rows = [_game_row(stock) for stock in games]
+    game_rows = [_game_row(stock, collector_targets) for stock in games]
 
     unavailable_reason = _unavailable_reason(
         current=current,
@@ -1244,6 +1849,18 @@ def plan_badges(
     )
     if unavailable_reason is None and not pricing_issue:
         unavailable_reason = availability_reason
+    scope_wire = _SCOPE_WIRE[options.scope]
+    if scope_block is not None:
+        return _unavailable_response(
+            scope_block,
+            current=current,
+            inventory_time=inventory_time,
+            badge_time=badge_time,
+            badges=badges,
+            contract=contract,
+            games=game_rows,
+            scope=scope_wire,
+        )
     if unavailable_reason is not None:
         return _unavailable_response(
             unavailable_reason,
@@ -1253,43 +1870,42 @@ def plan_badges(
             badges=badges,
             contract=contract,
             games=game_rows,
+            scope=scope_wire,
         )
 
-    plans = _build_plans(games, badges=badges, options=options)
-    if all(plan.craft_count == 0 for plan in plans):
-        target_needed = (
-            None
-            if options.mode == "budget" or options.target_level is None
-            else max(
-                0,
-                -(
-                    -(minimum_xp(options.target_level) - badges.player_xp)
-                    // NORMAL_BADGE_XP
-                ),
+    intent = _plan_intent(options, badges)
+    plan_eligible = _plan_eligible_stocks(games, options)
+    plans = _build_plans(
+        plan_eligible,
+        badges=badges,
+        intent=intent,
+        budget_minor=options.budget_minor,
+    )
+    # ``None`` (budget mode) and any positive need keep the quote-block
+    # upgrade live; only a satisfied zero-need request skips it.
+    if all(plan.craft_count == 0 for plan in plans) and intent.crafts_needed != 0:
+        quote_block = _purchase_quote_block_reason(plan_eligible.values())
+        if quote_block is not None:
+            if contract is None:
+                quote_block = "currency_contract_missing"
+            elif resolved_catalog is not None and not catalog_is_fresh:
+                quote_block = "price_generation_stale"
+            # A purchase-only plan could not be evaluated: name the quote
+            # condition instead of a misleading no_opportunity.  A known
+            # pricing reason (stale generation, missing contract) stays
+            # the more precise cause.
+            return _unavailable_response(
+                availability_reason
+                if pricing_issue and availability_reason is not None
+                else quote_block,
+                current=current,
+                inventory_time=inventory_time,
+                badge_time=badge_time,
+                badges=badges,
+                contract=contract,
+                games=game_rows,
+                scope=scope_wire,
             )
-        )
-        if target_needed != 0:
-            quote_block = _purchase_quote_block_reason(games)
-            if quote_block is not None:
-                if contract is None:
-                    quote_block = "currency_contract_missing"
-                elif resolved_catalog is not None and not catalog_is_fresh:
-                    quote_block = "price_generation_stale"
-                # A purchase-only plan could not be evaluated: name the quote
-                # condition instead of a misleading no_opportunity.  A known
-                # pricing reason (stale generation, missing contract) stays
-                # the more precise cause.
-                return _unavailable_response(
-                    availability_reason
-                    if pricing_issue and availability_reason is not None
-                    else quote_block,
-                    current=current,
-                    inventory_time=inventory_time,
-                    badge_time=badge_time,
-                    badges=badges,
-                    contract=contract,
-                    games=game_rows,
-                )
     quote_times = [
         card.quote_timestamp
         for stock in games
@@ -1315,7 +1931,20 @@ def plan_badges(
         badge_refreshed_at=_iso_utc(badge_time),
         player_xp=badges.player_xp,
         player_level=badges.player_level,
-        scope=_PLANNING_SCOPE,
+        scope=scope_wire,
         games=game_rows,
         plans=plans,
+        opportunity=_build_opportunity(
+            games=games,
+            eligible=(
+                _scope_eligible_stocks(games, options)
+                if options.mode == "collector"
+                else plan_eligible
+            ),
+            badges=badges,
+            options=options,
+            context=context,
+            response_valid_until=valid_until,
+        ),
+        evaluated_game_count=len(game_rows),
     )

@@ -8,7 +8,7 @@ released under the [GNU AGPL v3.0](LICENSE).
 [![React 19.2.8](https://img.shields.io/badge/React-19.2.8-informational)](https://react.dev/)
 [![FastAPI 0.141.1](https://img.shields.io/badge/FastAPI-0.141.1-informational)](https://fastapi.tiangolo.com/)
 
-First released in 2026; current release: 0.10.2 (2026-09-01).
+First released in 2026; current release: 1.1.0.
 [TheRockPusher](https://github.com/TheRockPusher) maintains it to make Steam inventory and
 badge decisions transparent without automating account actions.
 
@@ -109,23 +109,46 @@ The current connection, inventory, and read-only recommendation stage provides:
 - **Badges** groups normal trading cards by game, showing complete owned sets, the exact cost of
   the next craft when prices are usable, missing cards, maxed badges, reservations, and unavailable
   set information. Search, filters, and 50-game pagination keep large inventories manageable.
-- **Plan** turns a target Steam level or a wallet spending ceiling into repeated normal-badge
-  crafts, up to level five per game. It compares the exact cheapest policy within the submitted
-  inventory scope with clearly labeled fewest-purchase and preserve-owned-card heuristics.
+- **Plan** turns a target Steam level, a wallet spending ceiling, or per-game **Collector** targets
+  into repeated normal-badge crafts, up to level five per game. Choose inventory games, selected
+  games, or all supported complete normal-card sets, including games with no owned cards.
+  The complete normal-badge snapshot prevents rediscovering already-maxed badges as level zero.
+  Plans compare the exact cheapest policy in that scope with clearly labeled fewest-purchase
+  and preserve-owned-card heuristics.
   Plans show XP, projected level, remaining shortfall, purchased copies, owned cards consumed,
   exact spending, remaining budget, and manual Steam links. Every purchase consumes the shared
   quoted stock across repeated crafts; a missing price is never a zero-price purchase.
 - Set **Keep quantity** on an owned card to reserve copies from crafting and advanced sale-funded
   swaps; **Never sell** prohibits sales but still permits crafting. Exclude whole games from both
-  workflows. These preferences and goal inputs remain in React memory for the current account and
-  tab session only; they are not saved across reloads or sessions.
+  workflows. Preferences remain in memory by default. **Save current setup** optionally keeps
+  account-scoped intent on this device; a separate checkbox updates it whenever you Apply.
+  Restoring fills the draft only, not a live plan. **Forget saved setup** removes that saved intent.
+  Saved intent contains goals, scope, protections, strategy, and the entered budget/currency—not
+  inventory snapshots, badge snapshots, or quotes.
+  **Copy checklist**, **Download CSV**, and **Download JSON** export the chosen plan, required
+  purchases, goal-aware wanted/surplus cards, marks, currency, and snapshot/quote timestamps.
+  Purchase rows precede their crafts. Marks are manual notes, never evidence of a Steam action.
+  **Remember checklist marks on this device** separately opts into storing only row IDs and an
+  opaque plan fingerprint. The same regenerated plan can resume after reload; changed holdings
+  or plan details reset the marks. Untick it to remove saved marks.
+- Surplus counts subtract reservations, planned repeated crafts, and remaining collector goals;
+  **Never sell** and excluded games are withheld. Tradeable counts use eligible owned copies,
+  not every duplicate. Wanted rows never invent a card identity or treat a missing price as free.
+- Expanding a game lazily loads genuine badge artwork from public Steam Community game-card pages.
+  Only verified names, levels, and allowlisted Steam images appear. Coverage may be partial or
+  unavailable; the app does not fabricate artwork for the other levels.
+- **Compare selling one set** prices exactly one complete, unreserved, marketable set at fresh
+  bids, deducts the exact fees, and compares sale-funded crafts with free crafts without selling.
+  Replacement crafts use only sale receipts, not the Wallet budget, and exclude the source game
+  (including retained copies). The result can show an XP disadvantage; it is not cash profit.
 - The authenticated `POST /api/auth/badge-planning` endpoint reuses the loaded inventory and badge
   snapshots plus the server's scoped price cache. It never fetches inventory or badges or stores
   user inputs. Missing or stale market data still permits zero-spend crafts when complete set
   composition is known and inventory/badges are fresh. Unknown composition remains unavailable.
 - Nonzero budgets require a confirmed currency and minor-unit scale; a change resets the budget
-  to zero. Sale proceeds never fund this wallet-budget planner. Expired snapshots and unapplied
-  goal changes disable actionable links until refreshed or applied.
+  to zero. Sale proceeds never fund the wallet-budget planner. Expired snapshots and unapplied
+  goal changes disable actionable links. After manual actions, refresh inventory and badge data,
+  then confirm the remaining Wallet budget and Apply; the app recalculates from the new holdings.
 - **Advanced: sale-funded swaps** remains a separate, explicitly opened workflow below the
   workspace. Its lazy-loaded optimizer sells one card to fund missing cards; the independent
   target calculator in that panel does not drive swap selection. Module-load failures offer a
@@ -171,8 +194,8 @@ The current connection, inventory, and read-only recommendation stage provides:
   net of the exact sale fees. A negative value is the wallet shortfall the user would add; a
   missing side quote leaves that patient estimate absent rather than zero. These routes may need
   external funds and imply no XP advantage; they are estimates for manual navigation only.
-- Plans remain in React memory only while the account, inventory snapshot, and badge snapshot are
-  unchanged. They are never written to IndexedDB, `localStorage`, cookies, or a server-side user
+- Live plans remain in React memory only while the account, inventory snapshot, and badge snapshot
+  are unchanged. They are not automatically written to IndexedDB, `localStorage`, cookies, or a user
   cache. Account changes, logout, inventory refresh, session badge changes, and component unmount
   invalidate or discard the in-memory plan; quote expiry downgrades any retained rows to an expired,
   non-actionable state until the user refreshes the recommendation.
@@ -445,8 +468,9 @@ was last updated on 2026-09-05.
 - Badge-planning and level-up snapshot handling: the default Badges workspace reuses the loaded
   inventory and in-memory badge snapshot, submitting a bounded transient request to authenticated
   `POST /api/auth/badge-planning` with a matching `X-Expected-Steam-ID` header. It contains snapshot
-  timestamps, validated player XP/level, game names, set sizes, badge levels, exact card hashes and
-  quantities, the wallet budget or target level, kept quantities, never-sell flags, and exclusions.
+  timestamps, validated player XP/level, the full normal-badge levels, inventory game names, set
+  sizes, exact card hashes and quantities, scope, collector targets, wallet budget or target level,
+  kept quantities, never-sell flags, exclusions, and an optional complete-set comparison source.
   Opening advanced sale-funded swaps sends the reduced snapshot to `POST /api/auth/level-up`;
   `sellable_quantity` follows `marketable`, not `tradable`. Both requests are used only for their
   calculation: they are not logged, linked to a persistent server row, or stored by the backend.
@@ -456,12 +480,23 @@ was last updated on 2026-09-05.
   to IndexedDB, `localStorage`, cookies, or a server-side user cache. Account changes, logout,
   inventory refresh, and unmount discard it. Quote expiry retains the rows only in React memory as
   non-actionable audit information until refresh or another lifecycle invalidation.
+- Optional local planning state: saved setup intent and checklist marks use separate, bounded,
+  SteamID64-keyed `localStorage` records. They are never sent to a persistence endpoint and are
+  not loaded for another account. Saved intent is restored only into editable inputs; marks contain
+  row IDs and a fingerprint, not holdings, badge snapshots, or quotes. Forget the saved setup and
+  untick remembered marks to remove them. Explicit exports write timestamped reference files or
+  clipboard text at the user's request; these are not executable plans or live market data.
+- Badge artwork: authenticated `GET /api/auth/badge-artwork/{app_id}` checks the expected account
+  before a bounded, rate-limited lookup of configured public donor game-card pages. Public artwork
+  results are cached by game in process memory, independently of the requesting user's holdings.
+  Partial or unavailable results are explicit; links and images are limited to verified Steam URLs.
 - Badge-state handling: the authenticated session check makes one bounded server-only SteamApis v2
   `/v2/steam/users/{steamid}/badges` request for the signed SteamID64. It validates player XP,
   player level, and bounded normal badge levels, then stamps the validated snapshot with
   server-generated `checked_at`. Both planning requests carry it as `badge_refreshed_at`, reusing
   the in-memory snapshot without a badge-provider call during planning.
-  Foil, non-game, and syntactically valid records outside the normal-card catalog are ignored. The
+  Foil, non-game, event, and malformed badge records are ignored; valid normal levels remain
+  available even for games absent from the inventory or current price catalog.
   SteamApis API key and raw badge response remain server-side and are not persisted.
 - Market-price retention and provider freshness: market prices are a global AppID 753 generation,
   not user-specific inventory data. The backend stores normalized fields only in a separate SQLite
@@ -496,10 +531,12 @@ was last updated on 2026-09-05.
   affiliation.
 
 Users can clear the local session through **Sign out on this device**; signing out also clears the
-browser's IndexedDB inventory records. Deleting browser site data clears the local session and
-inventory cache, and an account change invalidates the prior account's records. The global
-server-side market and gem caches are not keyed to a user's SteamID and therefore are not part of
-logout deletion. Questions or deletion requests can be filed through the repository's
+browser's IndexedDB inventory records. Opted-in setup intent and checklist marks remain on this
+device until explicitly forgotten/disabled or browser site data is deleted. Deleting site data
+also clears the local session and inventory cache. An account change invalidates the prior account's
+inventory records without exposing its saved setup. The global server-side market and gem caches
+are not keyed to a user's SteamID and therefore are not part of logout deletion. Questions or
+deletion requests can be filed through the repository's
 [GitHub issues](https://github.com/TheRockPusher/Steam_Optimizer/issues).
 
 ### Steam Data Disclaimer

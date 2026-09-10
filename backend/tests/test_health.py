@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from fastapi.testclient import TestClient
 
 from app import main as main_module
+from app.badge_artwork import BadgeArtworkResponse
 from app.badge_planner import BadgePlanningResponse
 from app.booster_pricing import BoosterScanResult
 from app.gem_pricing import GemKey, GemScanResult
@@ -45,6 +46,14 @@ class LifecycleGateway:
     async def check_inventory(self, steam_id: str) -> InventoryCheck:
         del steam_id
         return InventoryCheck(status="unavailable", message="unused")
+
+    async def check_badge_artwork(
+        self, app_id: int, steam_id: str
+    ) -> BadgeArtworkResponse:
+        del steam_id
+        return BadgeArtworkResponse(
+            app_id=str(app_id), status="unavailable", badges=[], source_url=None
+        )
 
     async def check_level_up(
         self,
@@ -101,6 +110,8 @@ class LifecycleGateway:
             scope="inventory_normal_badges",
             games=[],
             plans=[],
+            opportunity=None,
+            evaluated_game_count=0,
         )
 
     async def refresh_gems(

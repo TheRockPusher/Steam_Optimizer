@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Coroutine,
+        Mapping,
+        Sequence,
+    )
     from pathlib import Path
 
 from app.booster_pricing import (
@@ -120,7 +126,7 @@ class FakeHTTPClient:
         headers: Mapping[str, str] | None = None,
         follow_redirects: bool = False,
         timeout: float | None = None,  # noqa: ASYNC109
-    ) -> AsyncIterator[FakeResponse]:
+    ) -> AsyncGenerator[FakeResponse]:
         del method, url, params, headers, follow_redirects, timeout
         if self.stream_response is None:
             raise AssertionError

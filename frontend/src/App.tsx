@@ -4225,23 +4225,23 @@ function FaqPage() {
           <section id="badge-workspace">
             <h2>What does the Badges tab cover?</h2>
             <p>
-              The Badges tab summarizes the normal game badges your trading
-              cards can build: craftable sets, closest completions, maxed
-              badges, and games you excluded or protected. Only normal game
-              badges represented by your inventory are listed; event badges,
-              foil sets, and badges outside your inventory are out of scope.
+              Start with badges represented in your inventory, choose specific
+              games, or discover all supported normal badges in the current
+              catalog. The dashboard shows craftable sets, completion costs,
+              maxed badges, and your exclusions and protections. Foil, event,
+              and community badges are not included in these plans.
             </p>
           </section>
 
           <section id="planner-modes">
-            <h2>How do target-level and budget plans work?</h2>
+            <h2>How do level, budget, and collector plans work?</h2>
             <p>
-              Plan mode reaches a target Steam level with the least purchase
-              spend, and reports a shortfall when the snapshot cannot reach it.
-              Budget mode maximizes craft XP under the Steam Wallet ceiling you
-              enter. Both compare cheapest, fewest-purchase, and
-              card-preserving policies using the current inventory, badge, and
-              price snapshot.
+              Target-level mode minimizes purchase spending toward a Steam
+              level. Budget mode maximizes craft XP within the Steam Wallet
+              ceiling you enter. Collector mode works toward the normal badge
+              levels you choose for specific games, without crafting unrelated
+              badges. Each mode compares cheapest, fewest-purchase, and
+              card-preserving policies and reports any remaining shortfall.
             </p>
             <p>
               Plans use real quotes with their order-book depth and never fold
@@ -4253,10 +4253,52 @@ function FaqPage() {
           <section id="protections">
             <h2>Do card protections persist?</h2>
             <p>
-              Keep quantities and never-sell choices apply to this workspace
-              session in this browser tab. They are not saved to an account,
-              synced between devices, or restored after you sign out or reload
-              the page.
+              Setups remain in this browser tab unless you opt into remembering
+              them on this device. Saved goals, protections, and exclusions are
+              separated by Steam account and are not synced to a server or
+              another device. Restore a saved setup explicitly, review the
+              current currency and remaining budget, then apply it again.
+              Saved setups do not contain inventory snapshots or executable
+              price quotes. You can forget a saved setup at any time.
+            </p>
+          </section>
+
+          <section id="manual-workflow">
+            <h2>Do checklists and exports confirm Steam transactions?</h2>
+            <p>
+              No. Checklist marks are personal notes, not purchase or craft
+              confirmations. Exports are a reference to one dated plan, not
+              guaranteed prices. After acting on Steam, refresh inventory and
+              badge data to recalculate what remains. Confirm your remaining
+              Wallet budget yourself; inventory changes do not reveal what
+              you spent.
+            </p>
+          </section>
+
+          <section id="surplus-cards">
+            <h2>How are surplus cards identified?</h2>
+            <p>
+              A duplicate is not necessarily surplus. The selected plan may
+              need several copies for repeated crafts. The surplus view keeps
+              those copies and your reservations out of its suggestions,
+              respects exclusions, and distinguishes marketable from tradable
+              copies. Never-sell cards are also withheld from suggested trades.
+              Have/want lists do not guarantee that a trading partner has the
+              cards you need.
+            </p>
+          </section>
+
+          <section id="set-comparison">
+            <h2>What does the complete-set sale comparison mean?</h2>
+            <p>
+              It compares keeping your inventory for zero-spend crafts with
+              selling one eligible complete set and using only its estimated
+              net Steam Wallet proceeds for alternative crafts. Sold cards
+              are removed first, and the source game is excluded from the
+              replacement plan. Other owned cards can still be consumed.
+              Fees and quoted stock are accounted for; random rewards and
+              future drops are not guaranteed funding. These hypothetical
+              proceeds never increase your entered planner budget.
             </p>
           </section>
 

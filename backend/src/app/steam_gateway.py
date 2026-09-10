@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.badge_artwork import BadgeArtworkService
 from app.badge_planner import BadgePlanningOptions, plan_badges
 from app.booster_pricing import (
     BoosterPricingService,
@@ -75,16 +76,19 @@ from app.steamapis_price_cache import (
     MAX_NORMAL_CARD_CATALOG_ROWS,
     CachedPrice,
     NormalCardCatalogRead,
+    NormalCardSetSeed,
     PriceCacheRead,
     SteamApisPriceCache,
     SteamApisPriceRefresh,
 )
 
 if TYPE_CHECKING:
+    from app.badge_artwork import BadgeArtworkResponse
     from app.badge_planner import BadgePlanningResponse
     from app.http_protocols import AsyncHTTPClient, HTTPResponse
     from app.market_fees import MarketFeeContract
     from app.settings import Settings
+    from app.steamapis_price_cache import NormalCardSetMetadata
 
 PROFILE_ENDPOINT = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
 STEAMAPIS_BASE_URL = "https://api.steamapis.com"
@@ -455,6 +459,15 @@ class SteamGatewayProtocol(Protocol):
         now: datetime | str | int | None = None,
     ) -> BadgePlanningResponse:
         """Calculate a read-only badge plan without external metadata I/O."""
+        ...
+
+    async def check_badge_artwork(
+        self,
+        app_id: int,
+        steam_id: str,
+    ) -> BadgeArtworkResponse:
+        """Return one read-only badge-artwork lookup for an account."""
+
         ...
 
     async def refresh_gems(
@@ -1031,17 +1044,18 @@ def _card_set_app_id(value: object) -> int | None:
 
 def _parse_card_sets_payload(
     payload: object,
-) -> dict[int, tuple[str, ...]] | None:
+) -> dict[int, NormalCardSetSeed] | None:
     """Parse the authoritative normal-card composition feed.
 
     This feed is the only source of normal-card membership: its literal card
     names (with or without Steam's legacy ``" (Trading Card)"`` suffix, never
-    percent-decoded) become the exact ``appid-name`` catalog hashes.  Only
-    plannable set sizes (5-15 names) become membership; out-of-domain sets
-    (events, partial sets) are skipped whole, so a broken game can never
-    appear as a partial catalog set.  A payload without a usable
-    ``data.sets`` list is rejected so a refresh never falls back to
-    name-suffix inference.
+    percent-decoded) become the exact ``appid-name`` catalog hashes, and its
+    per-set ``game`` display name plus ``normal.count`` set size are retained
+    verbatim as generation metadata.  Only plannable set sizes (5-15 names)
+    become membership; out-of-domain sets (events, partial sets) are skipped
+    whole, so a broken game can never appear as a partial catalog set.  A
+    payload without a usable ``data.sets`` list is rejected so a refresh
+    never falls back to name-suffix inference.
     """
 
     if not isinstance(payload, Mapping):
@@ -1052,7 +1066,7 @@ def _parse_card_sets_payload(
     raw_sets = data.get("sets")
     if not isinstance(raw_sets, list) or len(raw_sets) > MAX_CATALOG_SETS:
         return None
-    sets: dict[int, tuple[str, ...]] = {}
+    sets: dict[int, NormalCardSetSeed] = {}
     seen_app_ids: set[int] = set()
     total_names = 0
     for raw_set in raw_sets:
@@ -1064,6 +1078,18 @@ def _parse_card_sets_payload(
         if app_id in seen_app_ids:
             return None
         seen_app_ids.add(app_id)
+        raw_game = raw_set.get("game")
+        if raw_game is not None and not isinstance(raw_game, str):
+            continue
+        game_name: str | None = None
+        if isinstance(raw_game, str):
+            candidate = raw_game.strip()
+            if (
+                candidate
+                and len(candidate) <= MAX_GAME_NAME_LENGTH
+                and "\x00" not in candidate
+            ):
+                game_name = candidate
         normal = raw_set.get("normal")
         if not isinstance(normal, Mapping):
             continue
@@ -1095,7 +1121,7 @@ def _parse_card_sets_payload(
         if total_names + len(unique_names) > MAX_NORMAL_CARD_CATALOG_ROWS:
             return None
         total_names += len(unique_names)
-        sets[app_id] = unique_names
+        sets[app_id] = NormalCardSetSeed(game_name, unique_names)
     return sets
 
 
@@ -1253,10 +1279,45 @@ def _level_up_response(
     )
 
 
+def _expanded_planning_metadata(
+    *,
+    scope: str,
+    inventory_metadata: Mapping[int, tuple[str, int | None]],
+    generation_sets: Mapping[int, NormalCardSetMetadata],
+    selected_app_ids: tuple[int, ...],
+) -> dict[int, tuple[str, int | None]]:
+    """Expand caller metadata with retained generation names per scope.
+
+    Only real, known names enter the metadata: inventory rows keep their
+    caller-provided names and selected or catalog games gain the
+    authoritative composition-feed name and set size when the generation
+    retains them.  Unknown selected identifiers are never synthesized; the
+    pure engine fail-closes them with an explicit unavailable reason.
+    """
+
+    expanded = dict(inventory_metadata)
+    candidates = (
+        generation_sets
+        if scope == "catalog"
+        else selected_app_ids
+        if scope == "selected"
+        else ()
+    )
+    for app_id in candidates:
+        metadata = generation_sets.get(app_id)
+        if (
+            app_id not in expanded
+            and metadata is not None
+            and metadata.game_name is not None
+        ):
+            expanded[app_id] = (metadata.game_name, metadata.set_size)
+    return expanded
+
+
 def _badge_planning_catalog(
     steamapis: SteamApisClient,
     catalog_read: NormalCardCatalogRead,
-    normalized_metadata: Mapping[int, tuple[str, int | None]],
+    planning_metadata: Mapping[int, tuple[str, int | None]],
     *,
     current: datetime,
     quote_limit: int,
@@ -1265,6 +1326,10 @@ def _badge_planning_catalog(
 
     Stale or partial generations stay readable for ownership display; the
     fresh-quote constraints for purchases are enforced by the pure planner.
+    Every set whose metadata and cached group agree becomes part of the
+    explicit catalog; sets with unknown or conflicting composition are
+    dropped per game so the pure planner can report them as unavailable
+    instead of planning against a silently shrunk set.
     """
 
     generated_at: datetime | None = None
@@ -1304,20 +1369,21 @@ def _badge_planning_catalog(
         return None, availability_reason
     groups = _catalog_groups(catalog_read)
     catalog_sets: list[CatalogSet] = []
-    for app_id in sorted(normalized_metadata):
+    for app_id in sorted(planning_metadata):
         cards = groups.get(app_id)
         if (
             cards is None
             or not MIN_NORMAL_SET_SIZE <= len(cards) <= MAX_NORMAL_SET_SIZE
         ):
             continue
-        game_name, requested_set_size = normalized_metadata[app_id]
+        raw_game_name, requested_set_size = planning_metadata[app_id]
         if (catalog_read.truncated or not catalog_read.optimizer_complete) and (
             requested_set_size is None
         ):
             continue
         if requested_set_size is not None and requested_set_size != len(cards):
             continue
+        game_name = raw_game_name
         try:
             catalog_sets.append(
                 CatalogSet(
@@ -2779,7 +2845,7 @@ class SteamApisClient:
     async def _fetch_normal_card_sets(
         self,
         api_key: str,
-    ) -> dict[int, tuple[str, ...]]:
+    ) -> dict[int, NormalCardSetSeed]:
         """Fetch the authoritative normal-card composition feed.
 
         This provider route authenticates with the ``api_key`` query
@@ -2872,6 +2938,37 @@ class SteamApisClient:
         return False
 
 
+def _normalized_planning_scope(options: BadgePlanningOptions) -> str:
+    """Return the validated planning scope requested by the caller."""
+
+    scope = options.scope
+    if scope not in ("inventory", "selected", "catalog"):
+        raise OptimizerInputError("input_invalid", "planning scope is invalid")
+    return scope
+
+
+def _normalized_planning_app_ids(values: Sequence[object]) -> tuple[int, ...]:
+    """Parse bounded unique positive AppID texts into sorted integers."""
+
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise OptimizerInputError("input_invalid", "planning app IDs are invalid")
+    parsed: dict[int, None] = {}
+    for value in values:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, str)
+            or not value
+            or len(value) > 20
+            or _ASCII_DIGITS.fullmatch(value) is None
+        ):
+            raise OptimizerInputError("input_invalid", "planning app IDs are invalid")
+        app_id = int(value)
+        if not 0 < app_id <= MAX_APP_ID:
+            raise OptimizerInputError("input_invalid", "planning app IDs are invalid")
+        parsed.setdefault(app_id, None)
+    return tuple(sorted(parsed))
+
+
 class SteamGateway:
     """Read-only profile boundary plus SteamApis inventory access."""
 
@@ -2885,6 +2982,7 @@ class SteamGateway:
         price_cache: SteamApisPriceCache | None = None,
         gem_pricing: GemPricingService | None = None,
         booster_pricing: BoosterPricingService | None = None,
+        badge_artwork: BadgeArtworkService | None = None,
         limiter: SteamCommunityLimiter | None = None,
     ) -> None:
         self.settings = settings
@@ -2898,6 +2996,11 @@ class SteamGateway:
             price_cache=price_cache,
             gem_pricing=gem_pricing,
             booster_pricing=booster_pricing,
+            limiter=limiter,
+        )
+        self.badge_artwork = badge_artwork or BadgeArtworkService(
+            settings,
+            http_client=http_client,
             limiter=limiter,
         )
 
@@ -3004,6 +3107,15 @@ class SteamGateway:
             )
         except Exception:  # noqa: BLE001 - map badge failures to unavailable
             return _unavailable_badges()
+
+    async def check_badge_artwork(
+        self,
+        app_id: int,
+        steam_id: str,
+    ) -> BadgeArtworkResponse:
+        """Return one read-only badge-artwork lookup for an account."""
+
+        return await self.badge_artwork.check_badge_artwork(app_id, steam_id)
 
     async def _fetch_badge_state(
         self,
@@ -3393,6 +3505,9 @@ class SteamGateway:
 
         Ownership stays readable when the price catalog is partial, stale, or
         missing; the pure planner enforces purchase-side quote freshness.
+        Scope resolves the cached generation explicitly: catalog loads every
+        retained supported set, selected intersects the requested identifiers,
+        and inventory keeps its caller-covered read.
         """
 
         current = _level_up_timestamp(now) if now is not None else datetime.now(UTC)
@@ -3431,16 +3546,31 @@ class SteamGateway:
             raise OptimizerInputError(
                 "badge_data_unavailable", "validated badge state is required"
             )
+        scope = _normalized_planning_scope(options)
+        selected_app_ids = (
+            _normalized_planning_app_ids(options.selected_app_ids)
+            if scope == "selected"
+            else ()
+        )
         normalized_metadata = _normalize_level_up_game_metadata(game_metadata)
         if normalized_metadata is None:
             raise OptimizerInputError("input_invalid", "game metadata is invalid")
         requested_app_ids = tuple(sorted(normalized_metadata))
+        if scope == "catalog":
+            read_app_ids: tuple[int, ...] | None = None
+        elif scope == "selected":
+            read_app_ids = tuple(sorted({*requested_app_ids, *selected_app_ids}))
+        else:
+            read_app_ids = requested_app_ids
         catalog: ResolvedCatalog | None = None
-        if availability_reason is None and requested_app_ids:
+        planning_metadata: Mapping[int, tuple[str, int | None]] = normalized_metadata
+        if availability_reason is None and (
+            read_app_ids is None or requested_app_ids or selected_app_ids
+        ):
             try:
                 catalog_read = self.steamapis.read_price_catalog(
                     max_rows=MAX_LEVEL_UP_CATALOG_ROWS,
-                    app_ids=requested_app_ids,
+                    app_ids=read_app_ids,
                 )
             except (
                 OSError,
@@ -3454,17 +3584,23 @@ class SteamGateway:
                 catalog_read = NormalCardCatalogRead(0, None, {})
             if now is None:
                 current = datetime.now(UTC)
+            planning_metadata = _expanded_planning_metadata(
+                scope=scope,
+                inventory_metadata=normalized_metadata,
+                generation_sets=catalog_read.sets,
+                selected_app_ids=selected_app_ids,
+            )
             catalog, availability_reason = _badge_planning_catalog(
                 self.steamapis,
                 catalog_read,
-                normalized_metadata,
+                planning_metadata,
                 current=current,
                 quote_limit=quote_limit,
             )
         return plan_badges(
             catalog=catalog,
             holdings=holdings,
-            game_metadata=normalized_metadata,
+            game_metadata=planning_metadata,
             badges=badge_state,
             inventory_refreshed_at=inventory_time,
             badge_refreshed_at=badge_time,

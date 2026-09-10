@@ -5,7 +5,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-PRICE_CACHE_SCHEMA_VERSION = 4
+PRICE_CACHE_SCHEMA_VERSION = 5
 PRICE_CACHE_TTL_SECONDS = 86_400
 PRICE_REFRESH_RETRY_BASE_SECONDS = 60
 PRICE_REFRESH_RETRY_MAX_SECONDS = 3_600
@@ -27,7 +27,9 @@ MAX_PRICE_QUANTITY = 1_000_000_000
 MAX_NORMAL_CARD_APP_ID = 2**63 - 1
 MAX_NORMAL_CARD_NAME_LENGTH = MAX_PRICE_TEXT_LENGTH
 MAX_NORMAL_CARD_CATALOG_ROWS = 250_000
-MAX_NORMAL_CARD_APP_IDS = 10_000
+MAX_NORMAL_CARD_APP_IDS = 50_000
+MAX_NORMAL_CARD_SETS = 50_000
+MAX_NORMAL_CARD_GAME_NAME_LENGTH = 8_192
 _MAX_OBSERVED_AT_MILLISECONDS = Decimal(253402300799999)
 _MAX_GENERATION = 2**63 - 1
 _MAX_FAILURE_COUNT = 16
@@ -38,6 +40,7 @@ _PRICE_AMOUNT_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
 _PRICE_TABLE_NAME = "steamapis_price_cache"
 _PRICE_META_TABLE_NAME = "steamapis_price_cache_meta"
+_SETS_TABLE_NAME = "steamapis_price_cache_sets"
 _PRICE_INDEX_NAME = "steamapis_price_cache_generation_app_id_idx"
 _PRICE_TABLE_SQL = """
 CREATE TABLE steamapis_price_cache (
@@ -68,6 +71,15 @@ CREATE TABLE steamapis_price_cache_meta (
     optimizer_complete INTEGER NOT NULL CHECK (optimizer_complete IN (0, 1))
 )
 """
+_SETS_TABLE_SQL = """
+CREATE TABLE steamapis_price_cache_sets (
+    generation INTEGER NOT NULL,
+    app_id INTEGER NOT NULL,
+    game_name TEXT,
+    set_size INTEGER NOT NULL,
+    PRIMARY KEY (generation, app_id)
+)
+"""
 _PRICE_TABLE_INFO = (
     ("generation", "INTEGER", 1, None, 1),
     ("market_hash_name", "TEXT", 1, None, 2),
@@ -87,6 +99,12 @@ _PRICE_META_TABLE_INFO = (
     ("retry_until", "REAL", 1, None, 0),
     ("failure_count", "INTEGER", 1, None, 0),
     ("optimizer_complete", "INTEGER", 1, None, 0),
+)
+_SETS_TABLE_INFO = (
+    ("generation", "INTEGER", 1, None, 1),
+    ("app_id", "INTEGER", 1, None, 2),
+    ("game_name", "TEXT", 0, None, 0),
+    ("set_size", "INTEGER", 1, None, 0),
 )
 _PRICE_INDEX_INFO = (
     (0, "generation"),
@@ -117,6 +135,27 @@ class CachedPrice:
 
 
 @dataclass(frozen=True, slots=True)
+class NormalCardSetSeed:
+    """One authoritative normal-card set from the composition feed.
+
+    ``game_name`` is the provider's display name for the set and may be
+    absent; ``names`` are the literal normal-card names that become the
+    exact ``appid-name`` membership hashes.
+    """
+
+    game_name: str | None
+    names: Sequence[str]
+
+
+@dataclass(frozen=True, slots=True)
+class NormalCardSetMetadata:
+    """Authoritative composition metadata retained per generation set."""
+
+    game_name: str | None
+    set_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class NormalCardCatalogRead:
     """The bounded, current-generation normal-card catalog."""
 
@@ -126,6 +165,7 @@ class NormalCardCatalogRead:
     row_count: int = 0
     truncated: bool = False
     optimizer_complete: bool = False
+    sets: dict[int, NormalCardSetMetadata] = field(default_factory=dict)
 
     @property
     def fresh(self) -> bool:
@@ -412,12 +452,23 @@ class SteamApisPriceCache:
     def _schema_state(
         self,
         connection: sqlite3.Connection,
-    ) -> tuple[int, bool, bool, bool, str | None, str | None, str | None]:
+    ) -> tuple[
+        int,
+        bool,
+        bool,
+        bool,
+        bool,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ]:
         row = connection.execute("PRAGMA user_version").fetchone()
         if row is None or not isinstance(row[0], int):
             raise sqlite3.DatabaseError(_CACHE_USER_VERSION_UNAVAILABLE_ERROR)
         price_object = self._object_type(connection, _PRICE_TABLE_NAME)
         meta_object = self._object_type(connection, _PRICE_META_TABLE_NAME)
+        sets_object = self._object_type(connection, _SETS_TABLE_NAME)
         index_object = self._object_type(connection, _PRICE_INDEX_NAME)
         price_compatible = price_object == "table" and self._is_compatible_table(
             connection,
@@ -431,6 +482,12 @@ class SteamApisPriceCache:
             _PRICE_META_TABLE_INFO,
             _PRICE_META_TABLE_SQL,
         )
+        sets_compatible = sets_object == "table" and self._is_compatible_table(
+            connection,
+            _SETS_TABLE_NAME,
+            _SETS_TABLE_INFO,
+            _SETS_TABLE_SQL,
+        )
         index_compatible = price_compatible and self._is_compatible_index(
             connection,
             _PRICE_INDEX_NAME,
@@ -441,9 +498,11 @@ class SteamApisPriceCache:
             row[0],
             price_compatible,
             meta_compatible,
+            sets_compatible,
             index_compatible,
             price_object,
             meta_object,
+            sets_object,
             index_object,
         )
 
@@ -473,7 +532,9 @@ class SteamApisPriceCache:
             initial_version,
             initial_price,
             initial_meta,
+            initial_sets,
             initial_index,
+            _,
             _,
             _,
             _,
@@ -482,6 +543,7 @@ class SteamApisPriceCache:
             initial_version == self.schema_version
             and initial_price
             and initial_meta
+            and initial_sets
             and initial_index
         ):
             return
@@ -491,15 +553,18 @@ class SteamApisPriceCache:
                 version,
                 price_compatible,
                 meta_compatible,
+                sets_compatible,
                 index_compatible,
                 price_object,
                 meta_object,
+                sets_object,
                 index_object,
             ) = self._schema_state(connection)
             if (
                 version == self.schema_version
                 and price_compatible
                 and meta_compatible
+                and sets_compatible
                 and index_compatible
             ):
                 connection.commit()
@@ -507,6 +572,7 @@ class SteamApisPriceCache:
             if (
                 price_compatible
                 and meta_compatible
+                and sets_compatible
                 and version in (0, self.schema_version)
             ):
                 if not index_compatible:
@@ -517,10 +583,12 @@ class SteamApisPriceCache:
             else:
                 self._drop_object(connection, _PRICE_TABLE_NAME, price_object)
                 self._drop_object(connection, _PRICE_META_TABLE_NAME, meta_object)
+                self._drop_object(connection, _SETS_TABLE_NAME, sets_object)
                 self._drop_object(connection, _PRICE_INDEX_NAME, index_object)
                 connection.execute(_PRICE_TABLE_SQL)
                 connection.execute(_PRICE_INDEX_SQL)
                 connection.execute(_PRICE_META_TABLE_SQL)
+                connection.execute(_SETS_TABLE_SQL)
                 connection.execute(f"PRAGMA user_version = {self.schema_version}")
             connection.commit()
         except sqlite3.Error as error:
@@ -529,6 +597,7 @@ class SteamApisPriceCache:
                 initial_version in (0, self.schema_version)
                 and initial_price
                 and initial_meta
+                and initial_sets
                 and self._is_read_only(error)
             ):
                 # Index repair is optional for reads of compatible tables.
@@ -696,6 +765,118 @@ class SteamApisPriceCache:
         ):
             raise ValueError(_NORMAL_CARD_METADATA_ERROR)
         return parsed_app_id, name
+
+    @staticmethod
+    def _normalize_game_name(value: object) -> str | None:
+        """Return one bounded game display name, or ``None`` when absent."""
+
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > MAX_NORMAL_CARD_GAME_NAME_LENGTH
+            or "\x00" in value
+        ):
+            raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+        return value
+
+    @classmethod
+    def _set_metadata_row(
+        cls,
+        row: tuple[object, ...],
+    ) -> tuple[int, NormalCardSetMetadata]:
+        """Validate one persisted generation set-metadata row.
+
+        Corrupt rows raise so a bounded read fails closed instead of
+        silently shrinking the supported-set universe.
+        """
+
+        if len(row) != 4:
+            raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+        app_id = cls._sqlite_integer(row[1])
+        set_size = cls._sqlite_integer(row[3])
+        if (
+            app_id is None
+            or not 0 < app_id <= MAX_NORMAL_CARD_APP_ID
+            or set_size is None
+            or not 1 <= set_size <= MAX_NORMAL_CARD_CATALOG_ROWS
+        ):
+            raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+        return app_id, NormalCardSetMetadata(
+            cls._normalize_game_name(row[2]),
+            set_size,
+        )
+
+    def _read_generation_sets(
+        self,
+        connection: sqlite3.Connection,
+        generation: int,
+        requested_app_ids: tuple[int, ...] | None,
+    ) -> tuple[dict[int, NormalCardSetMetadata], bool]:
+        """Read the generation's authoritative set metadata, bounded.
+
+        Rows come back ordered by AppID; more rows than the supported-set
+        bound mark the read truncated so callers never treat a partial
+        universe as complete.
+        """
+
+        sets: dict[int, NormalCardSetMetadata] = {}
+        truncated = False
+        app_id_chunks: Iterable[tuple[int, ...] | None]
+        if requested_app_ids is None:
+            app_id_chunks = (None,)
+        else:
+            app_id_chunks = (
+                requested_app_ids[start : start + _BATCH_SIZE]
+                for start in range(0, len(requested_app_ids), _BATCH_SIZE)
+            )
+        for app_id_chunk in app_id_chunks:
+            remaining = MAX_NORMAL_CARD_SETS - len(sets)
+            if remaining <= 0:
+                truncated = True
+                break
+            limit = remaining + 1
+            if app_id_chunk is None:
+                query = """
+                    SELECT generation, app_id, game_name, set_size
+                      FROM steamapis_price_cache_sets
+                     WHERE generation = ?
+                     ORDER BY app_id
+                     LIMIT ?
+                """
+                parameters: tuple[object, ...] = (generation, limit)
+            else:
+                placeholders = ",".join("?" for _ in app_id_chunk)
+                query = f"""
+                    SELECT generation, app_id, game_name, set_size
+                      FROM steamapis_price_cache_sets
+                     WHERE generation = ?
+                       AND app_id IN ({placeholders})
+                     ORDER BY app_id
+                     LIMIT ?
+                """  # noqa: S608 - placeholders contain only literal "?"
+                parameters = (generation, *app_id_chunk, limit)
+            cursor = connection.execute(query, parameters)
+            while True:
+                batch_size = min(_BATCH_SIZE, remaining + 1)
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    if len(sets) >= MAX_NORMAL_CARD_SETS:
+                        truncated = True
+                        break
+                    app_id, metadata = self._set_metadata_row(row)
+                    sets[app_id] = metadata
+                if truncated:
+                    break
+                if len(rows) < batch_size:
+                    break
+                remaining = MAX_NORMAL_CARD_SETS - len(sets)
+            if truncated:
+                break
+        return sets, truncated
 
     @staticmethod
     def _normalize_amount(value: object) -> str | None:
@@ -966,6 +1147,11 @@ class SteamApisPriceCache:
             row_count = 0
             raw_count = 0
             truncated = False
+            sets, sets_truncated = self._read_generation_sets(
+                connection,
+                meta.generation,
+                requested_app_ids,
+            )
             app_id_chunks: Iterable[tuple[int, ...] | None]
             if requested_app_ids is None:
                 app_id_chunks = (None,)
@@ -1034,8 +1220,9 @@ class SteamApisPriceCache:
                 refreshed_at=meta.refreshed_at,
                 groups={app_id: tuple(grouped[app_id]) for app_id in sorted(grouped)},
                 row_count=row_count,
-                truncated=truncated,
+                truncated=truncated or sets_truncated,
                 optimizer_complete=meta.optimizer_complete,
+                sets=sets,
             )
             connection.commit()
             transaction_started = False
@@ -1179,16 +1366,21 @@ class SteamApisPriceRefresh:
 
     def seed_normal_cards(
         self,
-        sets: Mapping[int, Sequence[str]],
+        sets: Mapping[int, NormalCardSetSeed],
     ) -> None:
-        """Seed the authoritative normal-card composition for this generation.
+        """Seed the authoritative normal-card composition and set metadata.
 
-        ``sets`` maps each AppID to its literal provider card names (no
-        suffix is appended and no percent-decoding is applied).  Only these
-        exact ``appid-name`` hashes become normal-card catalog members; a
-        market-hash name alone is never treated as proof of item class.
-        Validation is strict: any malformed AppID or name fails the seed so
-        the caller never builds a generation from partial composition.
+        ``sets`` maps each AppID to the provider's literal card names and
+        display name for one plannable normal set (no suffix is appended and
+        no percent-decoding is applied).  Only these exact ``appid-name``
+        hashes become normal-card catalog members; a market-hash name alone
+        is never treated as proof of item class.  Validation is strict: any
+        malformed AppID, name, or seed entry fails the seed so the caller
+        never builds a generation from partial composition.
+
+        The per-set game name and set size are persisted atomically with the
+        membership in this same transaction, so the retained generation
+        metadata always describes exactly the composition that was installed.
         """
 
         if self._closed:
@@ -1196,15 +1388,21 @@ class SteamApisPriceRefresh:
         if not isinstance(sets, Mapping):
             raise TypeError(_NORMAL_CARD_METADATA_ERROR)
         membership: dict[str, tuple[int, str]] = {}
-        for raw_app_id, raw_names in sets.items():
+        set_rows: list[tuple[int, str | None, int]] = []
+        for raw_app_id, seed in sets.items():
             if isinstance(raw_app_id, bool) or not isinstance(raw_app_id, int):
                 raise TypeError(_NORMAL_CARD_METADATA_ERROR)
             if not 0 < raw_app_id <= MAX_NORMAL_CARD_APP_ID:
                 raise ValueError(_NORMAL_CARD_METADATA_ERROR)
+            if not isinstance(seed, NormalCardSetSeed):
+                raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+            raw_names = seed.names
             if isinstance(raw_names, (str, bytes)) or not isinstance(
                 raw_names, Sequence
             ):
                 raise TypeError(_NORMAL_CARD_METADATA_ERROR)
+            if not raw_names:
+                raise ValueError(_NORMAL_CARD_METADATA_ERROR)
             for raw_name in raw_names:
                 if not isinstance(raw_name, str):
                     raise TypeError(_NORMAL_CARD_METADATA_ERROR)
@@ -1214,6 +1412,21 @@ class SteamApisPriceRefresh:
                 if market_hash_name is None:
                     raise ValueError(_NORMAL_CARD_METADATA_ERROR)
                 membership[market_hash_name] = (raw_app_id, raw_name)
+            set_rows.append(
+                (
+                    raw_app_id,
+                    self._cache._normalize_game_name(seed.game_name),
+                    len(raw_names),
+                )
+            )
+        self._connection.executemany(
+            """
+            INSERT INTO steamapis_price_cache_sets (
+                generation, app_id, game_name, set_size
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [(self._generation, *row) for row in set_rows],
+        )
         self._normal_membership = membership
 
     @property
@@ -1319,6 +1532,10 @@ class SteamApisPriceRefresh:
             self._flush()
             self._connection.execute(
                 "DELETE FROM steamapis_price_cache WHERE generation != ?",
+                (self._generation,),
+            )
+            self._connection.execute(
+                "DELETE FROM steamapis_price_cache_sets WHERE generation != ?",
                 (self._generation,),
             )
             self._connection.execute(

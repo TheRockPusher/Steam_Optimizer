@@ -27,6 +27,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.badge_artwork import BadgeArtworkResponse
 from app.badge_planner import (
     BadgePlanningOptions,
     BadgePlanningResponse,
@@ -52,7 +53,13 @@ from app.level_up_optimizer import (
     level_for_xp,
     parse_normal_card_hash,
 )
-from app.steam_gateway import BadgeCheck, InventoryCheck, ProfileCheck
+from app.steam_gateway import (
+    MAX_NORMAL_BADGE_LEVEL_ROWS,
+    BadgeCheck,
+    InventoryCheck,
+    NormalBadgeLevel,
+    ProfileCheck,
+)
 from app.steam_openid import (
     OpenIDValidationError,
     OpenIDVerifierUnavailableError,
@@ -98,8 +105,13 @@ _BADGE_PLANNING_INVALID_REQUEST_MESSAGE = "Badge-planning request is invalid."
 _BADGE_PLANNING_DUPLICATE_PROTECTION_ERROR = "protection hashes must be unique"
 _BADGE_PLANNING_UNKNOWN_PROTECTION_ERROR = "protections must reference owned cards"
 _BADGE_PLANNING_PROTECTION_QUANTITY_ERROR = "keep quantity exceeds owned quantity"
-_BADGE_PLANNING_DUPLICATE_EXCLUSION_ERROR = "excluded game IDs must be unique"
-_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR = "exclusions must reference requested games"
+_BADGE_PLANNING_UNSORTED_BADGE_LEVELS_ERROR = (
+    "normal badge levels must be sorted and unique"
+)
+_BADGE_PLANNING_BADGE_LEVEL_MISMATCH_ERROR = (
+    "game badge levels must agree with the submitted badge snapshot"
+)
+_BADGE_ARTWORK_INVALID_APP_ID_MESSAGE = "Badge artwork AppID is invalid."
 
 Clock = Callable[[], datetime]
 
@@ -299,21 +311,24 @@ class LevelUpRequest(BaseModel):
 class BadgePlanningRequest(LevelUpRequest):
     model_config = ConfigDict(extra="forbid")
 
+    normal_badge_levels: list[NormalBadgeLevel] = Field(
+        max_length=MAX_NORMAL_BADGE_LEVEL_ROWS,
+    )
     options: BadgePlanningOptions
 
     @model_validator(mode="after")
     def validate_badge_planning_options(self) -> BadgePlanningRequest:
-        game_app_ids = {int(game.app_id) for game in self.games}
-        excluded_app_ids = self.options.excluded_app_ids
-        if len(set(excluded_app_ids)) != len(excluded_app_ids):
-            raise ValueError(_BADGE_PLANNING_DUPLICATE_EXCLUSION_ERROR)
-        for raw_app_id in excluded_app_ids:
-            try:
-                app_id = int(raw_app_id)
-            except TypeError, ValueError:
-                raise ValueError(_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR) from None
-            if app_id not in game_app_ids:
-                raise ValueError(_BADGE_PLANNING_UNKNOWN_EXCLUSION_ERROR)
+        previous_app_id = 0
+        for level in self.normal_badge_levels:
+            if level.app_id <= previous_app_id:
+                raise ValueError(_BADGE_PLANNING_UNSORTED_BADGE_LEVELS_ERROR)
+            previous_app_id = level.app_id
+        snapshot_levels = {
+            level.app_id: level.level for level in self.normal_badge_levels
+        }
+        for game in self.games:
+            if game.badge_level != snapshot_levels.get(int(game.app_id), 0):
+                raise ValueError(_BADGE_PLANNING_BADGE_LEVEL_MISMATCH_ERROR)
         known_holdings = {card.market_hash_name: card for card in self.cards}
         seen_protections: set[str] = set()
         for protection in self.options.protections:
@@ -571,6 +586,58 @@ def _level_up_snapshot_inputs(
         player_level=payload.player_level,
         normal_badge_levels={
             int(game.app_id): game.badge_level for game in payload.games
+        },
+    )
+    return holdings, game_metadata, badge_state
+
+
+def _badge_artwork_app_id(value: str) -> int | None:
+    """Parse one bounded artwork path AppID, or ``None`` when invalid."""
+
+    if not value or len(value) > 10 or not value.isascii() or not value.isdigit():
+        return None
+    app_id = int(value)
+    if not 0 < app_id <= MAX_APP_ID:
+        return None
+    return app_id
+
+
+def _unavailable_badge_artwork(app_id: int) -> BadgeArtworkResponse:
+    return BadgeArtworkResponse(
+        app_id=str(app_id),
+        status="unavailable",
+        badges=[],
+        source_url=None,
+    )
+
+
+def _badge_planning_snapshot_inputs(
+    payload: BadgePlanningRequest,
+) -> tuple[tuple[Holding, ...], dict[int, tuple[str, int | None]], BadgeState]:
+    """Build the planner snapshot from the complete submitted badge snapshot.
+
+    The request's ``normal_badge_levels`` is the session's complete validated
+    snapshot, so a normal badge missing from it denotes an uncrafted badge
+    rather than unknown state; inventory game rows are inventory-covered and
+    were reconciled against the snapshot during request validation.
+    """
+
+    holdings = tuple(
+        Holding(
+            market_hash_name=card.market_hash_name,
+            owned_quantity=card.owned_quantity,
+            sellable_quantity=card.sellable_quantity,
+        )
+        for card in payload.cards
+    )
+    game_metadata = {
+        int(game.app_id): (game.game_name, game.card_set_size) for game in payload.games
+    }
+    badge_state = BadgeState(
+        player_xp=payload.player_xp,
+        player_level=payload.player_level,
+        normal_badge_levels={
+            level.app_id: level.level for level in payload.normal_badge_levels
         },
     )
     return holdings, game_metadata, badge_state
@@ -967,7 +1034,9 @@ def create_auth_router(
                 headers={"Cache-Control": "no-store"},
             ) from error
         try:
-            holdings, game_metadata, badge_state = _level_up_snapshot_inputs(payload)
+            holdings, game_metadata, badge_state = _badge_planning_snapshot_inputs(
+                payload
+            )
         except (TypeError, ValueError, OptimizerInputError) as error:
             raise HTTPException(
                 status_code=422,
@@ -1004,6 +1073,68 @@ def create_auth_router(
                 reason="badge_data_unavailable",
             )
         return result
+
+    @router.get(
+        "/api/auth/badge-artwork/{app_id}",
+        response_model=BadgeArtworkResponse,
+        responses={401: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    )
+    async def auth_badge_artwork(
+        app_id: str,
+        request: Request,
+        response: Response,
+    ) -> BadgeArtworkResponse:
+        response.headers["Cache-Control"] = "no-store"
+        token = request.cookies.get(settings.session_cookie_name)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            steam_id = _session_steam_id(
+                token,
+                settings,
+                codec,
+                now=current_time(),
+            )
+        except (InvalidCookieError, ValueError) as error:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        if request.headers.get("x-expected-steam-id") != steam_id:
+            raise HTTPException(
+                status_code=401,
+                detail=_AUTHENTICATION_REQUIRED_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        parsed_app_id = _badge_artwork_app_id(app_id)
+        if parsed_app_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail=_BADGE_ARTWORK_INVALID_APP_ID_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            return await steam_gateway.check_badge_artwork(parsed_app_id, steam_id)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail=_BADGE_ARTWORK_INVALID_APP_ID_MESSAGE,
+                headers={"Cache-Control": "no-store"},
+            ) from error
+        except (
+            AttributeError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ArithmeticError,
+            RuntimeError,
+        ):
+            return _unavailable_badge_artwork(parsed_app_id)
 
     @router.post(
         "/api/auth/gems",
