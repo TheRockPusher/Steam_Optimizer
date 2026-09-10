@@ -1,12 +1,19 @@
 # Changelog
 
 All notable changes to Steam Ally are documented here.
-## Unreleased
+## v1.2.1
+
+
+### Documentation
+- Update changelog for v1.2.0
+
+
+### Features
+- Rebrand website to Steam Ally and align release checks **(breaking)**
 
 
 ### Maintenance
-- Rename the product to Steam Ally and verify the canonical website during releases
-- Reset storage and session namespaces to the steamally prefix; users must sign in again, inventory caches rebuild, and previously saved local plan setups are not migrated
+- Prepare release v1.2.1
 
 ## v1.2.0
 
