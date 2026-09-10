@@ -879,7 +879,7 @@ def test_inventory_accepts_live_and_documented_success_shapes(
     )
     assert client.get_calls[0]["headers"] == {
         "x-api-key": "server-only-key",
-        "User-Agent": "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)",
+        "User-Agent": "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)",
     }
 
 
@@ -1484,7 +1484,7 @@ def test_price_join_checks_case_sensitive_unquoted_name() -> None:
     assert lookup.prices["Encoded Name"].lowest_sell == "0.25"
     assert client.get_calls[1]["headers"] == {
         "x-api-key": "server-only-key",
-        "User-Agent": "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)",
+        "User-Agent": "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)",
     }
     assert client.get_calls[1]["follow_redirects"] is False
 
@@ -3039,8 +3039,7 @@ def test_get_badges_uses_steamapis_endpoint_server_key_and_signed_steam_id() -> 
                 "x-api-key": "server-badge-key",
                 "Accept-Encoding": "identity",
                 "User-Agent": (
-                    "SteamOptimizer/0.1.1 "
-                    "(+https://github.com/TheRockPusher/Steam_Optimizer)"
+                    "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
                 ),
             },
             "follow_redirects": False,

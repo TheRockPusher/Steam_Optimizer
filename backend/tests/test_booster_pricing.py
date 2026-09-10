@@ -229,7 +229,7 @@ def test_provider_requests_one_normal_card_count_with_public_market_parameters(
         "Cookie": "bMarketOptOut=1",
         "Referer": "https://steamcommunity.com/market/",
         "User-Agent": (
-            "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+            "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
         ),
     }
 

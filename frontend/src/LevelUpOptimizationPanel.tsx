@@ -64,7 +64,7 @@ const REASON_COPY: Record<LevelUpReason, string> = {
   price_generation_unavailable:
     "Current market prices are unavailable. Try refreshing the recommendation later.",
   price_generation_refreshing:
-    "Steam Optimizer is refreshing the shared market-price catalog. This recommendation will retry automatically.",
+    "Steam Ally is refreshing the shared market-price catalog. This recommendation will retry automatically.",
   price_generation_stale:
     "Current market prices are stale. Try refreshing the recommendation later.",
   quote_depth_unavailable:

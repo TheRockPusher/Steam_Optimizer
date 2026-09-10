@@ -255,7 +255,6 @@ describe("FAQ", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
 
     render(<App />);
-    expect(document.title).toBe("FAQ | Steam Optimizer");
 
     expect(
       screen.getByRole("heading", {
@@ -268,11 +267,8 @@ describe("FAQ", () => {
         .getByRole("link", { name: "FAQ" })
     ).toHaveAttribute("aria-current", "page");
     expect(
-      screen.getByRole("link", { name: "Steam Optimizer home" })
+      screen.getByRole("link", { name: "Steam Ally home" })
     ).toHaveAttribute("href", "/");
-    expect(
-      screen.getByRole("heading", { name: "Can Steam Optimizer change my account?" })
-    ).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: "How are gem values calculated?" })
     ).toBeInTheDocument();

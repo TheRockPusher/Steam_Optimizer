@@ -74,7 +74,7 @@ def _looks_like_placeholder(secret: str) -> bool:
 
 
 class Settings(BaseSettings):
-    app: str = "Steam Optimizer API"
+    app: str = "Steam Ally API"
     environment: str = "development"
     allowed_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:5173"]
@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     nonce_future_skew_seconds: int = 60
     steam_request_timeout_seconds: float = 10.0
     steam_bulk_timeout_seconds: float = 120.0
-    gem_price_cache_path: str = ".cache/steam-optimizer/gem_prices.sqlite3"
-    steamapis_price_cache_path: str = ".cache/steam-optimizer/steamapis_prices.sqlite3"
+    gem_price_cache_path: str = ".cache/steamally/gem_prices.sqlite3"
+    steamapis_price_cache_path: str = ".cache/steamally/steamapis_prices.sqlite3"
     # The complete group is optional, but it is atomic when enabled.  The
     # freshness defaults apply only when the other six values are supplied.
     level_up_currency_code: str | None = None

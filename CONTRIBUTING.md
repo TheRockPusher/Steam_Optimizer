@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to Steam Optimizer. Keep changes small, focused, and consistent with the read-only product boundary described in [`docs/PROJECT_SUMMARY.md`](docs/PROJECT_SUMMARY.md).
+Thanks for contributing to Steam Ally. Keep changes small, focused, and consistent with the read-only product boundary described in [`docs/PROJECT_SUMMARY.md`](docs/PROJECT_SUMMARY.md).
 
 ## Trunk-based workflow
 

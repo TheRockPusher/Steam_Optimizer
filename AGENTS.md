@@ -1,6 +1,6 @@
 # Product
 
-Steam Optimizer is an open-source, read-only tool for inspecting a public Steam Community inventory and planning badge-completion actions. It does not buy, sell, trade, or otherwise automate Steam transactions; users perform any resulting actions manually.
+Steam Ally is an open-source, read-only tool for inspecting a public Steam Community inventory and planning badge-completion actions. It does not buy, sell, trade, or otherwise automate Steam transactions; users perform any resulting actions manually.
 
 ## Conventions
 

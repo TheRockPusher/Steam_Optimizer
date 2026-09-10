@@ -40,8 +40,8 @@ STEAM_MARKET_SEARCH_RENDER_ENDPOINT = (
 )
 STEAM_COMMUNITY_REFERER = f"{STEAM_COMMUNITY_BASE_URL}/market/"
 STEAM_COMMUNITY_COOKIE = "bMarketOptOut=1"
-STEAM_OPTIMIZER_USER_AGENT = (
-    "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+STEAMALLY_USER_AGENT = (
+    "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
 
 BOOSTER_CACHE_SCHEMA_VERSION = CACHE_SCHEMA_VERSION
@@ -734,7 +734,7 @@ class SteamCommunityBoosterProvider:
             "Accept": "application/json",
             "Cookie": STEAM_COMMUNITY_COOKIE,
             "Referer": STEAM_COMMUNITY_REFERER,
-            "User-Agent": STEAM_OPTIMIZER_USER_AGENT,
+            "User-Agent": STEAMALLY_USER_AGENT,
         }
 
     async def lookup(self, game_app_id: str) -> BoosterLookup:

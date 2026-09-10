@@ -52,8 +52,8 @@ GAMECARDS_URL_TEMPLATE = (
 )
 """Public game-card page template; ``steam_id`` and ``app_id`` are digits."""
 
-STEAM_OPTIMIZER_USER_AGENT = (
-    "SteamOptimizer/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
+STEAMALLY_USER_AGENT = (
+    "steamally/0.1.1 (+https://github.com/TheRockPusher/Steam_Optimizer)"
 )
 
 MAX_BADGE_LEVEL = 5
@@ -411,7 +411,7 @@ class BadgeArtworkService:
                     url,
                     params={"l": "english"},
                     headers={
-                        "User-Agent": STEAM_OPTIMIZER_USER_AGENT,
+                        "User-Agent": STEAMALLY_USER_AGENT,
                         "Accept": "text/html,application/xhtml+xml",
                     },
                     follow_redirects=False,

@@ -21,7 +21,7 @@ from httpx2 import Response
 from app.badge_artwork import (
     GAMECARDS_URL_TEMPLATE,
     MAX_ARTWORK_PAGE_BYTES,
-    STEAM_OPTIMIZER_USER_AGENT,
+    STEAMALLY_USER_AGENT,
     BadgeArtworkService,
 )
 from app.gem_pricing import SteamCommunityLimiter
@@ -506,7 +506,7 @@ def test_upstream_requests_use_the_fixed_public_shape() -> None:
     )
     assert call["params"] == {"l": "english"}
     assert call["headers"] == {
-        "User-Agent": STEAM_OPTIMIZER_USER_AGENT,
+        "User-Agent": STEAMALLY_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml",
     }
     assert call["follow_redirects"] is False
